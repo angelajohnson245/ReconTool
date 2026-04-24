@@ -18,7 +18,7 @@ from recon_enhanced_output import (
     PrimaryFileSchemaError,
     build_output_filename,
     build_workbook,
-    categorize_m61_note,
+    categorize_m61_note_type,
     filter_recon_to_selected_fund,
     get_primary_config,
     normalise_facility,
@@ -517,7 +517,8 @@ with st.sidebar:
         key="recon_m61_note_category",
         help=(
             "Filters the **displayed** table, metrics, drilldown, and downloads together with **Scope**. "
-            "**Financing** (LN_Fin…) is the default. Choose **All** to show every category."
+            "**Financing** (M61 Liability Type: Repo / TBD / CLO) is the default. "
+            "Choose **All** to show every category."
         ),
     )
  
@@ -658,25 +659,26 @@ def derive_liability_type_for_filter(row: pd.Series) -> str:
     return _acore_source_type_family(row.get("Source"))
 
 
-def categorize_m61_note_for_filter(raw) -> str:
+def categorize_m61_note_for_filter(raw_liability_type) -> str:
     """Delegate to the canonical backend function — single source of truth."""
-    return categorize_m61_note(raw)
+    return categorize_m61_note_type(raw_liability_type)
 
 
 def _series_m61_note_category(df: pd.DataFrame) -> pd.Series:
-    """Per-row M61 note category for filtering (matches ``categorize_m61_note``)."""
+    """Per-row M61 note category for filtering (matches ``categorize_m61_note_type``)."""
     if df is None or df.empty:
         return pd.Series(dtype="object")
     if "M61 Note Category" in df.columns:
         return df["M61 Note Category"].fillna("Other").astype(str).str.strip()
-    if "Liability Note (M61)" in df.columns:
-        return (
-            df["Liability Note (M61)"]
-            .map(categorize_m61_note)
-            .fillna("Other")
-            .astype(str)
-            .str.strip()
-        )
+    for col in ("Liability Type (M61 Raw)", "Liability Type (M61)", "Liability Type"):
+        if col in df.columns:
+            return (
+                df[col]
+                .map(categorize_m61_note_type)
+                .fillna("Other")
+                .astype(str)
+                .str.strip()
+            )
     return pd.Series(["Other"] * len(df), index=df.index, dtype="object")
 
 
@@ -1536,7 +1538,10 @@ if "df_recon" in st.session_state:
                     _bc1, _bc2 = st.columns(2)
                     with _bc1:
                         st.markdown("**By M61 Note Category**")
-                        st.caption("LN_Fin = Financing · LN_Sub = Subline · LN_Eq = Equity/Fund")
+                        st.caption(
+                            "Financing = Repo / TBD / CLO · Subline = Subline · "
+                            "Equity/Fund = Fund or Equity in Liability Type"
+                        )
                         if _cat_counts:
                             # Preserve the canonical category order.
                             ordered_cats = [c for c in M61_NOTE_CATEGORIES if c in _cat_counts]
