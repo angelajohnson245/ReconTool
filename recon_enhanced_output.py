@@ -115,6 +115,14 @@ def _fund_cfg(primary_file_type: str) -> dict:
     return PRIMARY_TYPE_FUND_CONFIG.get(primary_file_type, {})
 
 
+LAST_RECON_DIAGNOSTICS: dict[str, int | str] = {}
+
+
+def get_last_recon_diagnostics() -> dict[str, int | str]:
+    """Most recent reconcile() row-count diagnostics (display-only helper)."""
+    return dict(LAST_RECON_DIAGNOSTICS)
+
+
 def _debug_rows(msg: str) -> None:
     """Temporary row-count diagnostics for reconciliation pipeline."""
     print(f"[RECON DEBUG] {msg}")
@@ -327,6 +335,7 @@ def default_recon_output_path(
 # 2. CONSTANTS
 # --------------------------------------------------
 M61_FINANCING_TYPES = ["Repo", "Non", "Subline"]
+M61_FINANCING_TYPE_BUCKETS = frozenset({"repo", "non", "subline"})
 
 TARGET_FUNDS = {
     "acore credit partners iii",
@@ -409,7 +418,11 @@ RECON_ORDERED_COLS = [
     "Note Name",
     "Liability Note (M61)",
     "Deal ID (ACP)",
+    "Deal ID Match Key (ACP)",
     "Liability Note Suffix (M61)",
+    "M61 Extracted Deal ID",
+    "ID Match Result",
+    "Match Stage",
     "Source",
     "Source Indicator",
     "Effective Date (ACP)",
@@ -418,6 +431,14 @@ RECON_ORDERED_COLS = [
     "Pledge Date (M61)",
     "Advance Rate (ACP)",
     "Advance Rate (M61)",
+    "Advance Rate Source (M61)",
+    "Current Advance Rate (M61 Raw)",
+    "Deal Level Advance Rate (M61 Raw)",
+    "Raw Target Advance Rate from M61",
+    "Raw Current Advance Rate from M61",
+    "Raw Deal Level Advance Rate from M61",
+    "Final Advance Rate (M61)",
+    "Liability Type (M61 Raw)",
     "Target Advance Rate (M61)",
     "Spread (ACP)",
     "Spread (M61)",
@@ -429,6 +450,7 @@ RECON_ORDERED_COLS = [
     "Index Name (M61)",
     "Recourse % (ACP)",
     "Recourse % (M61)",
+    "Advance Rate (ACP) Debug",
     "Advance Rate Status",
     "Spread Status",
     "Effective Date Status",
@@ -612,6 +634,66 @@ def ensure_columns(df: pd.DataFrame, columns) -> pd.DataFrame:
     return df
 
 
+def _norm_colname_key(name) -> str:
+    if name is None:
+        return ""
+    s = str(name)
+    s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+
+def _canonicalize_m61_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize M61 export column headers to expected canonical names."""
+    out = df.copy()
+    alias_to_canonical = {
+        "fund name": "Fund Name",
+        "liability name": "Liability Name",
+        "liability type": "Liability Type",
+        "financial institution": "Financial Institution",
+        "deal name": "Deal Name",
+        "liability note": "Liability Note",
+        "status": "Status",
+        "pledge": "Pledge",
+        "pledge date": "Pledge Date",
+        "effective date": "Effective Date",
+        "maturity date": "Maturity Date",
+        "current advance rate": "Current Advance Rate",
+        "target advance rate": "Target Advance Rate",
+        "current balance": "Current Balance",
+        "undrawn capacity": "Undrawn Capacity",
+        "spread": "Spread",
+        "target": "target",
+        "in_liability": "in_liability",
+    }
+    ren = {}
+    seen_targets = set(out.columns)
+    for c in out.columns:
+        k = _norm_colname_key(c)
+        tgt = alias_to_canonical.get(k)
+        if tgt and c != tgt and tgt not in seen_targets:
+            ren[c] = tgt
+            seen_targets.add(tgt)
+    if ren:
+        out = out.rename(columns=ren)
+    return out
+
+
+def _liability_type_bucket(value) -> str:
+    s = normalise_text(value)
+    if not s:
+        return ""
+    if "subline" in s:
+        return "subline"
+    if "repo" in s:
+        if "non" in s:
+            return "non"
+        return "repo"
+    if s in ("non", "non-repo", "non repo") or s.startswith("non "):
+        return "non"
+    return s
+
+
 # ACP II "10) Fin Inpt" can pick up merged-area junk columns (float headers, "0.0025.1", etc.).
 _FIN_INPT_NUMERIC_LIKE_HEADER_RE = re.compile(r"^[\d.]+$")
 
@@ -721,8 +803,18 @@ def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
     use_cols = [cmap[k] for k in PRIMARY_INTERNAL_FIELDS]
     renamer = {cmap[k]: INTERNAL_FIELD_TO_OUTPUT_COL[k] for k in PRIMARY_INTERNAL_FIELDS}
     df = df_raw.loc[:, use_cols].rename(columns=renamer)
+    deal_id_col = None
     if "Deal ID" in df_raw.columns:
-        df["Deal ID"] = df_raw["Deal ID"]
+        deal_id_col = "Deal ID"
+    else:
+        # Header-tolerant fallback (spaces/case variants).
+        deal_id_aliases = {"deal id", "dealid"}
+        for c in df_raw.columns:
+            if _norm_colname_key(c).replace(" ", "") in {"dealid"} or _norm_colname_key(c) in deal_id_aliases:
+                deal_id_col = c
+                break
+    if deal_id_col is not None:
+        df["Deal ID"] = df_raw[deal_id_col]
 
     df = ensure_columns(df, ACP_SHEET_COLS)
     keep_cols = list(ACP_SHEET_COLS) + (["Deal ID"] if "Deal ID" in df.columns else [])
@@ -741,9 +833,42 @@ def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def load_file_a(path: str, *, return_excluded: bool = False):
-    sheet_name = "Liability_Relationship"
+def _fin_note_token_for_primary(primary_file_type: str) -> str:
+    p = str(primary_file_type or "").strip().upper()
+    if p == "ACORE":
+        return "LN_FIN_ACPIII"
+    if p == "ACP II":
+        return "LN_FIN_ACPII"
+    if p == "AOC II":
+        return "LN_FIN_AOCII"
+    return ""
+
+
+def load_file_a(
+    path: str,
+    *,
+    primary_file_type: str = "ACORE",
+    return_excluded: bool = False,
+    return_diagnostics: bool = False,
+):
+    preferred_sheet = "Liability_Relationship"
+    xl = pd.ExcelFile(path)
+    sheet_name = preferred_sheet
+    if preferred_sheet not in xl.sheet_names:
+        # Fallback for exports that use spaces/casing variants.
+        fallback = None
+        for sn in xl.sheet_names:
+            sn_key = _norm_colname_key(sn).replace(" ", "_")
+            if "liability" in sn_key and "relationship" in sn_key:
+                fallback = sn
+                break
+        if fallback:
+            sheet_name = fallback
+        else:
+            sheet_name = xl.sheet_names[0]
     df = pd.read_excel(path, sheet_name=sheet_name)
+    df = _canonicalize_m61_columns(df)
+    m61_raw_rows_loaded = int(len(df))
     _debug_rows(
         f"M61 read_excel: sheet={sheet_name!r} rows={len(df)} cols={len(df.columns)} "
         f"(full sheet read; no usecols/nrows subset)"
@@ -777,16 +902,23 @@ def load_file_a(path: str, *, return_excluded: bool = False):
     in_target_set = fund_lower.isin(TARGET_FUNDS)
     aoc_style = df["Fund Name"].str.contains(AOC_M61_FUND_NAME_RE, regex=True, na=False)
     fund_mask = in_target_set | aoc_style
-    liab_type_mask = df["Liability Type"].isin(M61_FINANCING_TYPES)
+    df["Liability Type Bucket"] = df["Liability Type"].apply(_liability_type_bucket)
+    liab_type_mask = df["Liability Type Bucket"].isin(M61_FINANCING_TYPE_BUCKETS)
+    fin_note_token = _fin_note_token_for_primary(primary_file_type)
+    liab_note_up = df["Liability Note"].fillna("").astype(str).str.upper()
+    fin_note_scope_mask = liab_note_up.str.contains(fin_note_token, regex=False, na=False) if fin_note_token else pd.Series(False, index=df.index)
+    in_scope_mask = liab_type_mask | fin_note_scope_mask
     _debug_rows(
         "M61 pre-filter diagnostics (fund labels are informational; rows are NOT dropped by fund here): "
         f"rows_matching_target_fund_labels={int(fund_mask.sum())}/{len(df)} "
         f"rows_matching_liability_types={int(liab_type_mask.sum())}/{len(df)} "
+        f"rows_matching_financing_note_token={int(fin_note_scope_mask.sum())}/{len(df)} token={fin_note_token!r} "
+        f"rows_in_scope_after_expanded_filter={int(in_scope_mask.sum())}/{len(df)} "
         f"blank_deal_name={int(df['Deal Name'].isna().sum())} "
         f"blank_liability_note={int(df['Liability Note'].isna().sum())}"
     )
     excluded_by_type = df.loc[
-        ~liab_type_mask,
+        ~in_scope_mask,
         [
             c
             for c in (
@@ -800,18 +932,18 @@ def load_file_a(path: str, *, return_excluded: bool = False):
             if c in df.columns
         ],
     ].copy()
-    excluded_by_type["Exclusion Reason"] = "Excluded by Liability Type filter"
+    excluded_by_type["Exclusion Reason"] = "Excluded by expanded M61 in-scope filter"
     ex_type_counts = (
         excluded_by_type["Liability Type"].fillna("<NA>").astype(str).value_counts().to_dict()
         if "Liability Type" in excluded_by_type.columns
         else {}
     )
     _debug_rows(
-        "M61 rows excluded by Liability Type filter: "
+        "M61 rows excluded by expanded in-scope filter: "
         f"excluded_rows={len(excluded_by_type)} excluded_type_counts={ex_type_counts}"
     )
     if not excluded_by_type.empty:
-        _debug_rows("TEMP DEBUG: sample rows excluded by Liability Type filter (head 10)")
+        _debug_rows("TEMP DEBUG: sample rows excluded by expanded in-scope filter (head 10)")
         for i, (_, er) in enumerate(excluded_by_type.head(10).iterrows(), start=1):
             _debug_rows(
                 "TEMP DEBUG:   "
@@ -819,11 +951,22 @@ def load_file_a(path: str, *, return_excluded: bool = False):
                 f"liability_name={er.get('Liability Name')!r} note={er.get('Liability Note')!r} "
                 f"eff={er.get('Effective Date')!r}"
             )
-    df = df[df["Liability Type"].isin(M61_FINANCING_TYPES)].copy()
-    _debug_rows(f"M61 after Liability Type filter ({M61_FINANCING_TYPES}): rows={len(df)}")
+    df = df[in_scope_mask].copy()
+    _debug_rows(
+        "M61 after expanded in-scope filter: "
+        f"rows={len(df)} "
+        f"(kept liability buckets={sorted(M61_FINANCING_TYPE_BUCKETS)} OR note token={fin_note_token!r})"
+    )
     df = df[keep].copy()
 
-    for col in ["Deal Name", "Liability Note", "Financial Institution", "Liability Name", "Fund Name", "Pledge"]:
+    for col in [
+        "Deal Name",
+        "Liability Note",
+        "Financial Institution",
+        "Liability Name",
+        "Fund Name",
+        "Pledge",
+    ]:
         df[col] = df[col].astype(str).str.strip()
     _debug_rows(
         "M61 post-cleaning diagnostics: "
@@ -835,9 +978,22 @@ def load_file_a(path: str, *, return_excluded: bool = False):
     df["Effective Date"] = safe_parse_date(df["Effective Date"])
     df["Maturity Date"] = safe_parse_date(df["Maturity Date"])
     df = df.reset_index(drop=True)
+    m61_rows_after_liability_type_filter = int(len(df))
     excluded_by_type = excluded_by_type.reset_index(drop=True)
+    diagnostics = {
+        "m61_sheet_used": sheet_name,
+        "m61_raw_rows_loaded": m61_raw_rows_loaded,
+        "m61_rows_matching_target_fund_labels": int(fund_mask.sum()),
+        "m61_rows_matching_financing_note_token": int(fin_note_scope_mask.sum()),
+        "m61_rows_after_liability_type_filter": m61_rows_after_liability_type_filter,
+        "m61_rows_excluded_by_liability_type_filter": int(len(excluded_by_type)),
+    }
+    if return_excluded and return_diagnostics:
+        return df, excluded_by_type, diagnostics
     if return_excluded:
         return df, excluded_by_type
+    if return_diagnostics:
+        return df, diagnostics
     return df
 
 
@@ -856,20 +1012,31 @@ def normalise_facility(raw):
 
 
 def extract_liability_note_suffix(value) -> str:
-    """Extract trailing deal-id-like token from Liability Note (e.g., LN_Eq_ACPIII_25-2852 -> 25-2852)."""
+    """Extract deal-id token from Liability Note (e.g., 25-2852 anywhere in text)."""
+    return extract_deal_id_token(value)
+
+
+def extract_deal_id_token(value) -> str:
+    """Extract canonical deal-id token ``NN-NNNN`` from arbitrary text/value."""
     if pd.isna(value):
         return ""
     s = str(value).strip()
     if not s:
         return ""
-    m = re.search(r"([A-Za-z0-9]+-\d+)$", s)
+    # Normalize common dash variants / spacing around the dash before matching.
+    s_norm = (
+        s.replace("–", "-")
+        .replace("—", "-")
+        .replace("−", "-")
+    )
+    m = re.search(r"\b(\d{2})\s*-\s*(\d{4})\b", s_norm)
     if m:
-        return m.group(1).strip()
-    parts = [p.strip() for p in s.split("_") if p and p.strip()]
-    if not parts:
-        return ""
-    tail = parts[-1]
-    return tail if re.search(r"\d+-\d+", tail) else ""
+        return f"{m.group(1)}-{m.group(2)}"
+    # Fallback for compact six-digit exports (e.g., 252852 -> 25-2852).
+    m2 = re.search(r"\b(\d{2})(\d{4})\b", s_norm)
+    if m2:
+        return f"{m2.group(1)}-{m2.group(2)}"
+    return ""
 
 
 def normalise_deal_id_key(value) -> str:
@@ -889,6 +1056,24 @@ def _source_bucket(value) -> str:
     if s in ("non", "non-repo", "non repo") or " non" in f" {s}":
         return "non"
     return s
+
+
+def _is_sale_type_fund_or_deal(*, fund_name, liability_type) -> bool:
+    """Business override: sale-type funds compare against deal-level advance rate."""
+    fn = normalise_text(fund_name)
+    lt = normalise_text(liability_type)
+    # Use whole-word sale markers only (avoid false positives like "wholesale").
+    sale_re = re.compile(r"\b(sale|sold)\b", re.IGNORECASE)
+    return bool(sale_re.search(fn or "")) or bool(sale_re.search(lt or ""))
+
+
+def _m61_deal_level_advance_rate(row: pd.Series, label_a: str):
+    """Deal-level advance rate fallback chain from M61 export fields."""
+    for col in ("Advance Rate", "Advance"):
+        v = row.get(f"{label_a}_{col}")
+        if not _is_blank_for_compare(v):
+            return v
+    return pd.NA
 
 
 def date_key(series):
@@ -1209,7 +1394,9 @@ def reconcile(
     primary_file_type: str = "ACORE",
     mapping_path: str | None = None,
     uploaded_primary_filename: str | None = None,
+    return_diagnostics: bool = False,
 ):
+    global LAST_RECON_DIAGNOSTICS
     label_a = "in_liability"
     p_cfg = get_primary_config(primary_file_type)
     miss_pri = p_cfg["missing_in_primary_label"]
@@ -1218,7 +1405,12 @@ def reconcile(
     business_fund_label = detect_fund_label(uploaded_primary_filename, primary_file_type)
     fund_fallback_display = _fund_cfg(primary_file_type).get("recon_fund_display") or business_fund_label
 
-    raw_m61, excluded_by_type_df = load_file_a(file_a_path, return_excluded=True)
+    raw_m61, excluded_by_type_df, m61_load_diag = load_file_a(
+        file_a_path,
+        primary_file_type=primary_file_type,
+        return_excluded=True,
+        return_diagnostics=True,
+    )
     m61_row_count_after_load = len(raw_m61)
     _debug_rows(f"Reconcile input: M61 rows after load_file_a={len(raw_m61)}")
     _debug_rows(f"TEMP DEBUG: M61 row count immediately after load_file_a = {len(raw_m61)}")
@@ -1310,17 +1502,37 @@ def reconcile(
         df_b["deal_id_value"] = df_b["Deal ID"].apply(lambda v: "" if pd.isna(v) else str(v).strip())
     else:
         df_b["deal_id_value"] = ""
-    df_b["deal_id_key"] = df_b["deal_id_value"].apply(normalise_deal_id_key)
-    df_a["liability_note_suffix"] = df_a["Liability Note"].apply(extract_liability_note_suffix)
+    # Normalize ACP key via same token extractor used for M61 notes.
+    df_b["acp_extracted_deal_id"] = df_b["deal_id_value"].apply(extract_deal_id_token)
+    df_b["acp_match_key"] = df_b["acp_extracted_deal_id"].apply(normalise_deal_id_key)
+    df_b["deal_id_key"] = df_b["acp_match_key"]
+
+    df_a["m61_extracted_deal_id"] = df_a["Liability Note"].apply(extract_liability_note_suffix)
+    df_a["liability_note_suffix"] = df_a["m61_extracted_deal_id"]
     df_a["liability_note_suffix_key"] = df_a["liability_note_suffix"].apply(normalise_deal_id_key)
+    df_a["m61_match_key"] = df_a["liability_note_suffix_key"].astype(str)
     _debug_rows(
         "TEMP DEBUG: Deal ID helper readiness — "
-        f"primary_nonblank_deal_id={int(df_b['deal_id_key'].ne('').sum())} "
-        f"m61_nonblank_note_suffix={int(df_a['liability_note_suffix_key'].ne('').sum())}"
+        f"primary_nonblank_deal_id={int(df_b['acp_match_key'].ne('').sum())} "
+        f"m61_nonblank_note_suffix={int(df_a['m61_match_key'].ne('').sum())}"
     )
     _debug_rows("TEMP DEBUG: Deal ID helper sample — primary head 10")
     for i, (_, r) in enumerate(
-        df_b.loc[:, [c for c in ["Deal Name", "deal_id_value", "effective_date_key", "match_key"] if c in df_b.columns]]
+        df_b.loc[
+            :,
+            [
+                c
+                for c in [
+                    "Deal Name",
+                    "deal_id_value",
+                    "acp_extracted_deal_id",
+                    "acp_match_key",
+                    "effective_date_key",
+                    "match_key",
+                ]
+                if c in df_b.columns
+            ],
+        ]
         .head(10)
         .iterrows(),
         start=1,
@@ -1328,13 +1540,25 @@ def reconcile(
         _debug_rows(
             "TEMP DEBUG:   "
             f"#{i} deal={r.get('Deal Name')!r} deal_id={r.get('deal_id_value')!r} "
+            f"acp_extracted={r.get('acp_extracted_deal_id')!r} acp_match_key={r.get('acp_match_key')!r} "
             f"eff_key={r.get('effective_date_key')!r} match_key={r.get('match_key')!r}"
         )
     _debug_rows("TEMP DEBUG: Deal ID helper sample — M61 head 10")
     for i, (_, r) in enumerate(
         df_a.loc[
             :,
-            [c for c in ["Deal Name", "Liability Note", "liability_note_suffix", "effective_date_key", "match_key"] if c in df_a.columns],
+            [
+                c
+                for c in [
+                    "Deal Name",
+                    "Liability Note",
+                    "m61_extracted_deal_id",
+                    "m61_match_key",
+                    "effective_date_key",
+                    "match_key",
+                ]
+                if c in df_a.columns
+            ],
         ]
         .head(10)
         .iterrows(),
@@ -1343,8 +1567,39 @@ def reconcile(
         _debug_rows(
             "TEMP DEBUG:   "
             f"#{i} deal={r.get('Deal Name')!r} liability_note={r.get('Liability Note')!r} "
-            f"suffix={r.get('liability_note_suffix')!r} eff_key={r.get('effective_date_key')!r} "
+            f"m61_extracted_deal_id={r.get('m61_extracted_deal_id')!r} m61_match_key={r.get('m61_match_key')!r} "
+            f"eff_key={r.get('effective_date_key')!r} "
             f"match_key={r.get('match_key')!r}"
+        )
+    _debug_rows(
+        "TEMP DEBUG: requested key columns (ACP side) — "
+        "ACP Deal ID | acp_match_key"
+    )
+    for i, (_, r) in enumerate(
+        df_b.loc[:, [c for c in ["Deal Name", "deal_id_value", "acp_match_key"] if c in df_b.columns]]
+        .head(50)
+        .iterrows(),
+        start=1,
+    ):
+        _debug_rows(
+            f"TEMP DEBUG:   ACP[{i}] deal={r.get('Deal Name')!r} "
+            f"ACP Deal ID={r.get('deal_id_value')!r} acp_match_key={r.get('acp_match_key')!r}"
+        )
+    _debug_rows(
+        "TEMP DEBUG: requested key columns (M61 side) — "
+        "M61 Liability Note | m61_extracted_deal_id | m61_match_key"
+    )
+    for i, (_, r) in enumerate(
+        df_a.loc[:, [c for c in ["Deal Name", "Liability Note", "m61_extracted_deal_id", "m61_match_key"] if c in df_a.columns]]
+        .head(50)
+        .iterrows(),
+        start=1,
+    ):
+        _debug_rows(
+            f"TEMP DEBUG:   M61[{i}] deal={r.get('Deal Name')!r} "
+            f"M61 Liability Note={r.get('Liability Note')!r} "
+            f"m61_extracted_deal_id={r.get('m61_extracted_deal_id')!r} "
+            f"m61_match_key={r.get('m61_match_key')!r}"
         )
 
     _debug_match_key_overlap_diagnosis(df_b, df_a, n=10)
@@ -1395,10 +1650,83 @@ def reconcile(
         f"in_scope={int(a['_m61_in_scope'].sum())}/{len(a)} "
         f"pattern={fpattern!r} primary_type={primary_file_type}"
     )
+    primary_id_keys = set(b["acp_match_key"].astype(str).tolist())
+    primary_id_keys.discard("")
+    a["_id_in_primary"] = a["m61_match_key"].astype(str).isin(primary_id_keys)
+    _debug_rows(
+        "TEMP DEBUG: Deal ID / Liability Note suffix key overlap — "
+        f"primary_nonblank_ids={len(primary_id_keys)} "
+        f"m61_rows_with_id_in_primary={int(a['_id_in_primary'].sum())}/{len(a)}"
+    )
+    m61_rows_after_type = int(len(a))
+    m61_rows_nonblank_note = int(a["Liability Note"].fillna("").astype(str).str.strip().ne("").sum())
+    m61_rows_extracted_nonblank = int(a["m61_match_key"].astype(str).ne("").sum())
+    m61_rows_extracted_in_acp = int(a["_id_in_primary"].sum())
+    acp_total_rows = int(len(b))
+    m61_total_rows_after_filter = int(len(a))
+    _debug_rows(
+        "TEMP DEBUG: requested pre-merge counts — "
+        f"total_acp_rows={acp_total_rows} "
+        f"total_m61_rows_after_liability_type_filter={m61_total_rows_after_filter} "
+        f"m61_rows_with_extracted_deal_id={m61_rows_extracted_nonblank} "
+        f"m61_extracted_ids_matching_acp={m61_rows_extracted_in_acp}"
+    )
+    _debug_rows(
+        "TEMP DEBUG: M61 extraction counts after liability-type filter — "
+        f"rows_after_type={m61_rows_after_type} "
+        f"nonblank_liability_note={m61_rows_nonblank_note} "
+        f"nonblank_extracted_deal_id={m61_rows_extracted_nonblank} "
+        f"extracted_id_in_acp={m61_rows_extracted_in_acp}"
+    )
+    if m61_rows_extracted_in_acp == 0:
+        _debug_rows(
+            "TEMP DEBUG: extracted M61 deal IDs matching ACP = 0; printing first 50 raw Liability Note values."
+        )
+        for i, v in enumerate(a["Liability Note"].head(50).tolist(), start=1):
+            _debug_rows(f"TEMP DEBUG: raw_m61_liability_note[{i}]={v!r}")
+    _debug_rows("TEMP DEBUG: M61 first 50 rows after type filter (note + extracted id)")
+    m61_dbg_cols = [
+        c
+        for c in (
+            "Deal Name",
+            "Liability Type",
+            "Liability Note",
+            "liability_note_suffix",
+            "Target Advance Rate",
+        )
+        if c in a.columns
+    ]
+    for i, (_, rr) in enumerate(a.loc[:, m61_dbg_cols].head(50).iterrows(), start=1):
+        _debug_rows(
+            "TEMP DEBUG:   "
+            f"#{i} deal={rr.get('Deal Name')!r} "
+            f"type={rr.get('Liability Type')!r} "
+            f"liability_note={rr.get('Liability Note')!r} "
+            f"extracted_id={rr.get('liability_note_suffix')!r} "
+            f"target_adv={rr.get('Target Advance Rate')!r}"
+        )
 
     unmatched_b = set(b["_row_id_b"].tolist())
     unmatched_a = set(a["_row_id_a"].tolist())
     matchable_a = set(a.loc[a["_m61_in_scope"], "_row_id_a"].tolist())
+    if primary_file_type == "ACORE":
+        # ACP III runs: anchor reconciliation candidates to ACP financing identifiers.
+        # Only restrict to ID-matched candidates when Deal IDs are actually present on the
+        # ACP side; if none exist (Deal ID column absent from the sheet), fall back to the
+        # fund-scope candidate set so rows are not silently dropped.
+        id_anchored = set(a.loc[a["_id_in_primary"], "_row_id_a"].tolist())
+        if id_anchored:
+            matchable_a = id_anchored
+        else:
+            _debug_rows(
+                "TEMP DEBUG: ACORE anchored candidate set is EMPTY "
+                "(no ACP Deal IDs found); falling back to fund-scope matchable_a"
+            )
+            # matchable_a already set to fund-scope rows above; leave it unchanged.
+        _debug_rows(
+            "TEMP DEBUG: ACORE anchored candidate set "
+            f"(ID overlap)={len(matchable_a)}/{len(a)}"
+        )
     pair_rows: list[dict] = []
     b_by_id = b.set_index("_row_id_b", drop=False)
     a_by_id = a.set_index("_row_id_a", drop=False)
@@ -1447,67 +1775,128 @@ def reconcile(
             )
         return len(pairs)
 
-    strict_n = _pair_by_key("strict_key", "strict_key", "strict")
-    _debug_rows(f"TEMP DEBUG: staged matcher strict matches={strict_n}")
+    b["id_match_key"] = b["acp_match_key"].astype(str)
+    a["id_match_key"] = a["m61_match_key"].astype(str)
 
-    # Required debugging: candidate ACP rows, source-filter match, selected row.
-    cand_logged = 0
-    lb_dbg = b[b["_row_id_b"].isin(unmatched_b)].copy()
-    la_dbg = a[a["_row_id_a"].isin(unmatched_a.intersection(matchable_a))].copy()
-    common_dd = sorted(set(lb_dbg["deal_date_key"]).intersection(set(la_dbg["deal_date_key"])))
-    for dd in common_dd:
-        p_cand = lb_dbg[lb_dbg["deal_date_key"] == dd]
-        m_cand = la_dbg[la_dbg["deal_date_key"] == dd]
-        if p_cand.empty or m_cand.empty:
-            continue
-        deal_name_dbg = str(p_cand.iloc[0].get("Deal Name", ""))
-        if cand_logged < 40 or "geoffrey drive" in normalise_text(deal_name_dbg):
-            _debug_rows(
-                "TEMP DEBUG: candidate set (source-aware) "
-                f"deal_date={dd!r} acp_candidates={len(p_cand)} m61_candidates={len(m_cand)}"
+    if primary_file_type == "ACORE":
+        # ACP-driven matching: first try ACP Deal ID key -> M61 extracted Deal ID key (when
+        # Deal IDs are present); then fall through to staged matchers for any remaining rows.
+        lb = b[b["_row_id_b"].isin(unmatched_b)].copy()
+        la = a[a["_row_id_a"].isin(unmatched_a.intersection(matchable_a))].copy()
+        lb_id = lb[lb["id_match_key"].astype(str).str.strip().ne("")]
+        la_id = la[la["id_match_key"].astype(str).str.strip().ne("")]
+        id_n = 0
+        if not lb_id.empty and not la_id.empty:
+            lb_id = lb_id.sort_values(["id_match_key", "effective_date_key", "_row_id_b"]).copy()
+            la_id = la_id.sort_values(["id_match_key", "effective_date_key", "_row_id_a"]).copy()
+            lb_id["_rk"] = lb_id.groupby("id_match_key").cumcount()
+            la_id["_rk"] = la_id.groupby("id_match_key").cumcount()
+            id_pairs = lb_id[["_row_id_b", "id_match_key", "_rk"]].merge(
+                la_id[["_row_id_a", "id_match_key", "_rk"]],
+                on=["id_match_key", "_rk"],
+                how="inner",
             )
-            for _, pr in p_cand.iterrows():
+            for _, pr in id_pairs.iterrows():
+                rid_b = int(pr["_row_id_b"])
+                rid_a = int(pr["_row_id_a"])
+                if rid_b not in unmatched_b or rid_a not in unmatched_a:
+                    continue
+                unmatched_b.remove(rid_b)
+                unmatched_a.remove(rid_a)
+                pair_rows.append(
+                    {
+                        "_row_id_b": rid_b,
+                        "_row_id_a": rid_a,
+                        "_match_stage": "deal_id",
+                        "_merge": "both",
+                    }
+                )
+                id_n += 1
+        _debug_rows(
+            "TEMP DEBUG: ACORE key merge acp_match_key -> m61_match_key "
+            f"matched_rows={id_n}"
+        )
+        # Fall through to staged matchers for any rows not yet paired by Deal ID.
+        strict_n = _pair_by_key("strict_key", "strict_key", "strict")
+        _debug_rows(f"TEMP DEBUG: ACORE staged matcher strict matches={strict_n}")
+        source_fac_n = _pair_by_key(
+            "source_aware_facility_key", "source_aware_facility_key", "source_aware_facility"
+        )
+        _debug_rows(f"TEMP DEBUG: ACORE staged matcher source-aware+facility matches={source_fac_n}")
+        source_n = _pair_by_key("source_aware_key", "source_aware_key", "source_aware")
+        _debug_rows(f"TEMP DEBUG: ACORE staged matcher source-aware matches={source_n}")
+        fallback_n = _pair_by_key("deal_date_key", "deal_date_key", "fallback")
+        _debug_rows(f"TEMP DEBUG: ACORE staged matcher fallback matches={fallback_n}")
+    else:
+        strict_n = _pair_by_key("strict_key", "strict_key", "strict")
+        _debug_rows(f"TEMP DEBUG: staged matcher strict matches={strict_n}")
+
+        # Required debugging: candidate ACP rows, source-filter match, selected row.
+        cand_logged = 0
+        lb_dbg = b[b["_row_id_b"].isin(unmatched_b)].copy()
+        la_dbg = a[a["_row_id_a"].isin(unmatched_a.intersection(matchable_a))].copy()
+        common_dd = sorted(set(lb_dbg["deal_date_key"]).intersection(set(la_dbg["deal_date_key"])))
+        for dd in common_dd:
+            p_cand = lb_dbg[lb_dbg["deal_date_key"] == dd]
+            m_cand = la_dbg[la_dbg["deal_date_key"] == dd]
+            if p_cand.empty or m_cand.empty:
+                continue
+            deal_name_dbg = str(p_cand.iloc[0].get("Deal Name", ""))
+            if cand_logged < 40 or "geoffrey drive" in normalise_text(deal_name_dbg):
                 _debug_rows(
-                    "TEMP DEBUG:   ACP cand "
-                    f"id={int(pr['_row_id_b'])} deal={pr.get('Deal Name')!r} src={pr.get('Source')!r} "
-                    f"source_bucket={pr.get('source_bucket')!r} eff_key={pr.get('effective_date_key')!r}"
+                    "TEMP DEBUG: candidate set (source-aware) "
+                    f"deal_date={dd!r} acp_candidates={len(p_cand)} m61_candidates={len(m_cand)}"
                 )
-            for _, ar in m_cand.iterrows():
-                _debug_rows(
-                    "TEMP DEBUG:   M61 cand "
-                    f"id={int(ar['_row_id_a'])} deal={ar.get('Deal Name')!r} liab_type={ar.get('Liability Type')!r} "
-                    f"source_bucket={ar.get('source_bucket')!r} eff_key={ar.get('effective_date_key')!r} "
-                    f"facility_norm={ar.get('facility_norm')!r} undrawn={ar.get('Undrawn Capacity')!r}"
+                for _, pr in p_cand.iterrows():
+                    _debug_rows(
+                        "TEMP DEBUG:   ACP cand "
+                        f"id={int(pr['_row_id_b'])} deal={pr.get('Deal Name')!r} src={pr.get('Source')!r} "
+                        f"source_bucket={pr.get('source_bucket')!r} eff_key={pr.get('effective_date_key')!r}"
+                    )
+                for _, ar in m_cand.iterrows():
+                    _debug_rows(
+                        "TEMP DEBUG:   M61 cand "
+                        f"id={int(ar['_row_id_a'])} deal={ar.get('Deal Name')!r} liab_type={ar.get('Liability Type')!r} "
+                        f"source_bucket={ar.get('source_bucket')!r} eff_key={ar.get('effective_date_key')!r} "
+                        f"facility_norm={ar.get('facility_norm')!r} undrawn={ar.get('Undrawn Capacity')!r}"
+                    )
+                src_match_n = len(
+                    p_cand[["_row_id_b", "source_bucket"]]
+                    .merge(
+                        m_cand[["_row_id_a", "source_bucket"]],
+                        on="source_bucket",
+                        how="inner",
+                    )
                 )
-            src_match_n = len(
-                p_cand[["_row_id_b", "source_bucket"]]
-                .merge(
-                    m_cand[["_row_id_a", "source_bucket"]],
-                    on="source_bucket",
-                    how="inner",
-                )
-            )
-            _debug_rows(f"TEMP DEBUG:   source-aware candidate links={src_match_n}")
-            cand_logged += 1
+                _debug_rows(f"TEMP DEBUG:   source-aware candidate links={src_match_n}")
+                cand_logged += 1
 
-    source_fac_n = _pair_by_key(
-        "source_aware_facility_key", "source_aware_facility_key", "source_aware_facility"
-    )
-    _debug_rows(f"TEMP DEBUG: staged matcher source-aware+facility matches={source_fac_n}")
+        source_fac_n = _pair_by_key(
+            "source_aware_facility_key", "source_aware_facility_key", "source_aware_facility"
+        )
+        _debug_rows(f"TEMP DEBUG: staged matcher source-aware+facility matches={source_fac_n}")
 
-    source_n = _pair_by_key("source_aware_key", "source_aware_key", "source_aware")
-    _debug_rows(f"TEMP DEBUG: staged matcher source-aware matches={source_n}")
+        source_n = _pair_by_key("source_aware_key", "source_aware_key", "source_aware")
+        _debug_rows(f"TEMP DEBUG: staged matcher source-aware matches={source_n}")
 
-    fallback_n = _pair_by_key("deal_date_key", "deal_date_key", "fallback")
-    _debug_rows(f"TEMP DEBUG: staged matcher fallback matches={fallback_n}")
+        fallback_n = _pair_by_key("deal_date_key", "deal_date_key", "fallback")
+        _debug_rows(f"TEMP DEBUG: staged matcher fallback matches={fallback_n}")
 
     # Build merged-like frame while preserving unmatched rows (outer behavior).
     for rid_b in sorted(unmatched_b):
         pair_rows.append({"_row_id_b": int(rid_b), "_row_id_a": pd.NA, "_match_stage": "none", "_merge": "left_only"})
-    for rid_a in sorted(unmatched_a):
-        pair_rows.append({"_row_id_b": pd.NA, "_row_id_a": int(rid_a), "_match_stage": "none", "_merge": "right_only"})
+    if primary_file_type != "ACORE":
+        for rid_a in sorted(unmatched_a):
+            pair_rows.append({"_row_id_b": pd.NA, "_row_id_a": int(rid_a), "_match_stage": "none", "_merge": "right_only"})
 
     map_df = pd.DataFrame(pair_rows)
+    # Keep merge key dtypes aligned even when unmatched side uses pd.NA.
+    if "_row_id_b" in map_df.columns:
+        map_df["_row_id_b"] = pd.to_numeric(map_df["_row_id_b"], errors="coerce").astype("Int64")
+    if "_row_id_a" in map_df.columns:
+        map_df["_row_id_a"] = pd.to_numeric(map_df["_row_id_a"], errors="coerce").astype("Int64")
+    b["_row_id_b"] = pd.to_numeric(b["_row_id_b"], errors="coerce").astype("Int64")
+    a["_row_id_a"] = pd.to_numeric(a["_row_id_a"], errors="coerce").astype("Int64")
     merged = map_df.merge(b, on="_row_id_b", how="left")
     a_pref = a.add_prefix(f"{label_a}_")
     merged = merged.merge(
@@ -1517,10 +1906,22 @@ def reconcile(
         how="left",
     )
     _debug_unmatched_after_merge(merged, label_a=label_a, n=10)
-    _debug_rows(
-        "TEMP DEBUG: fallback pairing on Deal ID/Liability Note suffix is DISABLED "
-        "(diagnosis mode; primary match_key only)."
-    )
+    matched_rows_after_merge = int((merged["_merge"] == "both").sum()) if "_merge" in merged.columns else 0
+    _debug_rows(f"TEMP DEBUG: matched rows after merge={matched_rows_after_merge}")
+    if "_merge" in merged.columns:
+        _debug_rows(
+            "TEMP DEBUG: post-merge indicator counts "
+            f"{merged['_merge'].value_counts(dropna=False).to_dict()}"
+        )
+    if primary_file_type == "ACORE":
+        _debug_rows(
+            "TEMP DEBUG: ACORE final assembly is ACP-left anchored by Deal ID/Liability Note suffix key."
+        )
+    else:
+        _debug_rows(
+            "TEMP DEBUG: fallback pairing on Deal ID/Liability Note suffix is DISABLED "
+            "(diagnosis mode; primary match_key only)."
+        )
     _debug_rows(
         "Reconcile merge rows: "
         f"primary_rows={len(df_b)} m61_rows={len(df_a)} merged_rows={len(merged)} "
@@ -1609,10 +2010,28 @@ def reconcile(
         deal_id_key = normalise_deal_id_key(deal_id_acp)
         note_suffix_key = normalise_deal_id_key(note_suffix_m61)
         record["Deal ID (ACP)"] = deal_id_acp if deal_id_key else pd.NA
+        record["Deal ID Match Key (ACP)"] = deal_id_key if deal_id_key else pd.NA
         record["Liability Note Suffix (M61)"] = note_suffix_m61 if note_suffix_key else pd.NA
+        record["M61 Extracted Deal ID"] = note_suffix_key if note_suffix_key else pd.NA
+        record["ID Match Result"] = row.get("_merge")
+        record["Match Stage"] = row.get("_match_stage")
 
         record["Target Advance Rate (M61)"] = (
             row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
+        )
+        record["Current Advance Rate (M61 Raw)"] = (
+            row.get(f"{label_a}_Current Advance Rate") if in_a else pd.NA
+        )
+        record["Deal Level Advance Rate (M61 Raw)"] = (
+            _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
+        )
+        # Temporary trace columns for Advance Rate source debugging.
+        record["Advance Rate (ACP) Debug"] = record.get("Advance Rate")
+        record["Raw Target Advance Rate from M61"] = record["Target Advance Rate (M61)"]
+        record["Raw Current Advance Rate from M61"] = record["Current Advance Rate (M61 Raw)"]
+        record["Raw Deal Level Advance Rate from M61"] = record["Deal Level Advance Rate (M61 Raw)"]
+        record["Liability Type (M61 Raw)"] = (
+            row.get(f"{label_a}_Liability Type") if in_a else pd.NA
         )
 
         in_liability_raw = row.get(f"{label_a}_in_liability")
@@ -1626,11 +2045,6 @@ def reconcile(
             val_b = row.get(b_field)
             liability_label = LIABILITY_VALUE_LABELS.get(a_field, f"{a_field} (M61)")
 
-            # ACORE business rule: Spread is ACP-only in this run; M61 spread is not a shared compare field.
-            if b_field == "Spread" and primary_file_type == "ACORE":
-                record["Spread (M61)"] = pd.NA
-                record["Spread Status"] = "MISSING IN M61 FILE"
-                continue
 
             if only_target_from_invis and a_field != "target":
                 record[liability_label] = pd.NA
@@ -1639,18 +2053,28 @@ def reconcile(
                     key_field_statuses.append("MISSING")
                 continue
 
-            # Advance Rate status comparison basis:
-            # - Repo / Non: compare primary Advance Rate vs M61 Target Advance Rate
-            # - ACP II (legacy behavior): keep comparing vs Target Advance Rate
-            liab_type_lc = (
-                str(row.get(f"{label_a}_Liability Type")).strip().lower() if in_a else ""
-            )
-            use_target_for_adv_compare = liab_type_lc in {"repo", "non"} or primary_file_type == "ACP II"
-            if b_field == "Advance Rate" and use_target_for_adv_compare:
-                record["Advance Rate (M61)"] = (
-                    row.get(f"{label_a}_Current Advance Rate") if in_a else pd.NA
+            # Advance Rate status comparison basis (fund-based mapping):
+            # - Default: compare against M61 Target Advance Rate
+            # - Sale-type fund/deal: compare against M61 Deal Level Advance Rate
+            if b_field == "Advance Rate":
+                fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
+                liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
+                use_deal_level_adv = _is_sale_type_fund_or_deal(
+                    fund_name=fund_name,
+                    liability_type=liab_type,
                 )
-                val_a = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
+                if use_deal_level_adv:
+                    compare_val = _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
+                    record["Advance Rate (M61)"] = compare_val
+                    record["Advance Rate Source (M61)"] = "Deal Level Advance Rate"
+                    val_a = compare_val
+                else:
+                    compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
+                    # Non-sale rows must display and compare against Target Advance Rate.
+                    record["Advance Rate (M61)"] = compare_val
+                    record["Advance Rate Source (M61)"] = "Target Advance Rate"
+                    val_a = compare_val
+                record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
             else:
                 record[liability_label] = val_a
 
@@ -1749,11 +2173,19 @@ def reconcile(
             record.get("Index Name (ACP)"),
             "text",
         )
-        record["Recourse % Status"] = compare_optional(
-            record.get("Recourse % (M61)"),
-            record.get("Recourse % (ACP)"),
-            "numeric",
-        )
+        rec_m61 = record.get("Recourse % (M61)")
+        rec_acp = record.get("Recourse % (ACP)")
+        rec_m61_has = not _is_blank_for_compare(rec_m61)
+        rec_acp_has = not _is_blank_for_compare(rec_acp)
+        if rec_acp_has and not rec_m61_has:
+            # Display-only status lane; does not feed final recon_status.
+            record["Recourse % Status"] = "MISSING IN M61 FILE"
+        else:
+            record["Recourse % Status"] = compare_optional(
+                rec_m61,
+                rec_acp,
+                "numeric",
+            )
 
         src_status = "" if pd.isna(row.get(f"{label_a}_Status")) else str(row.get(f"{label_a}_Status")).strip().lower()
 
@@ -1808,6 +2240,37 @@ def reconcile(
             )
 
     df_adv = pd.DataFrame(adv_rows)
+    LAST_RECON_DIAGNOSTICS = {
+        "primary_file_type": primary_file_type,
+        "raw_primary_rows_loaded": int(len(df_pri_raw)),
+        "raw_m61_rows_loaded": int(m61_load_diag.get("m61_raw_rows_loaded", len(raw_m61))),
+        "m61_rows_after_fund_filter_for_primary": int(a["_m61_in_scope"].sum()) if "_m61_in_scope" in a.columns else int(len(a)),
+        "m61_rows_after_filters": int(m61_load_diag.get("m61_rows_after_liability_type_filter", len(raw_m61))),
+        "m61_rows_matching_acp_identifiers": int(
+            a["_id_in_primary"].sum()
+        ) if "_id_in_primary" in a.columns else 0,
+        "m61_rows_nonblank_liability_note": m61_rows_nonblank_note,
+        "m61_rows_extracted_deal_id_nonblank": m61_rows_extracted_nonblank,
+        "m61_rows_extracted_deal_id_in_acp": m61_rows_extracted_in_acp,
+        "matched_rows_after_merge": matched_rows_after_merge,
+        "m61_rows_matching_target_fund_labels": int(
+            m61_load_diag.get("m61_rows_matching_target_fund_labels", len(raw_m61))
+        ),
+        "m61_rows_excluded_by_type_filter": int(
+            m61_load_diag.get("m61_rows_excluded_by_liability_type_filter", len(excluded_by_type_df))
+        ),
+        "primary_rows_after_exclusions": int(len(df_b)),
+        "final_reconciliation_rows": int(len(df_out)),
+        "reconciliation_basis": (
+            "acp_left_anchored_by_deal_id"
+            if primary_file_type == "ACORE"
+            else "outer_merge_preserving_both_files"
+        ),
+        "m61_id_extraction_preview": a.loc[:, m61_dbg_cols].head(50).to_dict("records"),
+    }
+    _debug_rows(f"Diagnostics snapshot: {LAST_RECON_DIAGNOSTICS}")
+    if return_diagnostics:
+        return df_out, df_adv, excluded_by_type_df, dict(LAST_RECON_DIAGNOSTICS)
     return df_out, df_adv, excluded_by_type_df
 
 
@@ -1868,7 +2331,6 @@ COL_DEFS = [
     ("Pledge Date (M61)", 16, False, True, "LIB"),
     ("Advance Rate (ACP)", 13, True, False, "ACP"),
     ("Advance Rate (M61)", 16, True, False, "LIB"),
-    ("Target Advance Rate (M61)", 19, True, False, "LIB"),
     ("Spread (ACP)", 11, True, False, "ACP"),
     ("Spread (M61)", 14, True, False, "LIB"),
     ("Undrawn Capacity (ACP)", 17, False, False, "ACP"),
@@ -1997,7 +2459,9 @@ def _excel_header_for_primary(hdr: str, column_suffix: str) -> str:
     return hdr.replace("(ACP)", f"({column_suffix})")
 
 
-def build_workbook(df_recon, primary_file_type: str = "ACORE"):
+def build_workbook(
+    df_recon, primary_file_type: str = "ACORE", include_scoped_sheet: bool = False
+):
     wb = Workbook()
     ws = wb.active
     ws.title = "Reconciliation"
@@ -2090,7 +2554,6 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
             _fmt_date(row.get("Pledge Date (M61)")),
             _fmt_num(row.get("Advance Rate (ACP)")),
             _fmt_num(row.get("Advance Rate (M61)")),
-            _fmt_num(row.get("Target Advance Rate (M61)")),
             _fmt_num(row.get("Spread (ACP)")),
             _fmt_num(row.get("Spread (M61)")),
             _fmt_num(row.get("Undrawn Capacity (ACP)")),
@@ -2174,133 +2637,133 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
         c2.alignment = _left()
         ws_leg.row_dimensions[r].height = 18
 
-    # --- Scoped Reconciliation (same layout as main sheet; filtered by Fund for this run) ---
-    ws_scoped = wb.create_sheet("Scoped Reconciliation")
-    scoped_title = (
-        f"{wb_ctx['title']}  —  Scoped: {scope_label_for_primary_type(primary_file_type)}"
-    )
-    ws_scoped.merge_cells(f"A1:{last_col}1")
-    c = ws_scoped["A1"]
-    c.value = scoped_title
-    c.font = Font(name="Arial", size=13, bold=True, color=WHITE)
-    c.fill = _fill(HEADER_BG)
-    c.alignment = _center()
-    ws_scoped.row_dimensions[1].height = 24
-
-    ws_scoped.merge_cells(f"A2:{last_col}2")
-    c = ws_scoped["A2"]
-    c.value = wb_ctx["subtitle"]
-    c.font = Font(name="Arial", size=9, italic=True, color=WHITE)
-    c.fill = _fill(SUBHDR_BG)
-    c.alignment = _center()
-    ws_scoped.row_dimensions[2].height = 16
-
-    for grp, c_start, c_end in runs:
-        if c_start != c_end:
-            ws_scoped.merge_cells(start_row=3, start_column=c_start, end_row=3, end_column=c_end)
-
-        cell = ws_scoped.cell(row=3, column=c_start)
-        cell.value = grp_labels[grp]
-        cell.font = _hdr_font()
-        cell.fill = _fill(GROUP_COLORS[grp])
-        cell.alignment = _center()
-        cell.border = BORDER
-
-        for cnum in range(c_start, c_end + 1):
-            ws_scoped.cell(row=3, column=cnum).fill = _fill(GROUP_COLORS[grp])
-            ws_scoped.cell(row=3, column=cnum).border = BORDER
-
-    ws_scoped.row_dimensions[3].height = 35
-
-    for i, (hdr, w, _, _, grp) in enumerate(COL_DEFS, 1):
-        cell = ws_scoped.cell(row=4, column=i)
-        cell.value = _excel_header_for_primary(hdr, col_suffix)
-        cell.font = _hdr_font()
-        cell.fill = _fill(GROUP_COLORS[grp])
-        cell.alignment = _center()
-        cell.border = BORDER
-        ws_scoped.column_dimensions[get_column_letter(i)].width = w
-
-    ws_scoped.row_dimensions[4].height = 36
-
-    scoped_df = filter_recon_to_selected_fund(df_recon, primary_file_type)
-    if scoped_df.empty:
-        note = ws_scoped.cell(5, 1)
-        note.value = (
-            f"No scoped rows found for {scope_label_for_primary_type(primary_file_type)} "
-            "(Fund filter did not match any rows)."
+    if include_scoped_sheet:
+        # Optional legacy scoped tab; disabled by default for cleaner downloads.
+        ws_scoped = wb.create_sheet("Scoped Reconciliation")
+        scoped_title = (
+            f"{wb_ctx['title']}  —  Scoped: {scope_label_for_primary_type(primary_file_type)}"
         )
-        note.font = _body_font()
-        note.alignment = _left()
-    else:
-        for data_row_idx, (_, row) in enumerate(scoped_df.iterrows(), 5):
-            row_bg = _row_bg(row.get("recon_status", ""))
+        ws_scoped.merge_cells(f"A1:{last_col}1")
+        c = ws_scoped["A1"]
+        c.value = scoped_title
+        c.font = Font(name="Arial", size=13, bold=True, color=WHITE)
+        c.fill = _fill(HEADER_BG)
+        c.alignment = _center()
+        ws_scoped.row_dimensions[1].height = 24
 
-            vals = [
-                _fmt_str_cell(row.get("Fund")),
-                _fmt_str_cell(row.get("Deal Name", "")),
-                _fmt_str_cell(row.get("Facility", "")),
-                _fmt_str_cell(row.get("Financial Line", "")),
-                _fmt_str_cell(row.get("Note Name", "")),
-                _fmt_str_cell(row.get("Liability Note (M61)", "")),
-                _fmt_str_cell(row.get("Deal ID (ACP)", "")),
-                _fmt_str_cell(row.get("Liability Note Suffix (M61)", "")),
-                _fmt_str_cell(row.get("Source", "")),
-                _fmt_str_cell(row.get("Source Indicator", "")),
-                _fmt_date(row.get("Effective Date (ACP)")),
-                _fmt_date(row.get("Effective Date (M61)")),
-                _fmt_date(row.get("Pledge Date (ACP)")),
-                _fmt_date(row.get("Pledge Date (M61)")),
-                _fmt_num(row.get("Advance Rate (ACP)")),
-                _fmt_num(row.get("Advance Rate (M61)")),
-                _fmt_num(row.get("Target Advance Rate (M61)")),
-                _fmt_num(row.get("Spread (ACP)")),
-                _fmt_num(row.get("Spread (M61)")),
-                _fmt_num(row.get("Undrawn Capacity (ACP)")),
-                _fmt_num(row.get("Undrawn Capacity (M61)")),
-                _fmt_index_floor_cell(row.get("Index Floor (ACP)")),
-                _fmt_index_floor_cell(row.get("Index Floor (M61)")),
-                _fmt_index_name_cell(row.get("Index Name (ACP)")),
-                _fmt_index_name_cell(row.get("Index Name (M61)")),
-                _fmt_num(row.get("Recourse % (ACP)")),
-                _fmt_num(row.get("Recourse % (M61)")),
-                _fmt_status(row.get("Advance Rate Status")),
-                _fmt_status(row.get("Spread Status")),
-                _fmt_status(row.get("Effective Date Status")),
-                _fmt_status(row.get("Undrawn Capacity Status")),
-                _fmt_status(row.get("Index Floor Status")),
-                _fmt_status(row.get("Index Name Status")),
-                _fmt_status(row.get("Recourse % Status")),
-                _fmt_status(row.get("Pledge Date Status")),
-                _fmt_status(row.get("recon_status")),
-            ]
+        ws_scoped.merge_cells(f"A2:{last_col}2")
+        c = ws_scoped["A2"]
+        c.value = wb_ctx["subtitle"]
+        c.font = Font(name="Arial", size=9, italic=True, color=WHITE)
+        c.fill = _fill(SUBHDR_BG)
+        c.alignment = _center()
+        ws_scoped.row_dimensions[2].height = 16
 
-            for col_idx, (val, (hdr, _w, pct, dt, grp)) in enumerate(zip(vals, COL_DEFS), 1):
-                cell = ws_scoped.cell(row=data_row_idx, column=col_idx)
-                cell.value = val
-                cell.border = BORDER
+        for grp, c_start, c_end in runs:
+            if c_start != c_end:
+                ws_scoped.merge_cells(start_row=3, start_column=c_start, end_row=3, end_column=c_end)
 
-                if grp == "STATUS":
-                    _status_cell(cell, val)
-                else:
-                    cell.fill = _fill(row_bg)
-                    cell.font = _body_font()
-                    if dt and val is not None:
-                        cell.number_format = "m/d/yy"
-                        cell.alignment = _center()
-                    elif pct and isinstance(val, float):
-                        cell.number_format = "0.00%"
-                        cell.alignment = _center()
-                    elif isinstance(val, str):
-                        cell.alignment = _left()
-                    elif grp in ("ACP", "LIB") and not dt and not pct and isinstance(val, (int, float)):
-                        cell.alignment = _center()
+            cell = ws_scoped.cell(row=3, column=c_start)
+            cell.value = grp_labels[grp]
+            cell.font = _hdr_font()
+            cell.fill = _fill(GROUP_COLORS[grp])
+            cell.alignment = _center()
+            cell.border = BORDER
+
+            for cnum in range(c_start, c_end + 1):
+                ws_scoped.cell(row=3, column=cnum).fill = _fill(GROUP_COLORS[grp])
+                ws_scoped.cell(row=3, column=cnum).border = BORDER
+
+        ws_scoped.row_dimensions[3].height = 35
+
+        for i, (hdr, w, _, _, grp) in enumerate(COL_DEFS, 1):
+            cell = ws_scoped.cell(row=4, column=i)
+            cell.value = _excel_header_for_primary(hdr, col_suffix)
+            cell.font = _hdr_font()
+            cell.fill = _fill(GROUP_COLORS[grp])
+            cell.alignment = _center()
+            cell.border = BORDER
+            ws_scoped.column_dimensions[get_column_letter(i)].width = w
+
+        ws_scoped.row_dimensions[4].height = 36
+
+        scoped_df = filter_recon_to_selected_fund(df_recon, primary_file_type)
+        if scoped_df.empty:
+            note = ws_scoped.cell(5, 1)
+            note.value = (
+                f"No scoped rows found for {scope_label_for_primary_type(primary_file_type)} "
+                "(Fund filter did not match any rows)."
+            )
+            note.font = _body_font()
+            note.alignment = _left()
+        else:
+            for data_row_idx, (_, row) in enumerate(scoped_df.iterrows(), 5):
+                row_bg = _row_bg(row.get("recon_status", ""))
+
+                vals = [
+                    _fmt_str_cell(row.get("Fund")),
+                    _fmt_str_cell(row.get("Deal Name", "")),
+                    _fmt_str_cell(row.get("Facility", "")),
+                    _fmt_str_cell(row.get("Financial Line", "")),
+                    _fmt_str_cell(row.get("Note Name", "")),
+                    _fmt_str_cell(row.get("Liability Note (M61)", "")),
+                    _fmt_str_cell(row.get("Deal ID (ACP)", "")),
+                    _fmt_str_cell(row.get("Liability Note Suffix (M61)", "")),
+                    _fmt_str_cell(row.get("Source", "")),
+                    _fmt_str_cell(row.get("Source Indicator", "")),
+                    _fmt_date(row.get("Effective Date (ACP)")),
+                    _fmt_date(row.get("Effective Date (M61)")),
+                    _fmt_date(row.get("Pledge Date (ACP)")),
+                    _fmt_date(row.get("Pledge Date (M61)")),
+                    _fmt_num(row.get("Advance Rate (ACP)")),
+                    _fmt_num(row.get("Advance Rate (M61)")),
+                    _fmt_num(row.get("Spread (ACP)")),
+                    _fmt_num(row.get("Spread (M61)")),
+                    _fmt_num(row.get("Undrawn Capacity (ACP)")),
+                    _fmt_num(row.get("Undrawn Capacity (M61)")),
+                    _fmt_index_floor_cell(row.get("Index Floor (ACP)")),
+                    _fmt_index_floor_cell(row.get("Index Floor (M61)")),
+                    _fmt_index_name_cell(row.get("Index Name (ACP)")),
+                    _fmt_index_name_cell(row.get("Index Name (M61)")),
+                    _fmt_num(row.get("Recourse % (ACP)")),
+                    _fmt_num(row.get("Recourse % (M61)")),
+                    _fmt_status(row.get("Advance Rate Status")),
+                    _fmt_status(row.get("Spread Status")),
+                    _fmt_status(row.get("Effective Date Status")),
+                    _fmt_status(row.get("Undrawn Capacity Status")),
+                    _fmt_status(row.get("Index Floor Status")),
+                    _fmt_status(row.get("Index Name Status")),
+                    _fmt_status(row.get("Recourse % Status")),
+                    _fmt_status(row.get("Pledge Date Status")),
+                    _fmt_status(row.get("recon_status")),
+                ]
+
+                for col_idx, (val, (hdr, _w, pct, dt, grp)) in enumerate(zip(vals, COL_DEFS), 1):
+                    cell = ws_scoped.cell(row=data_row_idx, column=col_idx)
+                    cell.value = val
+                    cell.border = BORDER
+
+                    if grp == "STATUS":
+                        _status_cell(cell, val)
                     else:
-                        cell.alignment = _left()
+                        cell.fill = _fill(row_bg)
+                        cell.font = _body_font()
+                        if dt and val is not None:
+                            cell.number_format = "m/d/yy"
+                            cell.alignment = _center()
+                        elif pct and isinstance(val, float):
+                            cell.number_format = "0.00%"
+                            cell.alignment = _center()
+                        elif isinstance(val, str):
+                            cell.alignment = _left()
+                        elif grp in ("ACP", "LIB") and not dt and not pct and isinstance(val, (int, float)):
+                            cell.alignment = _center()
+                        else:
+                            cell.alignment = _left()
 
-            ws_scoped.row_dimensions[data_row_idx].height = EXCEL_RECON_DATA_ROW_HEIGHT
+                ws_scoped.row_dimensions[data_row_idx].height = EXCEL_RECON_DATA_ROW_HEIGHT
 
-    ws_scoped.freeze_panes = "A5"
+        ws_scoped.freeze_panes = "A5"
     return wb
 
 

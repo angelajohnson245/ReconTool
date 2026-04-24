@@ -471,17 +471,38 @@ with st.sidebar:
     st.checkbox("Match", key="filter_status_match")
     st.checkbox("Missing", key="filter_status_missing")
     st.checkbox("Mismatch", key="filter_status_mismatch")
-    scope_mode = st.radio(
-        "Scope",
-        ["All Results", "Selected Fund Only"],
-        index=0,
-        help=(
-            "**All Results:** every reconciliation row. "
-            "**Selected Fund Only:** only rows whose `Fund` belongs to "
-            f"{scope_label_for_primary_type(primary_file_type)} scope "
-            "(including **Both**, primary-only, and M61-only rows for that fund)."
-        ),
-    )
+
+    # Scope selector is adaptive: hide the toggle when both modes yield the same rows.
+    scope_mode = "All Results"
+    scope_toggle_needed = True
+    if "df_recon" in st.session_state:
+        _scope_df = st.session_state.get("df_recon", pd.DataFrame())
+        _scope_primary = st.session_state.get("primary_file_type", primary_file_type)
+        if isinstance(_scope_df, pd.DataFrame) and not _scope_df.empty:
+            _scope_subset = filter_recon_to_selected_fund(_scope_df, _scope_primary)
+            scope_toggle_needed = not _scope_df.sort_index().equals(
+                _scope_subset.sort_index()
+            )
+
+    if scope_toggle_needed:
+        _scope_choice = st.radio(
+            "Scope",
+            ["Current Upload Results", "Selected Fund View"],
+            index=0,
+            help=(
+                "**Current Upload Results:** full reconciliation output for this run. "
+                "**Selected Fund View:** only rows whose `Fund` belongs to "
+                f"{scope_label_for_primary_type(primary_file_type)} scope."
+            ),
+        )
+        scope_mode = (
+            "Selected Fund Only"
+            if _scope_choice == "Selected Fund View"
+            else "All Results"
+        )
+    else:
+        scope_mode = "All Results"
+        st.caption("This output is already scoped to the uploaded ACP III business file.")
  
     st.markdown("---")
     st.markdown(
@@ -531,8 +552,13 @@ def pill(status):
  
  
 def pct(v):
+    if v is None:
+        return "—"
     try:
-        return f"{float(v):.2%}"
+        fv = float(v)
+        if pd.isna(fv):
+            return "—"
+        return f"{fv:.2%}"
     except Exception:
         return "—"
 
@@ -542,7 +568,10 @@ def fmt_fraction_as_pct(v, *, ndigits: int = 3):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return "—"
     try:
-        return f"{float(v):.{ndigits}%}"
+        fv = float(v)
+        if pd.isna(fv):
+            return "—"
+        return f"{fv:.{ndigits}%}"
     except (TypeError, ValueError):
         return "—"
  
@@ -596,7 +625,7 @@ def _acore_source_type_family(raw) -> str:
 def derive_liability_type_for_filter(row: pd.Series) -> str:
     """Best-effort liability type for UI filtering from available row fields."""
     # Prefer explicit M61 type when present in schema.
-    explicit_keys = ("Liability Type (M61)", "Liability Type")
+    explicit_keys = ("Liability Type (M61)", "Liability Type (M61 Raw)", "Liability Type")
     explicit_present = any(k in row.index for k in explicit_keys)
     for k in explicit_keys:
         if k in row.index and pd.notna(row.get(k)):
@@ -612,8 +641,26 @@ def derive_liability_type_for_filter(row: pd.Series) -> str:
     return _acore_source_type_family(row.get("Source"))
 
 
+def categorize_m61_note_for_filter(raw) -> str:
+    """UI-only M61 note category from Liability Note prefix."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return "Other"
+    s = str(raw).strip().upper()
+    if not s:
+        return "Other"
+    if s.startswith("LN_FIN"):
+        return "Financing"
+    if s.startswith("LN_SUB"):
+        return "Subline"
+    if s.startswith("LN_EQ"):
+        return "Equity/Fund"
+    return "Other"
+
+
 def to_excel_bytes(df_recon, primary_file_type: str):
     df_recon = normalize_recon_fund_for_output(df_recon)
+    # User-facing export hides internal Target Advance Rate column.
+    df_recon = df_recon.drop(columns=["Target Advance Rate (M61)"], errors="ignore")
     wb = build_workbook(df_recon, primary_file_type=primary_file_type)
     buf = io.BytesIO()
     wb.save(buf)
@@ -690,18 +737,20 @@ def run_reconciliation_for_selection(
                 path_map = os.path.join(tmpdir, "liability_to_cre_mapping.xlsx")
                 with open(path_map, "wb") as f:
                     f.write(mapping_upload.getbuffer())
-            df_recon, _, df_excluded_type = reconcile(
+            df_recon, _, df_excluded_type, recon_diag = reconcile(
                 path_a,
                 path_b,
                 primary_file_type=primary_file_type,
                 mapping_path=path_map,
                 uploaded_primary_filename=file_b_upload.name,
+                return_diagnostics=True,
             )
             df_recon = normalize_recon_fund_for_output(df_recon)
             st.session_state["df_recon"] = df_recon
             st.session_state["df_excluded_by_liability_type"] = (
                 df_excluded_type.copy() if df_excluded_type is not None else pd.DataFrame()
             )
+            st.session_state["recon_row_counts"] = dict(recon_diag or {})
             st.session_state["primary_file_type"] = primary_file_type
             st.session_state["primary_upload_name"] = file_b_upload.name
             st.session_state["excel_bytes"] = to_excel_bytes(df_recon, primary_file_type)
@@ -854,6 +903,77 @@ if "df_recon" in st.session_state:
     if deal_pick and deal_pick != "All deals":
         df_view = df_view[df_view["Deal Name"] == deal_pick]
 
+    if False and run_primary == "ACORE":
+        diag_counts = st.session_state.get("recon_row_counts", {}) or {}
+        with st.expander("ACP III row count validation", expanded=False):
+            st.caption(
+                "ACP III baseline pipeline counters to explain why raw M61 rows can differ from final reconciliation rows."
+            )
+            d1, d2, d3, d4 = st.columns(4)
+            with d1:
+                st.metric(
+                    "Raw ACP III rows loaded",
+                    int(diag_counts.get("raw_primary_rows_loaded", 0)),
+                )
+            with d2:
+                st.metric(
+                    "Raw M61 rows loaded",
+                    int(diag_counts.get("raw_m61_rows_loaded", 0)),
+                )
+            with d3:
+                st.metric(
+                    "M61 rows after ACP III fund filter",
+                    int(
+                        diag_counts.get(
+                            "m61_rows_after_fund_filter_for_primary",
+                            diag_counts.get("m61_rows_after_filters", 0),
+                        )
+                    ),
+                )
+            with d4:
+                st.metric(
+                    "M61 rows after liability-type filter",
+                    int(diag_counts.get("m61_rows_after_filters", 0)),
+                )
+
+            d5, d6, d7 = st.columns(3)
+            with d5:
+                st.metric(
+                    "ACP III rows after exclusions",
+                    int(
+                        diag_counts.get(
+                            "primary_rows_after_exclusions",
+                            diag_counts.get("raw_primary_rows_loaded", 0),
+                        )
+                    ),
+                )
+            with d6:
+                st.metric(
+                    "Final reconciliation rows",
+                    int(diag_counts.get("final_reconciliation_rows", len(df_all))),
+                )
+            with d7:
+                st.metric("Displayed rows", int(len(df_view)))
+
+            excl = int(diag_counts.get("m61_rows_excluded_by_type_filter", 0))
+            st.caption(
+                f"M61 rows excluded by liability-type filter: **{excl}** "
+                "(current in-scope types: Repo / Non / Subline)."
+            )
+            st.caption(
+                "Displayed rows include current scope + sidebar status filters + Deal filter. "
+                "Use this to compare with final reconciliation output."
+            )
+            basis = str(
+                diag_counts.get("reconciliation_basis", "outer_merge_preserving_both_files")
+            )
+            if basis == "outer_merge_preserving_both_files":
+                st.info(
+                    "Final reconciliation rows come from an **outer merge preserving both ACP III and M61 sides** "
+                    "(matched rows + ACP-only rows + M61-only rows)."
+                )
+            st.write("Temporary diagnostics payload", diag_counts)
+
     # TEMP validation only (remove when done debugging fund-scope vs primary-key-scope).
     _val_cols = [
         c
@@ -874,7 +994,7 @@ if "df_recon" in st.session_state:
         use = [c for c in _val_cols if c in df.columns]
         return df.head(10)[use] if use else df.head(10)
 
-    with st.expander("TEMP: validation — df_recon / df_scoped / df_view", expanded=False):
+    if False:  # TEMP diagnostics block hidden
         st.caption(
             "Compare **df_recon** (full recon) vs **df_scoped** (Fin Inpt–anchored scoped subset) "
             "vs **df_view** (after Scope + status + deal filters)."
@@ -929,46 +1049,8 @@ if "df_recon" in st.session_state:
                     height=160,
                 )
 
-    with st.expander("Excluded by Liability Type (validation)", expanded=False):
-        st.caption(
-            "Rows present in uploaded M61 file but excluded before financing-line reconciliation "
-            "because `Liability Type` is not one of `Repo` / `Non` / `Subline`."
-        )
-        ex_count = int(len(df_excluded_by_type)) if df_excluded_by_type is not None else 0
-        st.metric("Excluded rows", ex_count)
-        if ex_count == 0:
-            st.info("No rows were excluded by the Liability Type filter for this run.")
-        else:
-            if "Liability Type" in df_excluded_by_type.columns:
-                st.markdown("**Excluded count by Liability Type**")
-                st.dataframe(
-                    df_excluded_by_type["Liability Type"]
-                    .fillna("<NA>")
-                    .astype(str)
-                    .value_counts(dropna=False)
-                    .rename("rows")
-                    .to_frame(),
-                    use_container_width=True,
-                    height=160,
-                )
-            show_cols = [
-                c
-                for c in (
-                    "Deal Name",
-                    "Liability Type",
-                    "Liability Name",
-                    "Liability Note",
-                    "Effective Date",
-                    "Exclusion Reason",
-                )
-                if c in df_excluded_by_type.columns
-            ]
-            st.markdown("**Sample excluded rows (first 200)**")
-            st.dataframe(
-                df_excluded_by_type.loc[:, show_cols].head(200),
-                use_container_width=True,
-                height=320,
-            )
+    if False:  # validation block hidden
+        pass
  
     # ---- Metric cards ----
     total    = len(df_view)
@@ -1006,6 +1088,47 @@ if "df_recon" in st.session_state:
           <div class="value">{n_mismatch}</div>
           <div class="sub">Requires review</div>
         </div>""", unsafe_allow_html=True)
+
+    adv_src_vals = []
+    if "Advance Rate Source (M61)" in df_view.columns:
+        adv_src_vals = sorted(
+            {
+                str(v).strip()
+                for v in df_view["Advance Rate Source (M61)"].fillna("").astype(str).tolist()
+                if str(v).strip()
+            }
+        )
+    if not adv_src_vals:
+        adv_src_note = "Target Advance Rate"
+    elif len(adv_src_vals) == 1:
+        adv_src_note = adv_src_vals[0]
+    else:
+        adv_src_note = "Mixed (" + ", ".join(adv_src_vals) + ")"
+    st.caption(f"Advance Rate source: {adv_src_note}")
+
+    # Validation/debug expanders intentionally hidden from main UI for submission.
+
+    if False:  # Temporary Adv Rate debug hidden
+        with st.expander("Temporary Adv Rate row debug", expanded=False):
+            dbg_cols = [
+                "Deal Name",
+                "Liability Note (M61)",
+                "Liability Type (M61 Raw)",
+                "Target Advance Rate (M61)",
+                "Current Advance Rate (M61 Raw)",
+                "Deal Level Advance Rate (M61 Raw)",
+                "Advance Rate (M61)",
+                "Advance Rate Source (M61)",
+            ]
+            dbg_cols_present = [c for c in dbg_cols if c in df_view.columns]
+            if not dbg_cols_present:
+                st.caption("No advance-rate debug columns available in current view.")
+            else:
+                st.dataframe(
+                    df_view.loc[:, dbg_cols_present],
+                    use_container_width=True,
+                    height=260,
+                )
  
 # --- TEMP DIAGNOSTICS (HIDDEN FOR CLEAN UI) ---
 # diag = st.session_state.get("recon_diagnostics", {}) or {}
@@ -1051,7 +1174,11 @@ if "df_recon" in st.session_state:
         )
 
     with col_dl2:
-        csv_data = df_view.to_csv(index=False).encode("utf-8")
+        csv_data = (
+            df_view.drop(columns=["Target Advance Rate (M61)"], errors="ignore")
+            .to_csv(index=False)
+            .encode("utf-8")
+        )
 
         st.download_button(
             label="⬇️ Download CSV",
@@ -1102,7 +1229,6 @@ if "df_recon" in st.session_state:
                     "Fund": "" if pd.isna(row.get("Fund")) else str(row.get("Fund")),
                     "Deal Name": row.get("Deal Name", ""),
                     "Facility": row.get("Facility", ""),
-                    "Financial Line": row.get("Financial Line", ""),
                     "Source Type (ACORE)": row.get("Source", ""),
                     "Liability Type (M61)": derive_liability_type_for_filter(row),
                     f"Eff Date ({col_tag})": fmt_date(ed_acp),
@@ -1113,7 +1239,6 @@ if "df_recon" in st.session_state:
                     "Pledge Date (M61)": fmt_date(row.get("Pledge Date (M61)")),
                     f"Adv Rate ({col_tag})": pct(adv_acp),
                     "Adv Rate (M61)": pct(row.get("Advance Rate (M61)")),
-                    "Target Adv Rate": pct(row.get("Target Advance Rate (M61)")),
                     f"Spread ({col_tag})": pct(sp_acp),
                     "Spread (M61)": pct(row.get("Spread (M61)")),
                     f"Undrawn ({col_tag})": fmt_num_plain(und_acp),
@@ -1128,7 +1253,7 @@ if "df_recon" in st.session_state:
                     "Index Name (M61)": fmt_opt_text(row.get("Index Name (M61)")),
                     f"Recourse % ({col_tag})": pct(row.get("Recourse % (ACP)")),
                     "Recourse % (M61)": pct(row.get("Recourse % (M61)")),
-                    "Source Status": row.get("Source Indicator", ""),
+                    "Match Coverage": row.get("Source Indicator", ""),
                     "Adv Rate Status": _status_display(row.get("Advance Rate Status", "")),
                     "Spread Status": _status_display(row.get("Spread Status", "")),
                     "Eff Date Status": _status_display(row.get("Effective Date Status", "")),
@@ -1165,6 +1290,17 @@ if "df_recon" in st.session_state:
                 if not df_type_opts_base.empty
                 else pd.Series(dtype="object")
             )
+            note_category_opt_series = (
+                df_type_opts_base["Liability Note (M61)"].map(categorize_m61_note_for_filter)
+                if (
+                    not df_type_opts_base.empty
+                    and "Liability Note (M61)" in df_type_opts_base.columns
+                )
+                else pd.Series(dtype="object")
+            )
+            _diag = st.session_state.get("recon_row_counts", {}) or {}
+            m61_type_opts_from_diag = _diag.get("m61_liability_type_values_found", []) or []
+            m61_cat_opts_from_diag = _diag.get("m61_note_categories_found", []) or []
 
             # --- Column visibility (display-only; does not modify df_recon / df_view) ---
             all_display_cols = list(df_display.columns)
@@ -1279,15 +1415,12 @@ if "df_recon" in st.session_state:
                     unsafe_allow_html=True,
                 )
 
-                # Primary/basic filters (single horizontal row)
+                # Filters split into two rows of 3 so each widget has room to breathe.
+                # Row 1: identity-level filters (what the row is)
+                # Row 2: source/type filters (where the data came from)
                 primary_filter_cols = [
-                    "Fund",
-                    "Deal Name",
-                    "Facility",
-                    "Financial Line",
-                    "Source Type (ACORE)",
-                    "Liability Type (M61)",
-                    "Source Status",
+                    ["Fund", "Deal Name", "Facility"],
+                    ["Source Type (ACORE)", "Liability Type (M61)", "Match Coverage"],
                 ]
                 auto_fund_value = ""
                 auto_source_type_filter_vals = None  # list[str] | None
@@ -1323,80 +1456,86 @@ if "df_recon" in st.session_state:
                                 lt = lt[lt.ne("")]
                                 if not lt.empty and lt.nunique(dropna=False) == 1:
                                     auto_liability_type_filter_val = str(lt.iloc[0]).strip()
-                pf_ui_cols = st.columns(len(primary_filter_cols))
-                for i, fc in enumerate(primary_filter_cols):
-                    with pf_ui_cols[i]:
-                        # Source/Liability: options from scope-mode basis (fund subset or full
-                        # ``df_all``), not from ``df_display`` / post-deal / post-status ``df_view``.
-                        if fc == "Source Type (ACORE)":
-                            opts_src = src_type_opt_series
-                        elif fc == "Liability Type (M61)":
-                            opts_src = liability_type_opt_series
-                        else:
-                            opts_src = (
-                                df_display[fc]
-                                if fc in df_display.columns
-                                else pd.Series(dtype="object")
-                            )
-                        opts = sorted(
-                            {
-                                str(v).strip()
-                                for v in opts_src.fillna("").astype(str).tolist()
-                                if str(v).strip()
-                            }
-                        )
-                        base_key = f"recon_tbl_primary_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}"
-                        # Selected Fund Only: Fund = most common fund; Source/Liability = safe
-                        # prefill when scoped ACORE-side data implies one type family (Source
-                        # normalized before ``|``) and, for Liability, one distinct resolved type.
-                        if fc == "Fund" and scope_mode == "Selected Fund Only":
-                            ms_key = f"{base_key}_auto_scope"
-                            # Only prefill when empty/missing; allow manual edits in this mode.
-                            if auto_fund_value and auto_fund_value in opts:
-                                if ms_key not in st.session_state or not st.session_state.get(ms_key):
-                                    st.session_state[ms_key] = [auto_fund_value]
-                        elif fc == "Source Type (ACORE)":
-                            # Dedicated key so legacy raw-string widget state does not clash
-                            # with family-token options.
-                            ms_key = f"{base_key}_dispopts"
-                            if scope_mode == "Selected Fund Only" and auto_source_type_filter_vals:
-                                if all(v in opts for v in auto_source_type_filter_vals):
-                                    if ms_key not in st.session_state or not st.session_state.get(
-                                        ms_key
-                                    ):
-                                        st.session_state[ms_key] = list(auto_source_type_filter_vals)
-                        elif fc == "Liability Type (M61)":
-                            ms_key = f"{base_key}_dispopts"
-                            if (
-                                scope_mode == "Selected Fund Only"
-                                and auto_liability_type_filter_val
-                                and auto_liability_type_filter_val in opts
-                            ):
-                                if ms_key not in st.session_state or not st.session_state.get(ms_key):
-                                    st.session_state[ms_key] = [auto_liability_type_filter_val]
-                        else:
-                            ms_key = base_key
-                        selected_vals = st.multiselect(
-                            fc,
-                            options=opts,
-                            default=[],
-                            key=ms_key,
-                            help="Empty = show all values.",
-                        )
-                        if selected_vals:
-                            allow = set(selected_vals)
-                            if fc == "Source Type (ACORE)" and "Source Type (ACORE)" in df_display.columns:
-                                fam = df_display["Source Type (ACORE)"].map(_acore_source_type_family)
-                                keep_idx = df_display.loc[fam.isin(allow)].index
-                            elif fc in df_display.columns:
-                                keep_idx = df_display[
-                                    df_display[fc].fillna("").astype(str).str.strip().isin(allow)
-                                ].index
+
+                for row_filters in primary_filter_cols:
+                    pf_ui_cols = st.columns(len(row_filters))
+                    for i, fc in enumerate(row_filters):
+                        with pf_ui_cols[i]:
+                            # Source/Liability: options from scope-mode basis (fund subset or full
+                            # ``df_all``), not from ``df_display`` / post-deal / post-status ``df_view``.
+                            if fc == "Source Type (ACORE)":
+                                opts_src = src_type_opt_series
+                            elif fc == "Liability Type (M61)":
+                                opts_src = (
+                                    pd.Series(m61_type_opts_from_diag, dtype="object")
+                                    if m61_type_opts_from_diag
+                                    else liability_type_opt_series
+                                )
                             else:
-                                keep_idx = df_display.index[:0]
-                            df_table_view = df_table_view.loc[
-                                df_table_view.index.intersection(keep_idx)
-                            ]
+                                opts_src = (
+                                    df_display[fc]
+                                    if fc in df_display.columns
+                                    else pd.Series(dtype="object")
+                                )
+                            opts = sorted(
+                                {
+                                    str(v).strip()
+                                    for v in opts_src.fillna("").astype(str).tolist()
+                                    if str(v).strip()
+                                }
+                            )
+                            base_key = f"recon_tbl_primary_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}"
+                            # Selected Fund Only: Fund = most common fund; Source/Liability = safe
+                            # prefill when scoped ACORE-side data implies one type family (Source
+                            # normalized before ``|``) and, for Liability, one distinct resolved type.
+                            if fc == "Fund" and scope_mode == "Selected Fund Only":
+                                ms_key = f"{base_key}_auto_scope"
+                                # Only prefill when empty/missing; allow manual edits in this mode.
+                                if auto_fund_value and auto_fund_value in opts:
+                                    if ms_key not in st.session_state or not st.session_state.get(ms_key):
+                                        st.session_state[ms_key] = [auto_fund_value]
+                            elif fc == "Source Type (ACORE)":
+                                # Dedicated key so legacy raw-string widget state does not clash
+                                # with family-token options.
+                                ms_key = f"{base_key}_dispopts"
+                                if scope_mode == "Selected Fund Only" and auto_source_type_filter_vals:
+                                    if all(v in opts for v in auto_source_type_filter_vals):
+                                        if ms_key not in st.session_state or not st.session_state.get(
+                                            ms_key
+                                        ):
+                                            st.session_state[ms_key] = list(auto_source_type_filter_vals)
+                            elif fc == "Liability Type (M61)":
+                                ms_key = f"{base_key}_dispopts"
+                                if (
+                                    scope_mode == "Selected Fund Only"
+                                    and auto_liability_type_filter_val
+                                    and auto_liability_type_filter_val in opts
+                                ):
+                                    if ms_key not in st.session_state or not st.session_state.get(ms_key):
+                                        st.session_state[ms_key] = [auto_liability_type_filter_val]
+                            else:
+                                ms_key = base_key
+                            selected_vals = st.multiselect(
+                                fc,
+                                options=opts,
+                                default=[],
+                                key=ms_key,
+                                help="Empty = show all values.",
+                            )
+                            if selected_vals:
+                                allow = set(selected_vals)
+                                if fc == "Source Type (ACORE)" and "Source Type (ACORE)" in df_display.columns:
+                                    fam = df_display["Source Type (ACORE)"].map(_acore_source_type_family)
+                                    keep_idx = df_display.loc[fam.isin(allow)].index
+                                elif fc in df_display.columns:
+                                    keep_idx = df_display[
+                                        df_display[fc].fillna("").astype(str).str.strip().isin(allow)
+                                    ].index
+                                else:
+                                    keep_idx = df_display.index[:0]
+                                df_table_view = df_table_view.loc[
+                                    df_table_view.index.intersection(keep_idx)
+                                ]
 
                 # TEMP: Advanced Filters expander disabled — restore by uncommenting the block below
                 # and removing the standalone ``sort_cols_list`` block that follows.
@@ -1650,10 +1789,6 @@ if "df_recon" in st.session_state:
                     <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
                       <div style='font-size:0.65rem; color:#888; text-transform:uppercase; letter-spacing:.06em'>Adv Rate (M61)</div>
                       <div style='font-size:0.92rem; font-weight:600; color:#1a3a6c'>{pct(row.get("Advance Rate (M61)"))}</div>
-                    </div>
-                    <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
-                      <div style='font-size:0.65rem; color:#888; text-transform:uppercase; letter-spacing:.06em'>Target Adv Rate</div>
-                      <div style='font-size:0.92rem; font-weight:600; color:#1a3a6c'>{pct(row.get("Target Advance Rate (M61)"))}</div>
                     </div>
                     <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
                       <div style='font-size:0.65rem; color:#888; text-transform:uppercase; letter-spacing:.06em'>Spread ({col_tag})</div>
