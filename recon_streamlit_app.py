@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
  
 from recon_enhanced_output import (
+    PRIMARY_TYPE_FUND_CONFIG,
     STREAMLIT_PRIMARY_FILE_TYPES,
     PrimaryFileSchemaError,
     build_output_filename,
@@ -207,6 +208,8 @@ st.markdown("""
     overflow: hidden;
     border: 1px solid #dce8f4;
   }
+  /* Status column visuals are driven by pandas Styler (see ``status_cols`` / ``set_properties``).
+     Keep only light container rules here so non-status columns stay Streamlit-default. */
  
   /* Info box */
   .info-box {
@@ -240,6 +243,76 @@ st.markdown("""
 def ui_primary_label(primary_type: str) -> str:
     cfg = get_primary_config(primary_type)
     return cfg.get("ui_display_label", cfg.get("display_name", primary_type))
+
+
+def primary_scope_label_for_missing_banner(
+    uploaded_filename: str | None, primary_file_type: str
+) -> str:
+    """Short fund/file token for UI-only missing-side labels (matches filename heuristics elsewhere)."""
+    if uploaded_filename:
+        name = uploaded_filename.upper()
+        if re.search(r"\bACP\s+III\b", name):
+            return PRIMARY_TYPE_FUND_CONFIG["ACORE"]["scope_label"]
+        if re.search(r"\bACP\s+II\b", name):
+            return PRIMARY_TYPE_FUND_CONFIG["ACP II"]["scope_label"]
+        if re.search(r"\bAOC\s+II\b", name):
+            return PRIMARY_TYPE_FUND_CONFIG["AOC II"]["scope_label"]
+    cfg = PRIMARY_TYPE_FUND_CONFIG.get(primary_file_type) or {}
+    return str(cfg.get("scope_label") or primary_file_type).strip()
+
+
+def format_missing_status_display(
+    raw,
+    *,
+    primary_scope_label: str,
+    m61_label: str = "M61",
+) -> str:
+    """UI-only: normalize reconciliation missing strings to ``MISSING FROM … FILE`` wording."""
+    if raw is None:
+        return ""
+    try:
+        if isinstance(raw, float) and pd.isna(raw):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(raw).strip()
+    if not s:
+        return ""
+
+    su = s.upper()
+    # Backend bug-shield: effective date path could double-prefix; collapse for display.
+    dup_in = "MISSING IN MISSING IN "
+    dup_from = "MISSING FROM MISSING FROM "
+    if su.startswith(dup_in):
+        s = "MISSING IN " + s[len(dup_in) :].lstrip()
+        su = s.upper()
+    elif su.startswith(dup_from):
+        s = "MISSING FROM " + s[len(dup_from) :].lstrip()
+        su = s.upper()
+
+    def _is_m61_missing(u: str) -> bool:
+        return (
+            u.startswith("MISSING IN M61")
+            or u.startswith("MISSING FROM M61")
+            or (
+                (u.startswith("MISSING IN ") or u.startswith("MISSING FROM "))
+                and "M61" in u
+            )
+        )
+
+    if _is_m61_missing(su):
+        return f"MISSING FROM {m61_label} FILE"
+
+    scope = str(primary_scope_label).strip()
+    if not scope:
+        return s
+
+    if su.startswith("MISSING IN ") or su.startswith("MISSING FROM "):
+        if not (su.startswith("MISSING IN M61") or su.startswith("MISSING FROM M61")):
+            # Replace any prior token with the current upload/scope token.
+            return f"MISSING FROM {scope} FILE"
+
+    return s
 
 
 def infer_primary_type_from_filename(uploaded_filename: str | None) -> str | None:
@@ -504,6 +577,41 @@ def fmt_opt_text(v):
     return s if s else "—"
 
 
+def _acore_source_type_family(raw) -> str:
+    """Normalize ACORE `Source` / Source Type display to a single type family token.
+
+    Examples: ``Subline | Bank of America`` → ``Subline``; ``Repo`` → ``Repo``.
+    Blank / NaN → empty string (caller excludes from distinct-family logic).
+    """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    s = str(raw).strip()
+    if not s or s.upper() in ("NAN", "NONE", "<NA>", "NAT"):
+        return ""
+    if "|" in s:
+        s = s.split("|", 1)[0].strip()
+    return s
+
+
+def derive_liability_type_for_filter(row: pd.Series) -> str:
+    """Best-effort liability type for UI filtering from available row fields."""
+    # Prefer explicit M61 type when present in schema.
+    explicit_keys = ("Liability Type (M61)", "Liability Type")
+    explicit_present = any(k in row.index for k in explicit_keys)
+    for k in explicit_keys:
+        if k in row.index and pd.notna(row.get(k)):
+            s = str(row.get(k)).strip()
+            if s:
+                return s
+
+    # If explicit type fields are present but blank, keep blank (do not infer from Source).
+    if explicit_present:
+        return ""
+
+    # Fallback only when explicit type fields are not present in this dataset version.
+    return _acore_source_type_family(row.get("Source"))
+
+
 def to_excel_bytes(df_recon, primary_file_type: str):
     df_recon = normalize_recon_fund_for_output(df_recon)
     wb = build_workbook(df_recon, primary_file_type=primary_file_type)
@@ -662,6 +770,9 @@ if "df_recon" in st.session_state:
     pl_run = get_primary_config(run_primary)
     col_tag = pl_run["excel_primary_column_suffix"]
     run_primary_label = ui_primary_label(run_primary)
+    primary_missing_scope_lbl = primary_scope_label_for_missing_banner(
+        run_primary_upload_name, run_primary
+    )
     is_stale_selection = run_primary != primary_file_type
 
     if is_stale_selection:
@@ -971,13 +1082,29 @@ if "df_recon" in st.session_state:
                 und_liab = _col(
                     row, "Undrawn Capacity (M61)", "Current Undrawn Capacity (M61)"
                 )
+
+                def _status_display(v):
+                    if v is None:
+                        return ""
+                    try:
+                        if isinstance(v, float) and pd.isna(v):
+                            return ""
+                    except (TypeError, ValueError):
+                        pass
+                    s = str(v).strip()
+                    if "MISSING" not in s.upper():
+                        return s
+                    return format_missing_status_display(
+                        s, primary_scope_label=primary_missing_scope_lbl
+                    )
+
                 rec = {
                     "Fund": "" if pd.isna(row.get("Fund")) else str(row.get("Fund")),
                     "Deal Name": row.get("Deal Name", ""),
                     "Facility": row.get("Facility", ""),
                     "Financial Line": row.get("Financial Line", ""),
-                    "Source": row.get("Source", ""),
-                    "Source Indicator": row.get("Source Indicator", ""),
+                    "Source Type (ACORE)": row.get("Source", ""),
+                    "Liability Type (M61)": derive_liability_type_for_filter(row),
                     f"Eff Date ({col_tag})": fmt_date(ed_acp),
                     "Eff Date (M61)": fmt_date(row.get("Effective Date (M61)")),
                     f"Pledge Date ({col_tag})": fmt_date(
@@ -1001,19 +1128,43 @@ if "df_recon" in st.session_state:
                     "Index Name (M61)": fmt_opt_text(row.get("Index Name (M61)")),
                     f"Recourse % ({col_tag})": pct(row.get("Recourse % (ACP)")),
                     "Recourse % (M61)": pct(row.get("Recourse % (M61)")),
-                    "Adv Rate Status": row.get("Advance Rate Status", ""),
-                    "Spread Status": row.get("Spread Status", ""),
-                    "Eff Date Status": row.get("Effective Date Status", ""),
-                    "Undrawn Capacity Status": row.get("Undrawn Capacity Status", ""),
+                    "Source Status": row.get("Source Indicator", ""),
+                    "Adv Rate Status": _status_display(row.get("Advance Rate Status", "")),
+                    "Spread Status": _status_display(row.get("Spread Status", "")),
+                    "Eff Date Status": _status_display(row.get("Effective Date Status", "")),
+                    "Pledge Date Status": _status_display(row.get("Pledge Date Status", "")),
+                    "Undrawn Capacity Status": _status_display(
+                        row.get("Undrawn Capacity Status", "")
+                    ),
                     "Index Floor Status": row.get("Index Floor Status", ""),
                     "Index Name Status": row.get("Index Name Status", ""),
                     "Recourse % Status": row.get("Recourse % Status", ""),
-                    "Pledge Date Status": row.get("Pledge Date Status", ""),
-                    "Recon Status": row.get("recon_status", ""),
+                    "Recon Status": _status_display(row.get("recon_status", "")),
                 }
                 display_rows.append(rec)
 
             df_display = pd.DataFrame(display_rows)
+
+            # Option pools for **Source Type (ACORE)** / **Liability Type (M61)** table filters:
+            # - Selected Fund Only → rows in ``df_all`` whose index is in ``in_scope_ix``
+            #   (same fund scope as the initial ``df_view`` *before* status/deal narrowing).
+            # - All Results → full ``df_all``.
+            # Intentionally excludes sidebar recon-status checkboxes and the Deal picker so
+            # type dropdowns are scope-aware but not over-reduced vs. the displayed row set.
+            if scope_mode == "Selected Fund Only":
+                df_type_opts_base = df_all.loc[df_all.index.isin(in_scope_ix)].copy()
+            else:
+                df_type_opts_base = df_all.copy()
+            src_type_opt_series = (
+                df_type_opts_base["Source"].map(_acore_source_type_family)
+                if not df_type_opts_base.empty and "Source" in df_type_opts_base.columns
+                else pd.Series(dtype="object")
+            )
+            liability_type_opt_series = (
+                df_type_opts_base.apply(derive_liability_type_for_filter, axis=1)
+                if not df_type_opts_base.empty
+                else pd.Series(dtype="object")
+            )
 
             # --- Column visibility (display-only; does not modify df_recon / df_view) ---
             all_display_cols = list(df_display.columns)
@@ -1134,13 +1285,59 @@ if "df_recon" in st.session_state:
                     "Deal Name",
                     "Facility",
                     "Financial Line",
-                    "Source",
-                    "Source Indicator",
+                    "Source Type (ACORE)",
+                    "Liability Type (M61)",
+                    "Source Status",
                 ]
+                auto_fund_value = ""
+                auto_source_type_filter_vals = None  # list[str] | None
+                auto_liability_type_filter_val = None  # str | None
+                if scope_mode == "Selected Fund Only" and not df_display.empty:
+                    if "Fund" in df_display.columns:
+                        fund_vals = (
+                            df_display["Fund"]
+                            .fillna("")
+                            .astype(str)
+                            .str.strip()
+                        )
+                        fund_vals = fund_vals[fund_vals.ne("")]
+                        if not fund_vals.empty:
+                            # Most-common visible scoped fund for this run.
+                            auto_fund_value = str(fund_vals.value_counts().index[0]).strip()
+                    # Single ACORE source/type family (normalized before ``|``): prefill Source
+                    # filter with that family token. Use the same scope basis as type dropdowns
+                    # (``df_type_opts_base``), not deal/status-narrowed ``df_display``.
+                    if "Source" in df_type_opts_base.columns and not df_type_opts_base.empty:
+                        fam_series = df_type_opts_base["Source"].map(_acore_source_type_family)
+                        fam_nonempty = fam_series[fam_series.ne("")]
+                        if not fam_nonempty.empty:
+                            distinct_families = set(fam_nonempty.unique().tolist())
+                            if len(distinct_families) == 1:
+                                sole_family = next(iter(distinct_families))
+                                auto_source_type_filter_vals = [sole_family]
+                                lt = (
+                                    liability_type_opt_series.fillna("")
+                                    .astype(str)
+                                    .str.strip()
+                                )
+                                lt = lt[lt.ne("")]
+                                if not lt.empty and lt.nunique(dropna=False) == 1:
+                                    auto_liability_type_filter_val = str(lt.iloc[0]).strip()
                 pf_ui_cols = st.columns(len(primary_filter_cols))
                 for i, fc in enumerate(primary_filter_cols):
                     with pf_ui_cols[i]:
-                        opts_src = df_display[fc] if fc in df_display.columns else pd.Series(dtype="object")
+                        # Source/Liability: options from scope-mode basis (fund subset or full
+                        # ``df_all``), not from ``df_display`` / post-deal / post-status ``df_view``.
+                        if fc == "Source Type (ACORE)":
+                            opts_src = src_type_opt_series
+                        elif fc == "Liability Type (M61)":
+                            opts_src = liability_type_opt_series
+                        else:
+                            opts_src = (
+                                df_display[fc]
+                                if fc in df_display.columns
+                                else pd.Series(dtype="object")
+                            )
                         opts = sorted(
                             {
                                 str(v).strip()
@@ -1148,19 +1345,58 @@ if "df_recon" in st.session_state:
                                 if str(v).strip()
                             }
                         )
+                        base_key = f"recon_tbl_primary_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}"
+                        # Selected Fund Only: Fund = most common fund; Source/Liability = safe
+                        # prefill when scoped ACORE-side data implies one type family (Source
+                        # normalized before ``|``) and, for Liability, one distinct resolved type.
+                        if fc == "Fund" and scope_mode == "Selected Fund Only":
+                            ms_key = f"{base_key}_auto_scope"
+                            # Only prefill when empty/missing; allow manual edits in this mode.
+                            if auto_fund_value and auto_fund_value in opts:
+                                if ms_key not in st.session_state or not st.session_state.get(ms_key):
+                                    st.session_state[ms_key] = [auto_fund_value]
+                        elif fc == "Source Type (ACORE)":
+                            # Dedicated key so legacy raw-string widget state does not clash
+                            # with family-token options.
+                            ms_key = f"{base_key}_dispopts"
+                            if scope_mode == "Selected Fund Only" and auto_source_type_filter_vals:
+                                if all(v in opts for v in auto_source_type_filter_vals):
+                                    if ms_key not in st.session_state or not st.session_state.get(
+                                        ms_key
+                                    ):
+                                        st.session_state[ms_key] = list(auto_source_type_filter_vals)
+                        elif fc == "Liability Type (M61)":
+                            ms_key = f"{base_key}_dispopts"
+                            if (
+                                scope_mode == "Selected Fund Only"
+                                and auto_liability_type_filter_val
+                                and auto_liability_type_filter_val in opts
+                            ):
+                                if ms_key not in st.session_state or not st.session_state.get(ms_key):
+                                    st.session_state[ms_key] = [auto_liability_type_filter_val]
+                        else:
+                            ms_key = base_key
                         selected_vals = st.multiselect(
                             fc,
                             options=opts,
                             default=[],
-                            key=f"recon_tbl_primary_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}",
+                            key=ms_key,
                             help="Empty = show all values.",
                         )
-                        if selected_vals and fc in df_display.columns:
+                        if selected_vals:
                             allow = set(selected_vals)
-                            keep_idx = df_display[
-                                df_display[fc].fillna("").astype(str).str.strip().isin(allow)
-                            ].index
-                            df_table_view = df_table_view.loc[df_table_view.index.intersection(keep_idx)]
+                            if fc == "Source Type (ACORE)" and "Source Type (ACORE)" in df_display.columns:
+                                fam = df_display["Source Type (ACORE)"].map(_acore_source_type_family)
+                                keep_idx = df_display.loc[fam.isin(allow)].index
+                            elif fc in df_display.columns:
+                                keep_idx = df_display[
+                                    df_display[fc].fillna("").astype(str).str.strip().isin(allow)
+                                ].index
+                            else:
+                                keep_idx = df_display.index[:0]
+                            df_table_view = df_table_view.loc[
+                                df_table_view.index.intersection(keep_idx)
+                            ]
 
                 # TEMP: Advanced Filters expander disabled — restore by uncommenting the block below
                 # and removing the standalone ``sort_cols_list`` block that follows.
@@ -1256,7 +1492,7 @@ if "df_recon" in st.session_state:
                     "No rows match the **Table filters** above. Clear one or more multiselect filters to see data."
                 )
 
-            # Apply background color styling
+            # Status columns: color only (layout / padding / alignment shared via set_properties).
             def color_status(val):
                 v = str(val).strip().upper()
                 if v in ("N/A", "", "—", "-", "NAN", "NONE"):
@@ -1269,18 +1505,38 @@ if "df_recon" in st.session_state:
                     return "background-color: #ffeb9c; color: #7d6608; font-weight: 600;"
                 return ""
 
+            # Single ordered list: Spread Status is the reference column; all share identical UI.
             status_cols = [
+                "Source Status",
                 "Adv Rate Status",
                 "Spread Status",
                 "Eff Date Status",
+                "Pledge Date Status",
                 "Undrawn Capacity Status",
                 "Index Floor Status",
                 "Index Name Status",
                 "Recourse % Status",
-                "Pledge Date Status",
                 "Recon Status",
             ]
             status_cols_visible = [c for c in status_cols if c in df_table_view.columns]
+
+            # Same Streamlit width + Styler box for every status column; shorter header label
+            # for Undrawn only so the column is not widened by a long title vs. peers.
+            def _status_column_config(col_name: str):
+                if col_name == "Undrawn Capacity Status":
+                    return st.column_config.TextColumn(
+                        "Undrawn status",
+                        width="medium",
+                        help="Undrawn Capacity Status",
+                    )
+                return st.column_config.TextColumn(width="medium")
+
+            _status_col_cfg = {
+                c: _status_column_config(c)
+                for c in df_table_view.columns
+                if isinstance(c, str)
+                and (c.endswith(" Status") or c == "Recon Status")
+            }
 
             if df_table_view.empty:
                 styled = df_table_view.style
@@ -1288,7 +1544,29 @@ if "df_recon" in st.session_state:
                 styled = df_table_view.style
                 if status_cols_visible:
                     styled = styled.map(color_status, subset=status_cols_visible)
-                st.dataframe(styled, use_container_width=True, height=520)
+                    # Uniform cell box for all status columns (padding, wrap, center — Spread baseline).
+                    styled = styled.set_properties(
+                        subset=status_cols_visible,
+                        **{
+                            "text-align": "center",
+                            "vertical-align": "middle",
+                            "white-space": "normal",
+                            "word-wrap": "break-word",
+                            "overflow-wrap": "break-word",
+                            "box-sizing": "border-box",
+                            "padding": "10px 10px",
+                            "min-height": "3.25rem",
+                            "line-height": "1.35",
+                            "background-clip": "padding-box",
+                        },
+                    )
+            _df_kwargs: dict = {
+                "use_container_width": True,
+                "height": 580,
+            }
+            if _status_col_cfg:
+                _df_kwargs["column_config"] = _status_col_cfg
+            st.dataframe(styled, **_df_kwargs)
  
     with tab2:
         st.markdown('<div class="section-label">Deal Drilldown</div>', unsafe_allow_html=True)
@@ -1321,6 +1599,21 @@ if "df_recon" in st.session_state:
                 )
                 fund_lbl = "" if pd.isna(row.get("Fund")) else str(row.get("Fund"))
 
+                def _deal_status_display(v):
+                    if v is None:
+                        return ""
+                    try:
+                        if isinstance(v, float) and pd.isna(v):
+                            return ""
+                    except (TypeError, ValueError):
+                        pass
+                    s = str(v).strip()
+                    if "MISSING" not in s.upper():
+                        return s
+                    return format_missing_status_display(
+                        s, primary_scope_label=primary_missing_scope_lbl
+                    )
+
                 st.markdown(f"""
                 <div style='background:#fff; border-left:4px solid {border_color}; border-radius:8px;
                              padding:18px 22px; margin-bottom:14px;
@@ -1331,7 +1624,7 @@ if "df_recon" in st.session_state:
                       <span style='font-size:1.08rem; font-weight:700; color:#1a3a6c'>{fmt_date(ed_acp)}</span>
                       <div style='font-size:0.78rem; color:#5a7a99; margin-top:6px;'>Fund: <strong>{fund_lbl or "—"}</strong></div>
                     </div>
-                    <div style='flex-shrink:0;'>{pill(row.get("recon_status", ""))}</div>
+                    <div style='flex-shrink:0;'>{pill(_deal_status_display(row.get("recon_status", "")))}</div>
                   </div>
                   <div style='display:grid; grid-template-columns:repeat(2, minmax(280px, 1fr)); gap:12px;'>
                     <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
@@ -1404,14 +1697,14 @@ if "df_recon" in st.session_state:
                     </div>
                   </div>
                   <div style='display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; margin-top:10px;'>
-                    <div style='font-size:0.74rem;'>Adv Rate: {pill(row.get("Advance Rate Status",""))}</div>
-                    <div style='font-size:0.74rem;'>Spread: {pill(row.get("Spread Status",""))}</div>
-                    <div style='font-size:0.74rem;'>Eff Date: {pill(row.get("Effective Date Status",""))}</div>
-                    <div style='font-size:0.74rem;'>Undrawn: {pill(row.get("Undrawn Capacity Status",""))}</div>
+                    <div style='font-size:0.74rem;'>Adv Rate: {pill(_deal_status_display(row.get("Advance Rate Status","")))}</div>
+                    <div style='font-size:0.74rem;'>Spread: {pill(_deal_status_display(row.get("Spread Status","")))}</div>
+                    <div style='font-size:0.74rem;'>Eff Date: {pill(_deal_status_display(row.get("Effective Date Status","")))}</div>
+                    <div style='font-size:0.74rem;'>Undrawn: {pill(_deal_status_display(row.get("Undrawn Capacity Status","")))}</div>
                     <div style='font-size:0.74rem;'>Index Floor: {pill(row.get("Index Floor Status",""))}</div>
                     <div style='font-size:0.74rem;'>Index Name: {pill(row.get("Index Name Status",""))}</div>
                     <div style='font-size:0.74rem;'>Recourse %: {pill(row.get("Recourse % Status",""))}</div>
-                    <div style='font-size:0.74rem;'>Pledge Date: {pill(row.get("Pledge Date Status",""))}</div>
+                    <div style='font-size:0.74rem;'>Pledge Date: {pill(_deal_status_display(row.get("Pledge Date Status","")))}</div>
                   </div>
                 </div>
                 """, unsafe_allow_html=True)

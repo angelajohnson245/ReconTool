@@ -787,7 +787,18 @@ def load_file_a(path: str, *, return_excluded: bool = False):
     )
     excluded_by_type = df.loc[
         ~liab_type_mask,
-        [c for c in ("Deal Name", "Liability Type", "Liability Name", "Liability Note", "Effective Date") if c in df.columns],
+        [
+            c
+            for c in (
+                "Fund Name",
+                "Deal Name",
+                "Liability Type",
+                "Liability Name",
+                "Liability Note",
+                "Effective Date",
+            )
+            if c in df.columns
+        ],
     ].copy()
     excluded_by_type["Exclusion Reason"] = "Excluded by Liability Type filter"
     ex_type_counts = (
@@ -1367,6 +1378,8 @@ def reconcile(
     a["source_bucket"] = a["Liability Type"].apply(_source_bucket) if "Liability Type" in a.columns else ""
     b["source_aware_key"] = b["deal_date_key"] + " | " + b["source_bucket"]
     a["source_aware_key"] = a["deal_date_key"] + " | " + a["source_bucket"]
+    b["source_aware_facility_key"] = b["source_aware_key"] + " | " + b["facility_norm"]
+    a["source_aware_facility_key"] = a["source_aware_key"] + " | " + a["facility_norm"]
     fcfg = _fund_cfg(primary_file_type)
     fpattern = fcfg.get("fund_regex") or (
         re.escape(fcfg.get("fund_token")) if fcfg.get("fund_token") else None
@@ -1419,11 +1432,18 @@ def reconcile(
             pair_rows.append({"_row_id_b": rid_b, "_row_id_a": rid_a, "_match_stage": stage, "_merge": "both"})
             br = b_by_id.loc[rid_b]
             ar = a_by_id.loc[rid_a]
+            reason = {
+                "strict": "all strict components aligned (deal, facility, note, effective date)",
+                "source_aware_facility": "same deal+effective date+source with facility alignment",
+                "source_aware": "same deal+effective date+source",
+                "fallback": "fallback on deal+effective date only",
+            }.get(stage, stage)
             _debug_rows(
                 "TEMP DEBUG: selected pair "
                 f"stage={stage} acp_id={rid_b} m61_id={rid_a} "
                 f"deal={br.get('Deal Name')!r} eff_key={br.get('effective_date_key')!r} "
-                f"acp_source={br.get('Source')!r} m61_type={ar.get('Liability Type')!r}"
+                f"acp_source={br.get('Source')!r} m61_type={ar.get('Liability Type')!r} "
+                f"m61_undrawn={ar.get('Undrawn Capacity')!r} reason={reason}"
             )
         return len(pairs)
 
@@ -1456,7 +1476,8 @@ def reconcile(
                 _debug_rows(
                     "TEMP DEBUG:   M61 cand "
                     f"id={int(ar['_row_id_a'])} deal={ar.get('Deal Name')!r} liab_type={ar.get('Liability Type')!r} "
-                    f"source_bucket={ar.get('source_bucket')!r} eff_key={ar.get('effective_date_key')!r}"
+                    f"source_bucket={ar.get('source_bucket')!r} eff_key={ar.get('effective_date_key')!r} "
+                    f"facility_norm={ar.get('facility_norm')!r} undrawn={ar.get('Undrawn Capacity')!r}"
                 )
             src_match_n = len(
                 p_cand[["_row_id_b", "source_bucket"]]
@@ -1468,6 +1489,11 @@ def reconcile(
             )
             _debug_rows(f"TEMP DEBUG:   source-aware candidate links={src_match_n}")
             cand_logged += 1
+
+    source_fac_n = _pair_by_key(
+        "source_aware_facility_key", "source_aware_facility_key", "source_aware_facility"
+    )
+    _debug_rows(f"TEMP DEBUG: staged matcher source-aware+facility matches={source_fac_n}")
 
     source_n = _pair_by_key("source_aware_key", "source_aware_key", "source_aware")
     _debug_rows(f"TEMP DEBUG: staged matcher source-aware matches={source_n}")
@@ -1599,6 +1625,12 @@ def reconcile(
             val_a = row.get(f"{label_a}_{a_field}")
             val_b = row.get(b_field)
             liability_label = LIABILITY_VALUE_LABELS.get(a_field, f"{a_field} (M61)")
+
+            # ACORE business rule: Spread is ACP-only in this run; M61 spread is not a shared compare field.
+            if b_field == "Spread" and primary_file_type == "ACORE":
+                record["Spread (M61)"] = pd.NA
+                record["Spread Status"] = "MISSING IN M61 FILE"
+                continue
 
             if only_target_from_invis and a_field != "target":
                 record[liability_label] = pd.NA
