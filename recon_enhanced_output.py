@@ -417,6 +417,7 @@ RECON_ORDERED_COLS = [
     "Financial Line",
     "Note Name",
     "Liability Note (M61)",
+    "M61 Note Category",
     "Deal ID (ACP)",
     "Deal ID Match Key (ACP)",
     "Liability Note Suffix (M61)",
@@ -1043,6 +1044,40 @@ def normalise_deal_id_key(value) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip().lower()
+
+
+# Ordered category list used by both backend column derivation and UI filter defaults.
+M61_NOTE_CATEGORIES: list[str] = ["Financing", "Subline", "Equity/Fund", "Other"]
+
+
+def categorize_m61_note(value) -> str:
+    """Derive M61 Note Category from Liability Note prefix.
+
+    - ``LN_Fin…``  → "Financing"  (repo / facility lines — primary recon rows)
+    - ``LN_Sub…``  → "Subline"
+    - ``LN_Eq…``   → "Equity/Fund"
+    - anything else → "Other"
+
+    Consistent with the UI helper ``categorize_m61_note_for_filter`` in the Streamlit app;
+    this is the single source of truth — the Streamlit helper should delegate here.
+    """
+    if value is None:
+        return "Other"
+    try:
+        if pd.isna(value):
+            return "Other"
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip().upper()
+    if not s:
+        return "Other"
+    if s.startswith("LN_FIN"):
+        return "Financing"
+    if s.startswith("LN_SUB"):
+        return "Subline"
+    if s.startswith("LN_EQ"):
+        return "Equity/Fund"
+    return "Other"
 
 
 def _source_bucket(value) -> str:
@@ -2045,6 +2080,11 @@ def reconcile(
             val_b = row.get(b_field)
             liability_label = LIABILITY_VALUE_LABELS.get(a_field, f"{a_field} (M61)")
 
+            # ACORE business rule: Spread is ACP-only in this run; M61 spread is not a shared compare field.
+            if b_field == "Spread" and primary_file_type == "ACORE":
+                record["Spread (M61)"] = pd.NA
+                record["Spread Status"] = "MISSING IN M61 FILE"
+                continue
 
             if only_target_from_invis and a_field != "target":
                 record[liability_label] = pd.NA
@@ -2112,6 +2152,9 @@ def reconcile(
             record[business_col] = (
                 pd.NA if (only_target_from_invis and a_col != "target") else row.get(f"{label_a}_{a_col}")
             )
+
+        # Derive M61 Note Category from Liability Note (M61) — display/filter only, no effect on matching.
+        record["M61 Note Category"] = categorize_m61_note(record.get("Liability Note (M61)"))
 
         pliab = pd.NA if only_target_from_invis else (row.get(f"{label_a}_Pledge") if in_a else pd.NA)
         pacp = row.get("Pledge") if in_b else pd.NA
@@ -2267,6 +2310,27 @@ def reconcile(
             else "outer_merge_preserving_both_files"
         ),
         "m61_id_extraction_preview": a.loc[:, m61_dbg_cols].head(50).to_dict("records"),
+        # Note category and liability type breakdowns for UI debug panel.
+        "m61_note_category_counts": (
+            df_out["M61 Note Category"]
+            .fillna("Other")
+            .astype(str)
+            .value_counts(dropna=False)
+            .to_dict()
+            if "M61 Note Category" in df_out.columns
+            else {}
+        ),
+        "m61_liability_type_counts": (
+            df_out["Liability Type (M61 Raw)"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace("", "Blank/Unknown")
+            .value_counts(dropna=False)
+            .to_dict()
+            if "Liability Type (M61 Raw)" in df_out.columns
+            else {}
+        ),
     }
     _debug_rows(f"Diagnostics snapshot: {LAST_RECON_DIAGNOSTICS}")
     if return_diagnostics:
@@ -2459,9 +2523,7 @@ def _excel_header_for_primary(hdr: str, column_suffix: str) -> str:
     return hdr.replace("(ACP)", f"({column_suffix})")
 
 
-def build_workbook(
-    df_recon, primary_file_type: str = "ACORE", include_scoped_sheet: bool = False
-):
+def build_workbook(df_recon, primary_file_type: str = "ACORE"):
     wb = Workbook()
     ws = wb.active
     ws.title = "Reconciliation"
@@ -2637,133 +2699,6 @@ def build_workbook(
         c2.alignment = _left()
         ws_leg.row_dimensions[r].height = 18
 
-    if include_scoped_sheet:
-        # Optional legacy scoped tab; disabled by default for cleaner downloads.
-        ws_scoped = wb.create_sheet("Scoped Reconciliation")
-        scoped_title = (
-            f"{wb_ctx['title']}  —  Scoped: {scope_label_for_primary_type(primary_file_type)}"
-        )
-        ws_scoped.merge_cells(f"A1:{last_col}1")
-        c = ws_scoped["A1"]
-        c.value = scoped_title
-        c.font = Font(name="Arial", size=13, bold=True, color=WHITE)
-        c.fill = _fill(HEADER_BG)
-        c.alignment = _center()
-        ws_scoped.row_dimensions[1].height = 24
-
-        ws_scoped.merge_cells(f"A2:{last_col}2")
-        c = ws_scoped["A2"]
-        c.value = wb_ctx["subtitle"]
-        c.font = Font(name="Arial", size=9, italic=True, color=WHITE)
-        c.fill = _fill(SUBHDR_BG)
-        c.alignment = _center()
-        ws_scoped.row_dimensions[2].height = 16
-
-        for grp, c_start, c_end in runs:
-            if c_start != c_end:
-                ws_scoped.merge_cells(start_row=3, start_column=c_start, end_row=3, end_column=c_end)
-
-            cell = ws_scoped.cell(row=3, column=c_start)
-            cell.value = grp_labels[grp]
-            cell.font = _hdr_font()
-            cell.fill = _fill(GROUP_COLORS[grp])
-            cell.alignment = _center()
-            cell.border = BORDER
-
-            for cnum in range(c_start, c_end + 1):
-                ws_scoped.cell(row=3, column=cnum).fill = _fill(GROUP_COLORS[grp])
-                ws_scoped.cell(row=3, column=cnum).border = BORDER
-
-        ws_scoped.row_dimensions[3].height = 35
-
-        for i, (hdr, w, _, _, grp) in enumerate(COL_DEFS, 1):
-            cell = ws_scoped.cell(row=4, column=i)
-            cell.value = _excel_header_for_primary(hdr, col_suffix)
-            cell.font = _hdr_font()
-            cell.fill = _fill(GROUP_COLORS[grp])
-            cell.alignment = _center()
-            cell.border = BORDER
-            ws_scoped.column_dimensions[get_column_letter(i)].width = w
-
-        ws_scoped.row_dimensions[4].height = 36
-
-        scoped_df = filter_recon_to_selected_fund(df_recon, primary_file_type)
-        if scoped_df.empty:
-            note = ws_scoped.cell(5, 1)
-            note.value = (
-                f"No scoped rows found for {scope_label_for_primary_type(primary_file_type)} "
-                "(Fund filter did not match any rows)."
-            )
-            note.font = _body_font()
-            note.alignment = _left()
-        else:
-            for data_row_idx, (_, row) in enumerate(scoped_df.iterrows(), 5):
-                row_bg = _row_bg(row.get("recon_status", ""))
-
-                vals = [
-                    _fmt_str_cell(row.get("Fund")),
-                    _fmt_str_cell(row.get("Deal Name", "")),
-                    _fmt_str_cell(row.get("Facility", "")),
-                    _fmt_str_cell(row.get("Financial Line", "")),
-                    _fmt_str_cell(row.get("Note Name", "")),
-                    _fmt_str_cell(row.get("Liability Note (M61)", "")),
-                    _fmt_str_cell(row.get("Deal ID (ACP)", "")),
-                    _fmt_str_cell(row.get("Liability Note Suffix (M61)", "")),
-                    _fmt_str_cell(row.get("Source", "")),
-                    _fmt_str_cell(row.get("Source Indicator", "")),
-                    _fmt_date(row.get("Effective Date (ACP)")),
-                    _fmt_date(row.get("Effective Date (M61)")),
-                    _fmt_date(row.get("Pledge Date (ACP)")),
-                    _fmt_date(row.get("Pledge Date (M61)")),
-                    _fmt_num(row.get("Advance Rate (ACP)")),
-                    _fmt_num(row.get("Advance Rate (M61)")),
-                    _fmt_num(row.get("Spread (ACP)")),
-                    _fmt_num(row.get("Spread (M61)")),
-                    _fmt_num(row.get("Undrawn Capacity (ACP)")),
-                    _fmt_num(row.get("Undrawn Capacity (M61)")),
-                    _fmt_index_floor_cell(row.get("Index Floor (ACP)")),
-                    _fmt_index_floor_cell(row.get("Index Floor (M61)")),
-                    _fmt_index_name_cell(row.get("Index Name (ACP)")),
-                    _fmt_index_name_cell(row.get("Index Name (M61)")),
-                    _fmt_num(row.get("Recourse % (ACP)")),
-                    _fmt_num(row.get("Recourse % (M61)")),
-                    _fmt_status(row.get("Advance Rate Status")),
-                    _fmt_status(row.get("Spread Status")),
-                    _fmt_status(row.get("Effective Date Status")),
-                    _fmt_status(row.get("Undrawn Capacity Status")),
-                    _fmt_status(row.get("Index Floor Status")),
-                    _fmt_status(row.get("Index Name Status")),
-                    _fmt_status(row.get("Recourse % Status")),
-                    _fmt_status(row.get("Pledge Date Status")),
-                    _fmt_status(row.get("recon_status")),
-                ]
-
-                for col_idx, (val, (hdr, _w, pct, dt, grp)) in enumerate(zip(vals, COL_DEFS), 1):
-                    cell = ws_scoped.cell(row=data_row_idx, column=col_idx)
-                    cell.value = val
-                    cell.border = BORDER
-
-                    if grp == "STATUS":
-                        _status_cell(cell, val)
-                    else:
-                        cell.fill = _fill(row_bg)
-                        cell.font = _body_font()
-                        if dt and val is not None:
-                            cell.number_format = "m/d/yy"
-                            cell.alignment = _center()
-                        elif pct and isinstance(val, float):
-                            cell.number_format = "0.00%"
-                            cell.alignment = _center()
-                        elif isinstance(val, str):
-                            cell.alignment = _left()
-                        elif grp in ("ACP", "LIB") and not dt and not pct and isinstance(val, (int, float)):
-                            cell.alignment = _center()
-                        else:
-                            cell.alignment = _left()
-
-                ws_scoped.row_dimensions[data_row_idx].height = EXCEL_RECON_DATA_ROW_HEIGHT
-
-        ws_scoped.freeze_panes = "A5"
     return wb
 
 

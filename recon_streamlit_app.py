@@ -14,9 +14,11 @@ import streamlit as st
 from recon_enhanced_output import (
     PRIMARY_TYPE_FUND_CONFIG,
     STREAMLIT_PRIMARY_FILE_TYPES,
+    M61_NOTE_CATEGORIES,
     PrimaryFileSchemaError,
     build_output_filename,
     build_workbook,
+    categorize_m61_note,
     filter_recon_to_selected_fund,
     get_primary_config,
     normalise_facility,
@@ -456,6 +458,9 @@ with st.sidebar:
     st.markdown("## 🔍 Filters")
     st.caption("Recon status")
 
+    # Apply M61 note-category default *before* the selectbox is instantiated (same-run safe).
+    if st.session_state.pop("recon_pending_m61_note_category_reset", False):
+        st.session_state["recon_m61_note_category"] = "Financing"
 
     if st.session_state.pop("reset_status_filters", False):
         st.session_state["filter_status_match"] = True
@@ -503,6 +508,18 @@ with st.sidebar:
     else:
         scope_mode = "All Results"
         st.caption("This output is already scoped to the uploaded ACP III business file.")
+
+    if "recon_m61_note_category" not in st.session_state:
+        st.session_state["recon_m61_note_category"] = "Financing"
+    st.selectbox(
+        "M61 Note Category",
+        options=["All"] + list(M61_NOTE_CATEGORIES),
+        key="recon_m61_note_category",
+        help=(
+            "Filters the **displayed** table, metrics, drilldown, and downloads together with **Scope**. "
+            "**Financing** (LN_Fin…) is the default. Choose **All** to show every category."
+        ),
+    )
  
     st.markdown("---")
     st.markdown(
@@ -642,19 +659,25 @@ def derive_liability_type_for_filter(row: pd.Series) -> str:
 
 
 def categorize_m61_note_for_filter(raw) -> str:
-    """UI-only M61 note category from Liability Note prefix."""
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return "Other"
-    s = str(raw).strip().upper()
-    if not s:
-        return "Other"
-    if s.startswith("LN_FIN"):
-        return "Financing"
-    if s.startswith("LN_SUB"):
-        return "Subline"
-    if s.startswith("LN_EQ"):
-        return "Equity/Fund"
-    return "Other"
+    """Delegate to the canonical backend function — single source of truth."""
+    return categorize_m61_note(raw)
+
+
+def _series_m61_note_category(df: pd.DataFrame) -> pd.Series:
+    """Per-row M61 note category for filtering (matches ``categorize_m61_note``)."""
+    if df is None or df.empty:
+        return pd.Series(dtype="object")
+    if "M61 Note Category" in df.columns:
+        return df["M61 Note Category"].fillna("Other").astype(str).str.strip()
+    if "Liability Note (M61)" in df.columns:
+        return (
+            df["Liability Note (M61)"]
+            .map(categorize_m61_note)
+            .fillna("Other")
+            .astype(str)
+            .str.strip()
+        )
+    return pd.Series(["Other"] * len(df), index=df.index, dtype="object")
 
 
 def to_excel_bytes(df_recon, primary_file_type: str):
@@ -710,12 +733,16 @@ def _reset_table_filter_state() -> None:
         "recon_tbl_primary_ms_",
         "recon_tbl_adv_ms_",
         "recon_tbl_sort_",
+        "recon_tbl_notecat_",
     )
     for k in list(st.session_state.keys()):
         if isinstance(k, str) and k.startswith(prefixes):
             del st.session_state[k]
     st.session_state["recon_hide_blank_cols"] = False
     st.session_state["recon_deal_pick"] = "All deals"
+    # Cannot set ``recon_m61_note_category`` here: sidebar selectbox may already exist this run.
+    # Apply default on the *next* run before the widget is created (see sidebar Filters block).
+    st.session_state["recon_pending_m61_note_category_reset"] = True
 
 
 def run_reconciliation_for_selection(
@@ -753,7 +780,7 @@ def run_reconciliation_for_selection(
             st.session_state["recon_row_counts"] = dict(recon_diag or {})
             st.session_state["primary_file_type"] = primary_file_type
             st.session_state["primary_upload_name"] = file_b_upload.name
-            st.session_state["excel_bytes"] = to_excel_bytes(df_recon, primary_file_type)
+            # Excel is built at download time from the same filtered view as the table.
             # Persist exact download names from this successful run context.
             st.session_state["last_run_excel_name"] = build_output_filename(
                 primary_file_type, "xlsx", uploaded_filename=file_b_upload.name
@@ -887,6 +914,12 @@ if "df_recon" in st.session_state:
             "**All Results:** full reconciliation output. **Selected Fund Only:** "
             f"subset to **{run_primary_label}** fund scope (see Scope info)."
         )
+
+    # M61 Note Category (sidebar): same filter for display, metrics, drilldown, and exports.
+    _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
+    if _note_pick != "All":
+        _cat_s = _series_m61_note_category(df_view)
+        df_view = df_view.loc[_cat_s.eq(_note_pick)].copy()
 
     # Apply status + deal filters on the current view.
     status_filter = []
@@ -1106,7 +1139,7 @@ if "df_recon" in st.session_state:
         adv_src_note = "Mixed (" + ", ".join(adv_src_vals) + ")"
     st.caption(f"Advance Rate source: {adv_src_note}")
 
-    # Validation/debug expanders intentionally hidden from main UI for submission.
+    # Validation/debug expanders hidden from submission UI.
 
     if False:  # Temporary Adv Rate debug hidden
         with st.expander("Temporary Adv Rate row debug", expanded=False):
@@ -1160,36 +1193,10 @@ if "df_recon" in st.session_state:
 #         st.metric("Subline", int(lt_counts.get("Subline", 0)))
 
     st.markdown("<br>", unsafe_allow_html=True)
- 
-    # ---- Download + count ----
-    col_dl1, col_dl2, col_count = st.columns([2, 2, 5])
 
-    with col_dl1:
-        st.download_button(
-            label="⬇️ Download Excel",
-            data=st.session_state["excel_bytes"],
-            file_name=run_excel_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            disabled=is_stale_selection,
-        )
+    # Default export matches df_view; tab1 updates this to the table row set + sort order when applicable.
+    df_export_ui = df_view.copy()
 
-    with col_dl2:
-        csv_data = (
-            df_view.drop(columns=["Target Advance Rate (M61)"], errors="ignore")
-            .to_csv(index=False)
-            .encode("utf-8")
-        )
-
-        st.download_button(
-            label="⬇️ Download CSV",
-            data=csv_data,
-            file_name=run_csv_name,
-            mime="text/csv",
-            disabled=is_stale_selection,
-        )
-    if is_stale_selection:
-        st.caption("Downloads are disabled until you rerun with the current selection.")
-    
     # ---- Tabs ----
     tab1, tab2 = st.tabs(["  All Results  ", "  Deal Drilldown  "])
  
@@ -1229,8 +1236,10 @@ if "df_recon" in st.session_state:
                     "Fund": "" if pd.isna(row.get("Fund")) else str(row.get("Fund")),
                     "Deal Name": row.get("Deal Name", ""),
                     "Facility": row.get("Facility", ""),
+                    "Financial Line": row.get("Financial Line", ""),
                     "Source Type (ACORE)": row.get("Source", ""),
                     "Liability Type (M61)": derive_liability_type_for_filter(row),
+                    "M61 Note Category": str(row.get("M61 Note Category") or "Other"),
                     f"Eff Date ({col_tag})": fmt_date(ed_acp),
                     "Eff Date (M61)": fmt_date(row.get("Effective Date (M61)")),
                     f"Pledge Date ({col_tag})": fmt_date(
@@ -1253,7 +1262,7 @@ if "df_recon" in st.session_state:
                     "Index Name (M61)": fmt_opt_text(row.get("Index Name (M61)")),
                     f"Recourse % ({col_tag})": pct(row.get("Recourse % (ACP)")),
                     "Recourse % (M61)": pct(row.get("Recourse % (M61)")),
-                    "Match Coverage": row.get("Source Indicator", ""),
+                    "Source Status": row.get("Source Indicator", ""),
                     "Adv Rate Status": _status_display(row.get("Advance Rate Status", "")),
                     "Spread Status": _status_display(row.get("Spread Status", "")),
                     "Eff Date Status": _status_display(row.get("Effective Date Status", "")),
@@ -1268,7 +1277,7 @@ if "df_recon" in st.session_state:
                 }
                 display_rows.append(rec)
 
-            df_display = pd.DataFrame(display_rows)
+            df_display = pd.DataFrame(display_rows, index=df_view.index)
 
             # Option pools for **Source Type (ACORE)** / **Liability Type (M61)** table filters:
             # - Selected Fund Only → rows in ``df_all`` whose index is in ``in_scope_ix``
@@ -1290,17 +1299,8 @@ if "df_recon" in st.session_state:
                 if not df_type_opts_base.empty
                 else pd.Series(dtype="object")
             )
-            note_category_opt_series = (
-                df_type_opts_base["Liability Note (M61)"].map(categorize_m61_note_for_filter)
-                if (
-                    not df_type_opts_base.empty
-                    and "Liability Note (M61)" in df_type_opts_base.columns
-                )
-                else pd.Series(dtype="object")
-            )
             _diag = st.session_state.get("recon_row_counts", {}) or {}
             m61_type_opts_from_diag = _diag.get("m61_liability_type_values_found", []) or []
-            m61_cat_opts_from_diag = _diag.get("m61_note_categories_found", []) or []
 
             # --- Column visibility (display-only; does not modify df_recon / df_view) ---
             all_display_cols = list(df_display.columns)
@@ -1414,32 +1414,23 @@ if "df_recon" in st.session_state:
                     '<div class="section-label">Table filters</div>',
                     unsafe_allow_html=True,
                 )
+                st.caption(
+                    "**M61 Note Category** is set in the sidebar (with **Scope**); it already applies to this table."
+                )
 
-                # Filters split into two rows of 3 so each widget has room to breathe.
-                # Row 1: identity-level filters (what the row is)
-                # Row 2: source/type filters (where the data came from)
-                primary_filter_cols = [
-                    ["Fund", "Deal Name", "Facility"],
-                    ["Source Type (ACORE)", "Liability Type (M61)", "Match Coverage"],
-                ]
+                # ── Rows 1–2: secondary filters, 3 columns each ───────────────────────────
+                # Compute option pools once (scope-aware, not narrowed by status/deal filters).
                 auto_fund_value = ""
-                auto_source_type_filter_vals = None  # list[str] | None
-                auto_liability_type_filter_val = None  # str | None
+                auto_source_type_filter_vals = None
+                auto_liability_type_filter_val = None
                 if scope_mode == "Selected Fund Only" and not df_display.empty:
                     if "Fund" in df_display.columns:
                         fund_vals = (
-                            df_display["Fund"]
-                            .fillna("")
-                            .astype(str)
-                            .str.strip()
+                            df_display["Fund"].fillna("").astype(str).str.strip()
                         )
                         fund_vals = fund_vals[fund_vals.ne("")]
                         if not fund_vals.empty:
-                            # Most-common visible scoped fund for this run.
                             auto_fund_value = str(fund_vals.value_counts().index[0]).strip()
-                    # Single ACORE source/type family (normalized before ``|``): prefill Source
-                    # filter with that family token. Use the same scope basis as type dropdowns
-                    # (``df_type_opts_base``), not deal/status-narrowed ``df_display``.
                     if "Source" in df_type_opts_base.columns and not df_type_opts_base.empty:
                         fam_series = df_type_opts_base["Source"].map(_acore_source_type_family)
                         fam_nonempty = fam_series[fam_series.ne("")]
@@ -1449,20 +1440,23 @@ if "df_recon" in st.session_state:
                                 sole_family = next(iter(distinct_families))
                                 auto_source_type_filter_vals = [sole_family]
                                 lt = (
-                                    liability_type_opt_series.fillna("")
-                                    .astype(str)
-                                    .str.strip()
+                                    liability_type_opt_series.fillna("").astype(str).str.strip()
                                 )
                                 lt = lt[lt.ne("")]
                                 if not lt.empty and lt.nunique(dropna=False) == 1:
                                     auto_liability_type_filter_val = str(lt.iloc[0]).strip()
 
-                for row_filters in primary_filter_cols:
+                # Row 1: identity — Fund, Deal Name, Facility
+                # Row 2: source — Source Type (ACORE), Liability Type (M61), Source Status
+                secondary_filter_rows = [
+                    ["Fund", "Deal Name", "Facility"],
+                    ["Source Type (ACORE)", "Liability Type (M61)", "Source Status"],
+                ]
+
+                for row_filters in secondary_filter_rows:
                     pf_ui_cols = st.columns(len(row_filters))
                     for i, fc in enumerate(row_filters):
                         with pf_ui_cols[i]:
-                            # Source/Liability: options from scope-mode basis (fund subset or full
-                            # ``df_all``), not from ``df_display`` / post-deal / post-status ``df_view``.
                             if fc == "Source Type (ACORE)":
                                 opts_src = src_type_opt_series
                             elif fc == "Liability Type (M61)":
@@ -1485,24 +1479,16 @@ if "df_recon" in st.session_state:
                                 }
                             )
                             base_key = f"recon_tbl_primary_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}"
-                            # Selected Fund Only: Fund = most common fund; Source/Liability = safe
-                            # prefill when scoped ACORE-side data implies one type family (Source
-                            # normalized before ``|``) and, for Liability, one distinct resolved type.
                             if fc == "Fund" and scope_mode == "Selected Fund Only":
                                 ms_key = f"{base_key}_auto_scope"
-                                # Only prefill when empty/missing; allow manual edits in this mode.
                                 if auto_fund_value and auto_fund_value in opts:
                                     if ms_key not in st.session_state or not st.session_state.get(ms_key):
                                         st.session_state[ms_key] = [auto_fund_value]
                             elif fc == "Source Type (ACORE)":
-                                # Dedicated key so legacy raw-string widget state does not clash
-                                # with family-token options.
                                 ms_key = f"{base_key}_dispopts"
                                 if scope_mode == "Selected Fund Only" and auto_source_type_filter_vals:
                                     if all(v in opts for v in auto_source_type_filter_vals):
-                                        if ms_key not in st.session_state or not st.session_state.get(
-                                            ms_key
-                                        ):
+                                        if ms_key not in st.session_state or not st.session_state.get(ms_key):
                                             st.session_state[ms_key] = list(auto_source_type_filter_vals)
                             elif fc == "Liability Type (M61)":
                                 ms_key = f"{base_key}_dispopts"
@@ -1515,6 +1501,7 @@ if "df_recon" in st.session_state:
                                         st.session_state[ms_key] = [auto_liability_type_filter_val]
                             else:
                                 ms_key = base_key
+
                             selected_vals = st.multiselect(
                                 fc,
                                 options=opts,
@@ -1537,50 +1524,51 @@ if "df_recon" in st.session_state:
                                     df_table_view.index.intersection(keep_idx)
                                 ]
 
-                # TEMP: Advanced Filters expander disabled — restore by uncommenting the block below
-                # and removing the standalone ``sort_cols_list`` block that follows.
-                # # Advanced filters retain extra capabilities.
-                # with st.expander("Advanced Filters", expanded=False):
-                #     advanced_filter_cols = [
-                #         "Adv Rate Status",
-                #         "Spread Status",
-                #         "Eff Date Status",
-                #         "Undrawn Capacity Status",
-                #         "Index Floor Status",
-                #         "Index Name Status",
-                #         "Recourse % Status",
-                #         "Pledge Date Status",
-                #     ]
-                #     adv_cols_present = [c for c in advanced_filter_cols if c in df_display.columns]
-                #     if adv_cols_present:
-                #         adv_ui_cols = st.columns(min(len(adv_cols_present), 3))
-                #         for i, fc in enumerate(adv_cols_present):
-                #             with adv_ui_cols[i % len(adv_ui_cols)]:
-                #                 adv_opts = sorted(
-                #                     {
-                #                         str(v).strip()
-                #                         for v in df_display[fc].fillna("").astype(str).tolist()
-                #                         if str(v).strip()
-                #                     }
-                #                 )
-                #                 adv_sel = st.multiselect(
-                #                     fc,
-                #                     options=adv_opts,
-                #                     default=[],
-                #                     key=f"recon_tbl_adv_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}",
-                #                     help="Optional additional filter; empty = all.",
-                #                 )
-                #                 if adv_sel:
-                #                     keep_idx = df_display[
-                #                         df_display[fc]
-                #                         .fillna("")
-                #                         .astype(str)
-                #                         .str.strip()
-                #                         .isin(set(adv_sel))
-                #                     ].index
-                #                     df_table_view = df_table_view.loc[
-                #                         df_table_view.index.intersection(keep_idx)
-                #                     ]
+                # ── Debug breakdown expander ─────────────────────────────────────────────
+                _diag_counts = st.session_state.get("recon_row_counts", {}) or {}
+                _cat_counts = _diag_counts.get("m61_note_category_counts", {})
+                _type_counts = _diag_counts.get("m61_liability_type_counts", {})
+                with st.expander("Row breakdown by note category & liability type", expanded=False):
+                    st.caption(
+                        "Counts from the full reconciliation output (all rows, before any display filters). "
+                        "Use this to understand the composition of the M61 data before narrowing the view."
+                    )
+                    _bc1, _bc2 = st.columns(2)
+                    with _bc1:
+                        st.markdown("**By M61 Note Category**")
+                        st.caption("LN_Fin = Financing · LN_Sub = Subline · LN_Eq = Equity/Fund")
+                        if _cat_counts:
+                            # Preserve the canonical category order.
+                            ordered_cats = [c for c in M61_NOTE_CATEGORIES if c in _cat_counts]
+                            ordered_cats += [c for c in _cat_counts if c not in M61_NOTE_CATEGORIES]
+                            st.dataframe(
+                                pd.DataFrame(
+                                    {
+                                        "Category": ordered_cats,
+                                        "Rows": [_cat_counts[c] for c in ordered_cats],
+                                    }
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        else:
+                            st.caption("Run reconciliation to see counts.")
+                    with _bc2:
+                        st.markdown("**By Liability Type (M61 Raw)**")
+                        st.caption("Raw Liability Type column from the M61 export.")
+                        if _type_counts:
+                            st.dataframe(
+                                pd.DataFrame(
+                                    {
+                                        "Liability Type": list(_type_counts.keys()),
+                                        "Rows": list(_type_counts.values()),
+                                    }
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        else:
+                            st.caption("Run reconciliation to see counts.")
 
                 sort_cols_list = [c for c in df_table_view.columns]
                 if sort_cols_list:
@@ -1706,7 +1694,12 @@ if "df_recon" in st.session_state:
             if _status_col_cfg:
                 _df_kwargs["column_config"] = _status_col_cfg
             st.dataframe(styled, **_df_kwargs)
- 
+
+            if len(df_table_view) == 0:
+                df_export_ui = df_view.iloc[0:0].copy()
+            else:
+                df_export_ui = df_view.loc[df_table_view.index].copy()
+
     with tab2:
         st.markdown('<div class="section-label">Deal Drilldown</div>', unsafe_allow_html=True)
  
@@ -1843,7 +1836,46 @@ if "df_recon" in st.session_state:
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
- 
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ---- Download ----
+    col_dl1, col_dl2 = st.columns(2)
+
+    with col_dl1:
+        _excel_payload = b""
+        if not is_stale_selection:
+            _excel_payload = to_excel_bytes(df_export_ui, run_primary)
+        st.download_button(
+            label="⬇️ Download Excel",
+            data=_excel_payload,
+            file_name=run_excel_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            disabled=is_stale_selection,
+        )
+
+    with col_dl2:
+        csv_data = (
+            df_export_ui.drop(columns=["Target Advance Rate (M61)"], errors="ignore")
+            .to_csv(index=False)
+            .encode("utf-8")
+        )
+
+        st.download_button(
+            label="⬇️ Download CSV",
+            data=csv_data,
+            file_name=run_csv_name,
+            mime="text/csv",
+            disabled=is_stale_selection,
+        )
+    st.caption(
+        "Excel and CSV use the **same row set and order** as the **All Results** table after "
+        "**Scope**, **M61 Note Category**, status/deal filters, **table filters**, and **sort** "
+        "(full reconciliation columns in the files)."
+    )
+    if is_stale_selection:
+        st.caption("Downloads are disabled until you rerun with the current selection.")
+
 else:
     # Empty state
     st.markdown(
