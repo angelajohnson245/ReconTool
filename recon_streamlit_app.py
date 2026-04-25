@@ -257,8 +257,12 @@ def primary_scope_label_for_missing_banner(
             return PRIMARY_TYPE_FUND_CONFIG["ACORE"]["scope_label"]
         if re.search(r"\bACP\s+II\b", name):
             return PRIMARY_TYPE_FUND_CONFIG["ACP II"]["scope_label"]
+        if re.search(r"\bACP\s+I\b(?!\s*I)", name):
+            return PRIMARY_TYPE_FUND_CONFIG["ACP I"]["scope_label"]
         if re.search(r"\bAOC\s+II\b", name):
             return PRIMARY_TYPE_FUND_CONFIG["AOC II"]["scope_label"]
+        if re.search(r"\bAOC\s+I\b(?!\s*I)", name):
+            return PRIMARY_TYPE_FUND_CONFIG["AOC I"]["scope_label"]
     cfg = PRIMARY_TYPE_FUND_CONFIG.get(primary_file_type) or {}
     return str(cfg.get("scope_label") or primary_file_type).strip()
 
@@ -327,8 +331,12 @@ def infer_primary_type_from_filename(uploaded_filename: str | None) -> str | Non
         return "ACORE"
     if re.search(r"\bACP\s+II\b", name):
         return "ACP II"
+    if re.search(r"\bACP\s+I\b(?!\s*I)", name):
+        return "ACP I"
     if re.search(r"\bAOC\s+II\b", name):
         return "AOC II"
+    if re.search(r"\bAOC\s+I\b(?!\s*I)", name):
+        return "AOC I"
     if "ACORE" in name:
         return "ACORE"
     return None
@@ -683,7 +691,7 @@ def _series_m61_note_category(df: pd.DataFrame) -> pd.Series:
 
 
 def to_excel_bytes(df_recon, primary_file_type: str):
-    df_recon = normalize_recon_fund_for_output(df_recon)
+    df_recon = normalize_recon_fund_for_output(df_recon).reset_index(drop=True)
     # User-facing export hides internal Target Advance Rate column.
     df_recon = df_recon.drop(columns=["Target Advance Rate (M61)"], errors="ignore")
     wb = build_workbook(df_recon, primary_file_type=primary_file_type)
@@ -762,7 +770,7 @@ def run_reconciliation_for_selection(
                 f.write(file_a_upload.getbuffer())
             with open(path_b, "wb") as f:
                 f.write(file_b_upload.getbuffer())
-            if primary_file_type == "AOC II" and mapping_upload:
+            if primary_file_type in ("AOC II", "AOC I") and mapping_upload:
                 path_map = os.path.join(tmpdir, "liability_to_cre_mapping.xlsx")
                 with open(path_map, "wb") as f:
                     f.write(mapping_upload.getbuffer())
@@ -937,6 +945,9 @@ if "df_recon" in st.session_state:
         df_view = df_view.iloc[0:0]
     if deal_pick and deal_pick != "All deals":
         df_view = df_view[df_view["Deal Name"] == deal_pick]
+
+    # Avoid showing non-contiguous / upstream row positions in the index column (confused with deal IDs).
+    df_view = df_view.reset_index(drop=True)
 
     if False and run_primary == "ACORE":
         diag_counts = st.session_state.get("recon_row_counts", {}) or {}
@@ -1141,6 +1152,44 @@ if "df_recon" in st.session_state:
         adv_src_note = "Mixed (" + ", ".join(adv_src_vals) + ")"
     st.caption(f"Advance Rate source: {adv_src_note}")
 
+    with st.expander("Match validation (deal ID, facilities, merge key)", expanded=False):
+        st.caption(
+            "Full reconciliation output (not scoped by sidebar filters). "
+            "Compare **Facility Norm (ACP)** vs **Facility Norm (M61)** when rows fail to pair."
+        )
+        _dbg_cols = [
+            "Deal Name",
+            "Deal ID (ACP)",
+            "M61 Extracted Deal ID",
+            "Liability Name (M61)",
+            "Facility Norm (ACP)",
+            "Facility Norm (M61)",
+            "Effective Date (ACP)",
+            "Effective Date (M61)",
+            "match_key",
+            "ID Match Result",
+        ]
+        _present = [c for c in _dbg_cols if c in df_recon.columns]
+        _missing = [c for c in _dbg_cols if c not in df_recon.columns]
+        if _missing:
+            st.caption(f"Re-run reconciliation to populate: {', '.join(_missing)}")
+        if _present:
+            _dbg_df = df_recon.loc[:, _present].copy()
+            _sort_by = [c for c in ("Deal Name", "ID Match Result") if c in _dbg_df.columns]
+            if _sort_by:
+                _dbg_df = _dbg_df.sort_values(by=_sort_by, ascending=True)
+            _disp = _dbg_df.rename(
+                columns={
+                    "ID Match Result": "Merge status",
+                    "M61 Extracted Deal ID": "M61 deal id (from Liability Note)",
+                    "Facility Norm (ACP)": "ACORE facility normalized",
+                    "Facility Norm (M61)": "M61 facility normalized",
+                }
+            ).reset_index(drop=True)
+            st.dataframe(_disp, use_container_width=True, height=420)
+        else:
+            st.caption("No validation columns available yet.")
+
     # Validation/debug expanders hidden from submission UI.
 
     if False:  # Temporary Adv Rate debug hidden
@@ -1279,7 +1328,7 @@ if "df_recon" in st.session_state:
                 }
                 display_rows.append(rec)
 
-            df_display = pd.DataFrame(display_rows, index=df_view.index)
+            df_display = pd.DataFrame(display_rows).reset_index(drop=True)
 
             # Option pools for **Source Type (ACORE)** / **Liability Type (M61)** table filters:
             # - Selected Fund Only → rows in ``df_all`` whose index is in ``in_scope_ix``

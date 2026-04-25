@@ -53,6 +53,13 @@ PRIMARY_TYPE_FUND_CONFIG = {
         "fund_regex": r"\bcredit partners ii\b",
         "recon_fund_display": "ACORE Credit Partners II",
     },
+    "ACP I": {
+        "export_label": "ACORE - ACP I",
+        "scope_label": "ACP I",
+        "fund_token": "credit partners i",
+        "fund_regex": r"\bcredit partners i\b",
+        "recon_fund_display": "ACORE Credit Partners I",
+    },
     "AOC II": {
         "export_label": "ACORE - AOC II",
         "scope_label": "AOC II",
@@ -60,6 +67,13 @@ PRIMARY_TYPE_FUND_CONFIG = {
         "fund_token": "opportunistic credit ii",
         "fund_regex": r"\bopportunistic\s+credit\s+ii\b",
         "recon_fund_display": "Opportunistic Credit II",
+    },
+    "AOC I": {
+        "export_label": "ACORE - AOC I",
+        "scope_label": "AOC I",
+        "fund_token": "opportunistic credit i",
+        "fund_regex": r"\bopportunistic\s+credit\s+i\b",
+        "recon_fund_display": "Opportunistic Credit I",
     },
 }
 
@@ -90,7 +104,7 @@ def normalize_recon_fund_for_output(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or "Fund" not in getattr(df, "columns", ()):
         return df
     if df.empty:
-        return df
+        return df.reset_index(drop=True)
     lc = {k.lower(): v for k, v in FUND_SHORTHAND_TO_CANONICAL.items()}
 
     def _norm_one(v):
@@ -108,12 +122,15 @@ def normalize_recon_fund_for_output(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
     out["Fund"] = out["Fund"].map(_norm_one)
-    return out
+    return out.reset_index(drop=True)
 
 
 def _fund_cfg(primary_file_type: str) -> dict:
     return PRIMARY_TYPE_FUND_CONFIG.get(primary_file_type, {})
 
+
+# Primary workbooks that share Fin Inpt + liability-note-driven financing match rules.
+FIN_INPT_PRIMARY_TYPES = frozenset({"ACORE", "ACP II", "ACP I", "AOC II", "AOC I"})
 
 LAST_RECON_DIAGNOSTICS: dict[str, int | str] = {}
 
@@ -269,8 +286,12 @@ def detect_fund_label(uploaded_filename: str | None, primary_file_type: str) -> 
             return PRIMARY_TYPE_FUND_CONFIG["ACORE"]["export_label"]
         if re.search(r"\bACP\s+II\b", name):
             return PRIMARY_TYPE_FUND_CONFIG["ACP II"]["export_label"]
+        if re.search(r"\bACP\s+I\b(?!\s*I)", name):
+            return PRIMARY_TYPE_FUND_CONFIG["ACP I"]["export_label"]
         if re.search(r"\bAOC\s+II\b", name):
             return PRIMARY_TYPE_FUND_CONFIG["AOC II"]["export_label"]
+        if re.search(r"\bAOC\s+I\b(?!\s*I)", name):
+            return PRIMARY_TYPE_FUND_CONFIG["AOC I"]["export_label"]
 
     cfg = _fund_cfg(primary_file_type)
     return cfg.get("export_label", primary_file_type)
@@ -340,16 +361,22 @@ M61_FINANCING_TYPE_BUCKETS = frozenset({"repo", "non", "subline"})
 TARGET_FUNDS = {
     "acore credit partners iii",
     "acore credit partners ii",
+    "acore credit partners i",
     "aoc ii",
+    "aoc i",
     "mcp",
     "api",
     "acore",
 }
 
-# M61 "Fund Name" for AOC: short "aoc ii" or full "… Opportunistic Credit II" (Roman II required;
-# do not match Opportunistic Credit I). ACP rows stay on exact TARGET_FUNDS membership only.
+# M61 "Fund Name" for AOC: short "aoc ii" / full "… Opportunistic Credit II" (Roman II required;
+# do not match Opportunistic Credit I). Roman I uses a separate pattern so "… Credit II" is not matched as I.
 AOC_M61_FUND_NAME_RE = re.compile(
     r"\b(?:aoc\s+ii|opportunistic\s+credit\s+ii)\b",
+    re.IGNORECASE,
+)
+AOC_M61_FUND_NAME_I_RE = re.compile(
+    r"\b(?:aoc\s+i|opportunistic\s+credit\s+i)\b",
     re.IGNORECASE,
 )
 
@@ -426,6 +453,10 @@ RECON_ORDERED_COLS = [
     "Match Stage",
     "Source",
     "Source Indicator",
+    "Liability Name (M61)",
+    "Facility Norm (ACP)",
+    "Facility Norm (M61)",
+    "match_key",
     "Effective Date (ACP)",
     "Effective Date (M61)",
     "Pledge Date (ACP)",
@@ -477,6 +508,18 @@ FACILITY_NORM_MAP = {
     "acpii-gs-repo": "gs",
     "acpii-ms-repo": "ms",
     "acpii-boa-repo": "boa",
+    "aocii-jpm-repo": "jpm",
+    "aocii-gs-repo": "gs",
+    "aocii-ms-repo": "ms",
+    "aocii-boa-repo": "boa",
+    "aoci-jpm-repo": "jpm",
+    "aoci-gs-repo": "gs",
+    "aoci-ms-repo": "ms",
+    "aoci-boa-repo": "boa",
+    "acpi-jpm-repo": "jpm",
+    "acpi-gs-repo": "gs",
+    "acpi-ms-repo": "ms",
+    "acpi-boa-repo": "boa",
 }
 
 PRIMARY_INTERNAL_FIELDS = (
@@ -612,9 +655,65 @@ PRIMARY_FILE_CONFIG: dict[str, dict] = {
         "primary_only_legend_label": "ACP II Only",
         "primary_group_header": "ACP II — PRIMARY DATA",
     },
+    "ACP I": {
+        "sheet_name": "10) Fin Inpt",
+        "header_row": 6,
+        "sanitize_fin_inpt_headers": True,
+        "column_map": {
+            "deal_name": "Deal Name",
+            "note_name": "Note Name",
+            "source": "Source",
+            "facility": "Facility",
+            "advance_rate": "Advance",
+            "spread": "Spread",
+            "pledge": "Pledge",
+            "pledge_date": "Pledge Date",
+            "effective_date": "Effective Date",
+            "undrawn_capacity": "Current Undrawn Capacity",
+            "maturity_date": "Maturity Date",
+            "floor": "Floor",
+            "recourse_pct": "Recourse %",
+        },
+        "display_name": "ACP I",
+        "ui_display_label": "ACORE - ACP I",
+        "model_descriptor": "ACP I Liquidity & Earnings Model",
+        "source_indicator_primary_only": "ACP I",
+        "missing_in_primary_label": "ACP I",
+        "excel_primary_column_suffix": "ACP I",
+        "primary_only_legend_label": "ACP I Only",
+        "primary_group_header": "ACP I — PRIMARY DATA",
+    },
+    "AOC I": {
+        "sheet_name": "10) Fin Inpt",
+        "header_row": 6,
+        "sanitize_fin_inpt_headers": True,
+        "column_map": {
+            "deal_name": "Deal Name",
+            "note_name": "Note Name",
+            "source": "Source",
+            "facility": "Facility",
+            "advance_rate": "Advance",
+            "spread": "Spread",
+            "pledge": "Pledge",
+            "pledge_date": "Pledge Date",
+            "effective_date": "Effective Date",
+            "undrawn_capacity": "Current Undrawn Capacity",
+            "maturity_date": "Maturity Date",
+            "floor": "Floor",
+            "recourse_pct": "Recourse %",
+        },
+        "display_name": "AOC I",
+        "ui_display_label": "ACORE - AOC I",
+        "model_descriptor": "AOC I Liquidity & Earnings Model",
+        "source_indicator_primary_only": "AOC I",
+        "missing_in_primary_label": "AOC I",
+        "excel_primary_column_suffix": "AOC I",
+        "primary_only_legend_label": "AOC I Only",
+        "primary_group_header": "AOC I — PRIMARY DATA",
+    },
 }
 
-STREAMLIT_PRIMARY_FILE_TYPES = ("ACORE", "AOC II", "ACP II")
+STREAMLIT_PRIMARY_FILE_TYPES = ("ACP I", "ACP II", "ACORE", "AOC I", "AOC II")
 
 PRIMARY_REQUIRED_IN_SHEET = ("deal_name", "note_name", "facility", "effective_date")
 
@@ -834,15 +933,60 @@ def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _fin_note_token_for_primary(primary_file_type: str) -> str:
+def _fin_note_tokens_for_primary(primary_file_type: str) -> tuple[str, ...]:
+    """Liability-note substrings that flag financing lines for the selected fund (M61 load filter OR)."""
     p = str(primary_file_type or "").strip().upper()
     if p == "ACORE":
-        return "LN_FIN_ACPIII"
+        return (
+            "LN_FIN_ACPIII",
+            "LN_FIN_ACP_III",
+            "LN_FIN_ACP3",
+            "LN_FIN_ACP_3",
+            "ACPIII",
+        )
     if p == "ACP II":
-        return "LN_FIN_ACPII"
+        return (
+            "LN_FIN_ACPII",
+            "LN_FIN_ACP_II",
+            "LN_FIN_ACP2",
+            "LN_FIN_ACP_2",
+            "ACPII",
+        )
+    if p == "ACP I":
+        return (
+            "LN_FIN_ACP_I_",
+            "LN_FIN_ACP_I",
+            "LN_FIN_ACP1",
+            "LN_FIN_ACP_1",
+            "ACP I",
+        )
     if p == "AOC II":
-        return "LN_FIN_AOCII"
-    return ""
+        return (
+            "LN_FIN_AOCII",
+            "LN_FIN_AOC_II",
+            "LN_FIN_AOC2",
+            "LN_FIN_AOC_2",
+            "AOCII",
+            "AOC II",
+        )
+    if p == "AOC I":
+        return (
+            "LN_FIN_AOCI_",
+            "LN_FIN_AOC_I",
+            "LN_FIN_AOC1",
+            "LN_FIN_AOC_1",
+            "AOCI",
+            "AOC I",
+        )
+    return ()
+
+
+def _fin_note_scope_mask(liab_note_up: pd.Series, primary_file_type: str) -> pd.Series:
+    toks = _fin_note_tokens_for_primary(primary_file_type)
+    if not toks:
+        return pd.Series(False, index=liab_note_up.index)
+    pat = "|".join(re.escape(t) for t in toks)
+    return liab_note_up.astype(str).str.contains(pat, case=False, regex=True, na=False)
 
 
 def load_file_a(
@@ -901,19 +1045,21 @@ def load_file_a(
     df["Fund Name"] = df["Fund Name"].astype(str).str.strip()
     fund_lower = df["Fund Name"].str.lower()
     in_target_set = fund_lower.isin(TARGET_FUNDS)
-    aoc_style = df["Fund Name"].str.contains(AOC_M61_FUND_NAME_RE, regex=True, na=False)
+    aoc_style = df["Fund Name"].str.contains(AOC_M61_FUND_NAME_RE, regex=True, na=False) | df[
+        "Fund Name"
+    ].str.contains(AOC_M61_FUND_NAME_I_RE, regex=True, na=False)
     fund_mask = in_target_set | aoc_style
     df["Liability Type Bucket"] = df["Liability Type"].apply(_liability_type_bucket)
     liab_type_mask = df["Liability Type Bucket"].isin(M61_FINANCING_TYPE_BUCKETS)
-    fin_note_token = _fin_note_token_for_primary(primary_file_type)
     liab_note_up = df["Liability Note"].fillna("").astype(str).str.upper()
-    fin_note_scope_mask = liab_note_up.str.contains(fin_note_token, regex=False, na=False) if fin_note_token else pd.Series(False, index=df.index)
+    fin_note_scope_mask = _fin_note_scope_mask(liab_note_up, primary_file_type)
     in_scope_mask = liab_type_mask | fin_note_scope_mask
+    _fin_toks = _fin_note_tokens_for_primary(primary_file_type)
     _debug_rows(
         "M61 pre-filter diagnostics (fund labels are informational; rows are NOT dropped by fund here): "
         f"rows_matching_target_fund_labels={int(fund_mask.sum())}/{len(df)} "
         f"rows_matching_liability_types={int(liab_type_mask.sum())}/{len(df)} "
-        f"rows_matching_financing_note_token={int(fin_note_scope_mask.sum())}/{len(df)} token={fin_note_token!r} "
+        f"rows_matching_financing_note_token={int(fin_note_scope_mask.sum())}/{len(df)} tokens={_fin_toks!r} "
         f"rows_in_scope_after_expanded_filter={int(in_scope_mask.sum())}/{len(df)} "
         f"blank_deal_name={int(df['Deal Name'].isna().sum())} "
         f"blank_liability_note={int(df['Liability Note'].isna().sum())}"
@@ -956,7 +1102,7 @@ def load_file_a(
     _debug_rows(
         "M61 after expanded in-scope filter: "
         f"rows={len(df)} "
-        f"(kept liability buckets={sorted(M61_FINANCING_TYPE_BUCKETS)} OR note token={fin_note_token!r})"
+        f"(kept liability buckets={sorted(M61_FINANCING_TYPE_BUCKETS)} OR note tokens={_fin_toks!r})"
     )
     df = df[keep].copy()
 
@@ -1008,13 +1154,131 @@ def normalise_text(value):
     return str(value).strip().lower()
 
 
+def _alnum_compact_upper(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+
+
+def _compact_alnum_is_fund_prefixed_tbd_only(u: str) -> bool:
+    """True when compact form is optional fund slug + one or more ``TBD`` (e.g. ``ACPIIITBDTBD``)."""
+    if not u or "TBD" not in u:
+        return False
+    rest = u
+    for pref in ("ACPIII", "ACPII", "AOCII", "AOCI", "ACP3", "ACP2", "AOC2", "ACPI"):
+        if rest.startswith(pref):
+            rest = rest[len(pref) :]
+            break
+    return bool(rest) and bool(re.fullmatch(r"(TBD)+", rest))
+
+
+def _normalise_dashes_for_facility(s: str) -> str:
+    """Map unicode / typographic dashes to ASCII hyphen so fund-prefixed facility patterns match."""
+    if not s:
+        return s
+    return (
+        str(s)
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2212", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+
+
+def _facility_source_collapses_to_tbd(raw) -> bool:
+    """True when value is only TBD and/or ACP/AOC fund slug tokens (for facility/source matching).
+
+    Normalizes cases such as ``TBD``, ``ACPIII-TBD``, ``ACPIII-TBD-TBD``, and compact ``ACPIIITBDTBD``
+    so they align with plain ``tbd`` from Fin Inpt.
+    """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return False
+    s = _normalise_dashes_for_facility(str(raw).strip())
+    if not s or s.lower() in ("nan", "none", "<na>", "nat"):
+        return False
+    nt = normalise_text(s).replace("_", "-")
+    if nt == "tbd":
+        return True
+    parts = [p for p in re.split(r"[\s_\-|,/]+", nt) if p]
+    has_tbd_token = any(p.lower() == "tbd" for p in parts)
+    if has_tbd_token:
+        fund_re = re.compile(
+            r"^(?:acpiii|acp\s*iii|acp3|acpii|acp\s*ii|acp2|aocii|aoc\s*ii|aoc2|aoci|aoc\s*i\b|acpi)$",
+            re.IGNORECASE,
+        )
+        for i, p in enumerate(parts):
+            pl = p.lower()
+            if pl == "tbd":
+                continue
+            if fund_re.match(p):
+                continue
+            # ``AOC II - TBD`` / ``ACP I - TBD`` split as ``aoc`` ``ii`` / ``acp`` ``i`` …
+            if pl in ("ii", "iii", "i") and i > 0 and parts[i - 1].lower() in ("aoc", "acp"):
+                continue
+            if pl in ("aoc", "acp") and i + 1 < len(parts) and parts[i + 1].lower() in ("ii", "iii", "i"):
+                continue
+            return False
+        return True
+    return _compact_alnum_is_fund_prefixed_tbd_only(_alnum_compact_upper(s))
+
+
+# Strip M61 export / generated facility prefixes (``ACPIII-MS-Repo`` / ``ACPIII – MS - Repo`` → ``ms repo``).
+# Allow unicode dashes (normalized upstream) and whitespace between fund slug and bank/repo tokens.
+_M61_FUND_FACILITY_PREFIX = re.compile(
+    r"^(?:acpiii|acp\s*iii|acp3|acpii|acp\s*ii|acp2|acpi|acp\s*i\b|aocii|aoc\s*ii|aoc2|aoci|aoc\s*i\b)"
+    r"(?:\s*[-_/]+\s*|\s+)",
+    re.IGNORECASE,
+)
+
+
+def _normalise_m61_fund_prefixed_facility(raw) -> str | None:
+    """If ``raw`` is ``ACPIII-MS-Repo`` / ``ACPIII-GS-Repo`` style, return ``FACILITY_NORM_MAP`` token; else None."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    s = _normalise_dashes_for_facility(str(raw).strip())
+    if not s or s.lower() in ("nan", "none", "<na>", "nat"):
+        return None
+    t = normalise_text(s).replace("_", "-")
+    rest = t
+    while True:
+        m = _M61_FUND_FACILITY_PREFIX.match(rest)
+        if not m:
+            break
+        rest = rest[m.end() :].lstrip("-_/")
+        if not rest:
+            return None
+    if rest == t:
+        return None
+    readable = " ".join(rest.replace("-", " ").replace("_", " ").split())
+    if _facility_source_collapses_to_tbd(readable):
+        return "tbd"
+    nt2 = normalise_text(readable)
+    if nt2 in FACILITY_NORM_MAP:
+        return FACILITY_NORM_MAP[nt2]
+    if "repo" not in nt2:
+        cand = normalise_text(f"{readable} repo")
+        if cand in FACILITY_NORM_MAP:
+            return FACILITY_NORM_MAP[cand]
+    return None
+
+
 def normalise_facility(raw):
-    return FACILITY_NORM_MAP.get(normalise_text(raw), normalise_text(raw))
-
-
-def extract_liability_note_suffix(value) -> str:
-    """Extract deal-id token from Liability Note (e.g., 25-2852 anywhere in text)."""
-    return extract_deal_id_token(value)
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    s = _normalise_dashes_for_facility(str(raw).strip())
+    if not s or s.lower() in ("nan", "none", "<na>", "nat"):
+        return ""
+    pipe_parts = [p.strip() for p in re.split(r"\||,|/", s) if p.strip()]
+    if len(pipe_parts) > 1:
+        for p in pipe_parts:
+            if _facility_source_collapses_to_tbd(p):
+                return "tbd"
+    if _facility_source_collapses_to_tbd(s):
+        return "tbd"
+    bank = _normalise_m61_fund_prefixed_facility(s)
+    if bank is not None:
+        return bank
+    nt = normalise_text(s)
+    return FACILITY_NORM_MAP.get(nt, nt)
 
 
 def extract_deal_id_token(value) -> str:
@@ -1030,11 +1294,12 @@ def extract_deal_id_token(value) -> str:
         .replace("—", "-")
         .replace("−", "-")
     )
-    m = re.search(r"\b(\d{2})\s*-\s*(\d{4})\b", s_norm)
+    # Do not rely on ``\\b`` before the first digit: deal ids can follow letters (e.g. ``…ACPIII_25-2852``).
+    m = re.search(r"(?<![0-9])(\d{2})\s*-\s*(\d{4})(?![0-9])", s_norm)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
     # Fallback for compact six-digit exports (e.g., 252852 -> 25-2852).
-    m2 = re.search(r"\b(\d{2})(\d{4})\b", s_norm)
+    m2 = re.search(r"(?<![0-9])(\d{2})(\d{4})(?![0-9])", s_norm)
     if m2:
         return f"{m2.group(1)}-{m2.group(2)}"
     return ""
@@ -1046,37 +1311,174 @@ def normalise_deal_id_key(value) -> str:
     return str(value).strip().lower()
 
 
-# Ordered category list used by both backend column derivation and UI filter defaults.
-M61_NOTE_CATEGORIES: list[str] = ["Financing", "Subline", "Equity/Fund", "Other"]
+def _ln_compact_alnum(note: str) -> str:
+    """Uppercase alphanumeric run (fund codes like ACPIII / ACP3 survive as one token)."""
+    return _alnum_compact_upper(note)
 
 
-def categorize_m61_note(value) -> str:
-    """Derive M61 Note Category from Liability Note prefix.
+_LN_FIN_RE = re.compile(r"LN[_\s]?FIN", re.IGNORECASE)
+_LN_SUB_RE = re.compile(r"LN[_\s]?SUB", re.IGNORECASE)
+_LN_EQ_RE = re.compile(r"LN[_\s]?EQ", re.IGNORECASE)
 
-    - ``LN_Fin…``  → "Financing"  (repo / facility lines — primary recon rows)
-    - ``LN_Sub…``  → "Subline"
-    - ``LN_Eq…``   → "Equity/Fund"
-    - anything else → "Other"
+def _parse_fund_scope_from_note(note: str) -> str:
+    """Return fund scope label when a fund code is present in the note, else ``\"\"``.
 
-    Consistent with the UI helper ``categorize_m61_note_for_filter`` in the Streamlit app;
-    this is the single source of truth — the Streamlit helper should delegate here.
+    Order matters: longer tokens (``ACPIII``, ``ACPII``, ``AOCII``) before Roman ``I`` forms.
     """
-    if value is None:
+    u = _ln_compact_alnum(note)
+    if "ACPIII" in u or "ACP3" in u:
+        return "ACP III"
+    if "ACPII" in u or "ACP2" in u:
+        return "ACP II"
+    if ("ACPI" in u or "ACP1" in u) and "ACPII" not in u and "ACPIII" not in u:
+        return "ACP I"
+    if "AOCII" in u or "AOC2" in u:
+        return "AOC II"
+    if ("AOCI" in u or "AOC1" in u) and "AOCII" not in u:
+        return "AOC I"
+    s = str(note or "").strip()
+    if re.search(r"\bACP\s+III\b", s, re.IGNORECASE):
+        return "ACP III"
+    if re.search(r"\bACP\s+II\b", s, re.IGNORECASE):
+        return "ACP II"
+    if re.search(r"\bACP\s+I\b(?!\s*I)", s, re.IGNORECASE):
+        return "ACP I"
+    if re.search(r"\bAOC\s+II\b", s, re.IGNORECASE):
+        return "AOC II"
+    if re.search(r"\bAOC\s+I\b(?!\s*I)", s, re.IGNORECASE):
+        return "AOC I"
+    return ""
+
+
+def _parse_suffix_after_deal_id(note: str, deal_id: str) -> str:
+    """Trailing bank / facility token after the deal id (e.g. ``GS``, ``JPM``, ``BOA``, ``TBD``)."""
+    if not deal_id or not str(note).strip():
+        return ""
+    s = str(note).strip()
+    did = deal_id.strip()
+    compact = did.replace("-", "")
+    for token in (did, compact):
+        if not token:
+            continue
+        pos = s.upper().find(token.upper())
+        if pos < 0:
+            continue
+        tail = s[pos + len(token) :].strip(" _-|/\t")
+        if not tail:
+            return ""
+        if _facility_source_collapses_to_tbd(tail):
+            return "TBD"
+        for part in re.split(r"[_\s|,\-/]+", tail):
+            t = part.strip()
+            if t and re.fullmatch(r"[A-Za-z]{2,6}", t):
+                return t.upper()
+        return ""
+    return ""
+
+
+def parse_liability_note(note) -> dict[str, str]:
+    """Parse M61 **Liability Note** into category, fund, deal id, and optional source/facility suffix.
+
+    Returns a dict with keys:
+
+    - ``note_category``: ``Fin`` | ``Sub`` | ``Eq/Fund`` | ``Other`` (from ``LN_FIN`` / ``LN_SUB`` / ``LN_EQ``…)
+    - ``fund_code``: ``ACP III`` | ``ACP II`` | ``ACP I`` | ``AOC II`` | ``AOC I`` | ``\"\"`` when absent
+    - ``deal_id``: ``NN-NNNN`` token when present (same rules as ``extract_deal_id_token``)
+    - ``source_suffix``: bank / facility shorthand when present (e.g. ``GS``, ``BOA``, ``TBD``)
+
+    Works across ACP III / II / I and AOC II / I note styles (``ACPIII``, ``ACPI``, ``ACP3``, ``AOCII``, ``AOCI``, etc.).
+    """
+    empty = {
+        "note_category": "Other",
+        "fund_code": "",
+        "deal_id": "",
+        "source_suffix": "",
+    }
+    if note is None:
+        return dict(empty)
+    try:
+        if pd.isna(note):
+            return dict(empty)
+    except (TypeError, ValueError):
+        pass
+    s = str(note).strip()
+    if not s or s.lower() in ("nan", "<na>", "nat", "none"):
+        return dict(empty)
+
+    if _LN_FIN_RE.search(s):
+        cat = "Fin"
+    elif _LN_SUB_RE.search(s):
+        cat = "Sub"
+    elif _LN_EQ_RE.search(s):
+        cat = "Eq/Fund"
+    else:
+        cat = "Other"
+
+    deal_id = extract_deal_id_token(s)
+    fund_code = _parse_fund_scope_from_note(s)
+    source_suffix = _parse_suffix_after_deal_id(s, deal_id) if deal_id else ""
+
+    return {
+        "note_category": cat,
+        "fund_code": fund_code,
+        "deal_id": deal_id,
+        "source_suffix": source_suffix,
+    }
+
+
+def extract_liability_note_suffix(value) -> str:
+    """Extract deal-id token from Liability Note (e.g., 25-2852 anywhere in text)."""
+    return parse_liability_note(value).get("deal_id", "")
+
+
+# Ordered category list used by both backend column derivation and UI filter defaults.
+M61_NOTE_CATEGORIES: list[str] = ["Financing", "Subline", "Other"]
+
+# Liability-type substrings / tokens for ``categorize_m61_note_type`` (maintenance-friendly).
+_M61_LT_SUBLINE = "subline"
+_M61_LT_TBD_RE = re.compile(r"\btbd\b", re.IGNORECASE)
+_M61_LT_CLO_RE = re.compile(r"\bclo\b", re.IGNORECASE)
+_M61_LT_EQUITY_RE = re.compile(r"\bequity\b", re.IGNORECASE)
+_M61_LT_FUND_RE = re.compile(r"\bfund\b", re.IGNORECASE)
+
+
+def categorize_m61_note_type(liability_type_raw) -> str:
+    """Map M61 **Liability Type** (raw export value) to sidebar / export note categories.
+
+    Display and filter only; does not affect merge or reconciliation row counts.
+
+    - **Financing**: Repo (excluding Non-Repo), TBD, CLO
+    - **Subline**: Subline
+    - **Equity/Fund**: liability types that reference Fund or Equity
+    - **Other**: blank, missing M61 side, Non-Repo / standalone Non, or anything else
+
+    Evaluation order: Subline → Equity/Fund → TBD / CLO / Repo → Other.
+    """
+    if liability_type_raw is None:
         return "Other"
     try:
-        if pd.isna(value):
+        if pd.isna(liability_type_raw):
             return "Other"
     except (TypeError, ValueError):
         pass
-    s = str(value).strip().upper()
+    s = normalise_text(liability_type_raw)
     if not s:
         return "Other"
-    if s.startswith("LN_FIN"):
-        return "Financing"
-    if s.startswith("LN_SUB"):
+
+    if _M61_LT_SUBLINE in s:
         return "Subline"
-    if s.startswith("LN_EQ"):
+
+    if _M61_LT_EQUITY_RE.search(s) or _M61_LT_FUND_RE.search(s):
         return "Equity/Fund"
+
+    if _M61_LT_TBD_RE.search(s) or _M61_LT_CLO_RE.search(s):
+        return "Financing"
+
+    if "repo" in s:
+        if "non" in s:
+            return "Other"
+        return "Financing"
+
     return "Other"
 
 
@@ -1304,6 +1706,88 @@ def compare_pledge_date_status(
     return "MISMATCH"
 
 
+def _primary_facility_match_token(source, facility) -> str:
+    """Single normalized facility/source token for financing match keys (aligns with ``normalise_facility``)."""
+    for raw in (facility, source):
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        s = _normalise_dashes_for_facility(str(raw).strip())
+        if not s or s.lower() in ("nan", "none", "<na>", "nat"):
+            continue
+        parts = [p.strip() for p in re.split(r"\||,|/", s) if p.strip()]
+        # Prefer TBD composite segments (e.g. ``Repo | ACPIII-TBD-TBD``) before whole-string norm.
+        if len(parts) > 1:
+            for p in parts:
+                if _facility_source_collapses_to_tbd(p):
+                    return "tbd"
+        if _facility_source_collapses_to_tbd(s):
+            return "tbd"
+        t = normalise_facility(s)
+        if t:
+            return t
+        for p in parts:
+            t2 = normalise_facility(p)
+            if t2:
+                return t2
+    return ""
+
+
+def _normalize_ln_suffix_token(raw) -> str:
+    """Map parsed liability-note suffix (``GS``, ``BOA``, …) to the same token space as ``normalise_facility``."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "<na>", "nat"):
+        return ""
+    if _facility_source_collapses_to_tbd(s):
+        return "tbd"
+    bank = _normalise_m61_fund_prefixed_facility(s)
+    if bank is not None:
+        return bank
+    u = s.upper()
+    alias = {"BAML": "boa", "BAC": "boa", "GS": "gs", "JPM": "jpm", "MS": "ms", "BOA": "boa", "TBD": "tbd"}
+    if u in alias:
+        return alias[u]
+    return normalise_facility(f"{s} repo") or normalise_text(s)
+
+
+def _facility_norm_for_debug_cell(v) -> str:
+    """Normalized facility token for recon output / debug columns (blank → empty string)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    t = str(v).strip()
+    if not t or t.lower() in ("nan", "none", "<na>", "nat"):
+        return ""
+    return normalise_facility(t)
+
+
+def _fin_m61_key_from_row(row: pd.Series, scope_label: str) -> str:
+    """Composite financing key on M61 rows: deal id + eff date + optional suffix; ``Fin`` + fund scope only."""
+    p = parse_liability_note(row.get("Liability Note"))
+    if p.get("note_category") != "Fin":
+        return ""
+    did = normalise_deal_id_key(p.get("deal_id") or "")
+    if not did:
+        return ""
+    fc = (p.get("fund_code") or "").strip()
+    if fc and fc != scope_label:
+        return ""
+    if not fc and not bool(row.get("_m61_in_scope")):
+        return ""
+    eff = str(row.get("effective_date_key") or "")
+    sx = _normalize_ln_suffix_token(p.get("source_suffix") or "")
+    # Liability Note may omit bank/repo while **Liability Name** carries ``ACPIII-MS-Repo`` / ``…-TBD-TBD``.
+    if not sx:
+        sx = _primary_facility_match_token(
+            row.get("Financial Institution"),
+            row.get("Liability Name"),
+        )
+    # When the note has no suffix and name/FI yield no token, match on deal id + effective date only.
+    if sx:
+        return f"{did}|{eff}|{sx}"
+    return f"{did}|{eff}"
+
+
 def build_match_key(df, deal_col, facility_col, note_col, effective_date_col):
     """Join key = normalized deal + facility + effective date (``note_col`` is unused; kept for call-site clarity)."""
     out = df.copy()
@@ -1451,7 +1935,7 @@ def reconcile(
     _debug_rows(f"TEMP DEBUG: M61 row count immediately after load_file_a = {len(raw_m61)}")
     _debug_m61_load_preview(raw_m61)
 
-    if primary_file_type == "AOC II" and mapping_path:
+    if primary_file_type in ("AOC II", "AOC I") and mapping_path:
         df_map = load_liability_cre_mapping(mapping_path)
         raw_m61 = raw_m61.merge(
             df_map,
@@ -1744,24 +2228,40 @@ def reconcile(
     unmatched_b = set(b["_row_id_b"].tolist())
     unmatched_a = set(a["_row_id_a"].tolist())
     matchable_a = set(a.loc[a["_m61_in_scope"], "_row_id_a"].tolist())
-    if primary_file_type == "ACORE":
-        # ACP III runs: anchor reconciliation candidates to ACP financing identifiers.
-        # Only restrict to ID-matched candidates when Deal IDs are actually present on the
-        # ACP side; if none exist (Deal ID column absent from the sheet), fall back to the
-        # fund-scope candidate set so rows are not silently dropped.
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        # Fin Inpt runs (ACP III / ACP II / AOC II): anchor reconciliation candidates to
+        # financing identifiers. Only restrict to ID-matched candidates when Deal IDs are
+        # actually present on the primary side; if none exist, fall back to the fund-scope
+        # candidate set so rows are not silently dropped.
         id_anchored = set(a.loc[a["_id_in_primary"], "_row_id_a"].tolist())
         if id_anchored:
             matchable_a = id_anchored
         else:
             _debug_rows(
-                "TEMP DEBUG: ACORE anchored candidate set is EMPTY "
-                "(no ACP Deal IDs found); falling back to fund-scope matchable_a"
+                "TEMP DEBUG: Fin Inpt anchored candidate set is EMPTY "
+                "(no primary Deal IDs found); falling back to fund-scope matchable_a"
             )
-            # matchable_a already set to fund-scope rows above; leave it unchanged.
         _debug_rows(
-            "TEMP DEBUG: ACORE anchored candidate set "
+            "TEMP DEBUG: Fin Inpt anchored candidate set "
             f"(ID overlap)={len(matchable_a)}/{len(a)}"
         )
+
+    b["fin_acp_key"] = ""
+    a["fin_m61_key"] = ""
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        scope_lbl = scope_label_for_primary_type(primary_file_type)
+        b["_pri_fac_tok"] = b.apply(
+            lambda r: _primary_facility_match_token(r.get("Source"), r.get("Facility")), axis=1
+        )
+        msk_b = b["deal_id_key"].astype(str).str.strip().ne("")
+        sub_b = b.loc[msk_b]
+        tok_stripped = sub_b["_pri_fac_tok"].fillna("").astype(str).str.strip()
+        base_k = sub_b["deal_id_key"].astype(str) + "|" + sub_b["effective_date_key"].astype(str)
+        fin_vals = base_k + "|" + sub_b["_pri_fac_tok"].fillna("").astype(str)
+        fin_vals.loc[tok_stripped.eq("")] = base_k[tok_stripped.eq("")]
+        b.loc[msk_b, "fin_acp_key"] = fin_vals
+        a["fin_m61_key"] = a.apply(lambda r: _fin_m61_key_from_row(r, scope_lbl), axis=1)
+
     pair_rows: list[dict] = []
     b_by_id = b.set_index("_row_id_b", drop=False)
     a_by_id = a.set_index("_row_id_a", drop=False)
@@ -1796,6 +2296,7 @@ def reconcile(
             br = b_by_id.loc[rid_b]
             ar = a_by_id.loc[rid_a]
             reason = {
+                "financing_note": "Financing: primary Deal ID + effective date + facility/suffix aligned to parsed M61 liability note",
                 "strict": "all strict components aligned (deal, facility, note, effective date)",
                 "source_aware_facility": "same deal+effective date+source with facility alignment",
                 "source_aware": "same deal+effective date+source",
@@ -1813,9 +2314,13 @@ def reconcile(
     b["id_match_key"] = b["acp_match_key"].astype(str)
     a["id_match_key"] = a["m61_match_key"].astype(str)
 
-    if primary_file_type == "ACORE":
-        # ACP-driven matching: first try ACP Deal ID key -> M61 extracted Deal ID key (when
-        # Deal IDs are present); then fall through to staged matchers for any remaining rows.
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        # Financing-first: parsed M61 liability note (Fin + fund + deal id + eff date + suffix)
+        # aligned to primary Deal ID + eff date + facility/source token.
+        fin_note_n = _pair_by_key("fin_acp_key", "fin_m61_key", "financing_note")
+        _debug_rows(f"TEMP DEBUG: Fin Inpt financing-note composite matches={fin_note_n}")
+
+        # Deal ID key merge (when Deal IDs are present); then staged matchers for remaining rows.
         lb = b[b["_row_id_b"].isin(unmatched_b)].copy()
         la = a[a["_row_id_a"].isin(unmatched_a.intersection(matchable_a))].copy()
         lb_id = lb[lb["id_match_key"].astype(str).str.strip().ne("")]
@@ -1848,20 +2353,19 @@ def reconcile(
                 )
                 id_n += 1
         _debug_rows(
-            "TEMP DEBUG: ACORE key merge acp_match_key -> m61_match_key "
+            "TEMP DEBUG: Fin Inpt key merge acp_match_key -> m61_match_key "
             f"matched_rows={id_n}"
         )
-        # Fall through to staged matchers for any rows not yet paired by Deal ID.
         strict_n = _pair_by_key("strict_key", "strict_key", "strict")
-        _debug_rows(f"TEMP DEBUG: ACORE staged matcher strict matches={strict_n}")
+        _debug_rows(f"TEMP DEBUG: Fin Inpt staged matcher strict matches={strict_n}")
         source_fac_n = _pair_by_key(
             "source_aware_facility_key", "source_aware_facility_key", "source_aware_facility"
         )
-        _debug_rows(f"TEMP DEBUG: ACORE staged matcher source-aware+facility matches={source_fac_n}")
+        _debug_rows(f"TEMP DEBUG: Fin Inpt staged matcher source-aware+facility matches={source_fac_n}")
         source_n = _pair_by_key("source_aware_key", "source_aware_key", "source_aware")
-        _debug_rows(f"TEMP DEBUG: ACORE staged matcher source-aware matches={source_n}")
+        _debug_rows(f"TEMP DEBUG: Fin Inpt staged matcher source-aware matches={source_n}")
         fallback_n = _pair_by_key("deal_date_key", "deal_date_key", "fallback")
-        _debug_rows(f"TEMP DEBUG: ACORE staged matcher fallback matches={fallback_n}")
+        _debug_rows(f"TEMP DEBUG: Fin Inpt staged matcher fallback matches={fallback_n}")
     else:
         strict_n = _pair_by_key("strict_key", "strict_key", "strict")
         _debug_rows(f"TEMP DEBUG: staged matcher strict matches={strict_n}")
@@ -1920,9 +2424,15 @@ def reconcile(
     # Build merged-like frame while preserving unmatched rows (outer behavior).
     for rid_b in sorted(unmatched_b):
         pair_rows.append({"_row_id_b": int(rid_b), "_row_id_a": pd.NA, "_match_stage": "none", "_merge": "left_only"})
-    if primary_file_type != "ACORE":
-        for rid_a in sorted(unmatched_a):
-            pair_rows.append({"_row_id_b": pd.NA, "_row_id_a": int(rid_a), "_match_stage": "none", "_merge": "right_only"})
+    for rid_a in sorted(unmatched_a):
+        pair_rows.append(
+            {
+                "_row_id_b": pd.NA,
+                "_row_id_a": int(rid_a),
+                "_match_stage": "none",
+                "_merge": "right_only",
+            }
+        )
 
     map_df = pd.DataFrame(pair_rows)
     # Keep merge key dtypes aligned even when unmatched side uses pd.NA.
@@ -1948,14 +2458,14 @@ def reconcile(
             "TEMP DEBUG: post-merge indicator counts "
             f"{merged['_merge'].value_counts(dropna=False).to_dict()}"
         )
-    if primary_file_type == "ACORE":
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES:
         _debug_rows(
-            "TEMP DEBUG: ACORE final assembly is ACP-left anchored by Deal ID/Liability Note suffix key."
+            "TEMP DEBUG: Fin Inpt final assembly uses liability-note parse + Deal ID / staged keys "
+            "(full outer merge preserves both sides)."
         )
     else:
         _debug_rows(
-            "TEMP DEBUG: fallback pairing on Deal ID/Liability Note suffix is DISABLED "
-            "(diagnosis mode; primary match_key only)."
+            "TEMP DEBUG: Non–Fin Inpt primary: staged matchers on match_key; full outer merge."
         )
     _debug_rows(
         "Reconcile merge rows: "
@@ -2015,6 +2525,17 @@ def reconcile(
             row.get("match_key")
             if not pd.isna(row.get("match_key"))
             else row.get(f"{label_a}_match_key")
+        )
+        record["Liability Name (M61)"] = (
+            row.get(f"{label_a}_Liability Name") if in_a else pd.NA
+        )
+        record["Facility Norm (ACP)"] = (
+            _facility_norm_for_debug_cell(row.get("Facility")) if in_b else pd.NA
+        )
+        record["Facility Norm (M61)"] = (
+            _facility_norm_for_debug_cell(row.get(f"{label_a}_Liability Name"))
+            if in_a
+            else pd.NA
         )
 
         # Filter-friendly Facility: when the primary model left Facility blank but M61 has a liability name.
@@ -2153,8 +2674,10 @@ def reconcile(
                 pd.NA if (only_target_from_invis and a_col != "target") else row.get(f"{label_a}_{a_col}")
             )
 
-        # Derive M61 Note Category from Liability Note (M61) — display/filter only, no effect on matching.
-        record["M61 Note Category"] = categorize_m61_note(record.get("Liability Note (M61)"))
+        # M61 Note Category from Liability Type — display/filter only, no effect on matching.
+        record["M61 Note Category"] = categorize_m61_note_type(
+            record.get("Liability Type (M61 Raw)")
+        )
 
         pliab = pd.NA if only_target_from_invis else (row.get(f"{label_a}_Pledge") if in_a else pd.NA)
         pacp = row.get("Pledge") if in_b else pd.NA
@@ -2246,7 +2769,7 @@ def reconcile(
         record["recon_status"] = recon_status
         rows.append(record)
 
-    df_out = pd.DataFrame(rows).reindex(columns=RECON_ORDERED_COLS)
+    df_out = pd.DataFrame(rows).reindex(columns=RECON_ORDERED_COLS).reset_index(drop=True)
     _debug_rows(f"Reconciliation output rows (df_out)={len(df_out)}")
 
     adv_rate_col = f"{p_cfg['display_name']} Advance Rate"
@@ -2282,7 +2805,7 @@ def reconcile(
                 }
             )
 
-    df_adv = pd.DataFrame(adv_rows)
+    df_adv = pd.DataFrame(adv_rows).reset_index(drop=True)
     LAST_RECON_DIAGNOSTICS = {
         "primary_file_type": primary_file_type,
         "raw_primary_rows_loaded": int(len(df_pri_raw)),
@@ -2305,8 +2828,8 @@ def reconcile(
         "primary_rows_after_exclusions": int(len(df_b)),
         "final_reconciliation_rows": int(len(df_out)),
         "reconciliation_basis": (
-            "acp_left_anchored_by_deal_id"
-            if primary_file_type == "ACORE"
+            "fin_inpt_left_anchored_by_liability_note_and_deal_id"
+            if primary_file_type in FIN_INPT_PRIMARY_TYPES
             else "outer_merge_preserving_both_files"
         ),
         "m61_id_extraction_preview": a.loc[:, m61_dbg_cols].head(50).to_dict("records"),
@@ -2766,7 +3289,7 @@ def main():
     parser.add_argument(
         "--mapping",
         default=None,
-        help="Path to LiabilityNoteID -> CRENoteID mapping workbook (required for --primary-type AOC II)",
+        help="Path to LiabilityNoteID -> CRENoteID mapping workbook (required for --primary-type AOC II or AOC I)",
     )
     args = parser.parse_args()
     if args.inspect_primary:
