@@ -929,7 +929,17 @@ if "df_recon" in st.session_state:
     _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
     if _note_pick != "All":
         _cat_s = _series_m61_note_category(df_view)
-        df_view = df_view.loc[_cat_s.eq(_note_pick)].copy()
+        _keep = _cat_s.eq(_note_pick)
+        # Keep primary-only rows in ACP III default output even when M61 note category is filtered.
+        if run_primary == "ACORE" and "Source Indicator" in df_view.columns:
+            _primary_only_lbl = (
+                pl_run.get("primary_only_legend_label")
+                or pl_run.get("source_indicator_primary_only")
+                or "ACORE Only"
+            )
+            _src = df_view["Source Indicator"].fillna("").astype(str).str.strip().str.lower()
+            _keep |= _src.eq(str(_primary_only_lbl).strip().lower())
+        df_view = df_view.loc[_keep].copy()
 
     # Apply status + deal filters on the current view.
     status_filter = []
@@ -945,6 +955,24 @@ if "df_recon" in st.session_state:
         df_view = df_view.iloc[0:0]
     if deal_pick and deal_pick != "All deals":
         df_view = df_view[df_view["Deal Name"] == deal_pick]
+
+    # ACP III default view is primary-driven: keep M61-only rows behind an explicit toggle.
+    if run_primary == "ACORE":
+        show_m61_only_exceptions = st.checkbox(
+            "Show M61-only exceptions",
+            value=False,
+            key="recon_show_m61_only_exceptions",
+            help=(
+                "Default hides rows that exist only on the M61 side so the main ACP III table stays "
+                "ACORE-driven. Enable to review unmatched M61 exceptions."
+            ),
+        )
+        if not show_m61_only_exceptions and "Source Indicator" in df_view.columns:
+            _before = len(df_view)
+            df_view = df_view.loc[df_view["Source Indicator"].fillna("").astype(str).str.strip().ne("M61 Only")].copy()
+            _hidden = _before - len(df_view)
+            if _hidden > 0:
+                st.caption(f"Hidden M61-only exceptions: {_hidden}")
 
     # Avoid showing non-contiguous / upstream row positions in the index column (confused with deal IDs).
     df_view = df_view.reset_index(drop=True)

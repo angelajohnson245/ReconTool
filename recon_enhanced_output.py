@@ -1439,7 +1439,6 @@ _M61_LT_SUBLINE = "subline"
 _M61_LT_TBD_RE = re.compile(r"\btbd\b", re.IGNORECASE)
 _M61_LT_CLO_RE = re.compile(r"\bclo\b", re.IGNORECASE)
 _M61_LT_EQUITY_RE = re.compile(r"\bequity\b", re.IGNORECASE)
-_M61_LT_FUND_RE = re.compile(r"\bfund\b", re.IGNORECASE)
 
 
 def categorize_m61_note_type(liability_type_raw) -> str:
@@ -1449,10 +1448,10 @@ def categorize_m61_note_type(liability_type_raw) -> str:
 
     - **Financing**: Repo (excluding Non-Repo), TBD, CLO
     - **Subline**: Subline
-    - **Equity/Fund**: liability types that reference Fund or Equity
+    - **Equity/Fund**: Equity
     - **Other**: blank, missing M61 side, Non-Repo / standalone Non, or anything else
 
-    Evaluation order: Subline → Equity/Fund → TBD / CLO / Repo → Other.
+    Evaluation order: Subline → TBD / CLO / Repo → Equity/Fund → Other.
     """
     if liability_type_raw is None:
         return "Other"
@@ -1468,9 +1467,6 @@ def categorize_m61_note_type(liability_type_raw) -> str:
     if _M61_LT_SUBLINE in s:
         return "Subline"
 
-    if _M61_LT_EQUITY_RE.search(s) or _M61_LT_FUND_RE.search(s):
-        return "Equity/Fund"
-
     if _M61_LT_TBD_RE.search(s) or _M61_LT_CLO_RE.search(s):
         return "Financing"
 
@@ -1478,6 +1474,9 @@ def categorize_m61_note_type(liability_type_raw) -> str:
         if "non" in s:
             return "Other"
         return "Financing"
+
+    if _M61_LT_EQUITY_RE.search(s):
+        return "Equity/Fund"
 
     return "Other"
 
@@ -2229,11 +2228,17 @@ def reconcile(
     unmatched_a = set(a["_row_id_a"].tolist())
     matchable_a = set(a.loc[a["_m61_in_scope"], "_row_id_a"].tolist())
     if primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        # Fin Inpt reconciliation is financing-only on the M61 side (no Eq/Fund fallback pairing).
+        a["_m61_note_category"] = a["Liability Note"].apply(
+            lambda v: parse_liability_note(v).get("note_category", "Other")
+        )
+        fin_note_rows = set(a.loc[a["_m61_note_category"].eq("Fin"), "_row_id_a"].tolist())
+        matchable_a = matchable_a.intersection(fin_note_rows)
         # Fin Inpt runs (ACP III / ACP II / AOC II): anchor reconciliation candidates to
         # financing identifiers. Only restrict to ID-matched candidates when Deal IDs are
         # actually present on the primary side; if none exist, fall back to the fund-scope
         # candidate set so rows are not silently dropped.
-        id_anchored = set(a.loc[a["_id_in_primary"], "_row_id_a"].tolist())
+        id_anchored = set(a.loc[a["_id_in_primary"], "_row_id_a"].tolist()).intersection(fin_note_rows)
         if id_anchored:
             matchable_a = id_anchored
         else:
@@ -2241,6 +2246,10 @@ def reconcile(
                 "TEMP DEBUG: Fin Inpt anchored candidate set is EMPTY "
                 "(no primary Deal IDs found); falling back to fund-scope matchable_a"
             )
+        _debug_rows(
+            "TEMP DEBUG: Fin Inpt financing-note guard "
+            f"fin_note_rows={len(fin_note_rows)}/{len(a)} matchable_after_guard={len(matchable_a)}"
+        )
         _debug_rows(
             "TEMP DEBUG: Fin Inpt anchored candidate set "
             f"(ID overlap)={len(matchable_a)}/{len(a)}"
