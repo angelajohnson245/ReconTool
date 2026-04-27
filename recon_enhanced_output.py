@@ -1539,6 +1539,47 @@ def _has_compare_value(v):
     return str(v).strip().lower() not in ("", "nan", "none")
 
 
+def _coerce_numeric_value(v) -> float | None:
+    """Best-effort numeric coercion; accepts percent strings like ``2.250%``."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", "<na>", "nat"):
+        return None
+    pct = "%" in s
+    s_num = s.replace("%", "").replace(",", "").strip()
+    try:
+        out = float(s_num)
+    except ValueError:
+        return None
+    return out / 100.0 if pct else out
+
+
+def _normalize_index_floor_value(v):
+    """Normalize index-floor-like values; blank/zero-ish values are treated as missing."""
+    n = _coerce_numeric_value(v)
+    if n is not None:
+        return pd.NA if abs(n) <= FLOAT_TOLERANCE else n
+    if v is None:
+        return pd.NA
+    try:
+        if pd.isna(v):
+            return pd.NA
+    except (TypeError, ValueError):
+        return pd.NA
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", "<na>", "nat"):
+        return pd.NA
+    return s
+
+
 def compare_values(val_a, val_b, comparison_type):
     if pd.isna(val_a) and pd.isna(val_b):
         return "MATCH"
@@ -1547,7 +1588,11 @@ def compare_values(val_a, val_b, comparison_type):
 
     if comparison_type == "numeric":
         try:
-            return "MATCH" if abs(float(val_a) - float(val_b)) <= FLOAT_TOLERANCE else "MISMATCH"
+            n_a = _coerce_numeric_value(val_a)
+            n_b = _coerce_numeric_value(val_b)
+            if n_a is None or n_b is None:
+                return "MISMATCH"
+            return "MATCH" if abs(n_a - n_b) <= FLOAT_TOLERANCE else "MISMATCH"
         except Exception:
             return "MISMATCH"
 
@@ -2013,6 +2058,36 @@ def reconcile(
             facility_col="Liability Name",
             note_col="Liability Note",
             eff_col="Effective Date",
+        )
+
+    # TEMP DEBUG: spread source resolution on each side before merged assembly.
+    _debug_rows(
+        "TEMP DEBUG: spread column presence — "
+        f"primary_has_spread={'Spread' in df_b.columns} m61_has_spread={'Spread' in df_a.columns}"
+    )
+    if "Spread" in df_b.columns:
+        _debug_rows(
+            "TEMP DEBUG: primary Spread sample head(10)="
+            f"{df_b['Spread'].head(10).tolist()!r}"
+        )
+    if "Spread" in df_a.columns:
+        _debug_rows(
+            "TEMP DEBUG: M61 Spread sample head(10)="
+            f"{df_a['Spread'].head(10).tolist()!r}"
+        )
+    _debug_rows(
+        "TEMP DEBUG: index-floor column presence — "
+        f"primary_has_floor={'Floor' in df_b.columns} m61_has_indexfloor={'IndexFloor' in df_a.columns}"
+    )
+    if "Floor" in df_b.columns:
+        _debug_rows(
+            "TEMP DEBUG: primary Floor sample head(10)="
+            f"{df_b['Floor'].head(10).tolist()!r}"
+        )
+    if "IndexFloor" in df_a.columns:
+        _debug_rows(
+            "TEMP DEBUG: M61 IndexFloor sample head(10)="
+            f"{df_a['IndexFloor'].head(10).tolist()!r}"
         )
 
     # Helper IDs for validation / fallback alignment aid.
@@ -2515,6 +2590,9 @@ def reconcile(
         b_deal = row.get("Deal Name")
         in_a = not pd.isna(a_deal)
         in_b = not pd.isna(b_deal)
+        spread_primary = row.get("Spread") if in_b else pd.NA
+        spread_m61 = row.get(f"{label_a}_Spread") if in_a else pd.NA
+        floor_primary = row.get("Floor") if in_b else pd.NA
 
         record = {col: row.get(col) for col in ACP_SHEET_COLS}
 
@@ -2609,12 +2687,10 @@ def reconcile(
             val_a = row.get(f"{label_a}_{a_field}")
             val_b = row.get(b_field)
             liability_label = LIABILITY_VALUE_LABELS.get(a_field, f"{a_field} (M61)")
-
-            # ACORE business rule: Spread is ACP-only in this run; M61 spread is not a shared compare field.
-            if b_field == "Spread" and primary_file_type == "ACORE":
-                record["Spread (M61)"] = pd.NA
-                record["Spread Status"] = "MISSING IN M61 FILE"
-                continue
+            if b_field == "Spread":
+                # Explicit source-scoped values to avoid same-name Spread collisions after merge.
+                val_a = spread_m61
+                val_b = spread_primary
 
             if only_target_from_invis and a_field != "target":
                 record[liability_label] = pd.NA
@@ -2623,27 +2699,32 @@ def reconcile(
                     key_field_statuses.append("MISSING")
                 continue
 
-            # Advance Rate status comparison basis (fund-based mapping):
-            # - Default: compare against M61 Target Advance Rate
-            # - Sale-type fund/deal: compare against M61 Deal Level Advance Rate
+            # Advance Rate comparison basis:
+            # - Fin Inpt runs (ACORE/ACP/AOC): always compare against M61 Target Advance Rate.
+            # - Other flows retain sale-type fallback to deal-level advance.
             if b_field == "Advance Rate":
-                fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
-                liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
-                use_deal_level_adv = _is_sale_type_fund_or_deal(
-                    fund_name=fund_name,
-                    liability_type=liab_type,
-                )
-                if use_deal_level_adv:
-                    compare_val = _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
-                    record["Advance Rate (M61)"] = compare_val
-                    record["Advance Rate Source (M61)"] = "Deal Level Advance Rate"
-                    val_a = compare_val
-                else:
+                if primary_file_type in FIN_INPT_PRIMARY_TYPES:
                     compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
-                    # Non-sale rows must display and compare against Target Advance Rate.
                     record["Advance Rate (M61)"] = compare_val
                     record["Advance Rate Source (M61)"] = "Target Advance Rate"
                     val_a = compare_val
+                else:
+                    fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
+                    liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
+                    use_deal_level_adv = _is_sale_type_fund_or_deal(
+                        fund_name=fund_name,
+                        liability_type=liab_type,
+                    )
+                    if use_deal_level_adv:
+                        compare_val = _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
+                        record["Advance Rate (M61)"] = compare_val
+                        record["Advance Rate Source (M61)"] = "Deal Level Advance Rate"
+                        val_a = compare_val
+                    else:
+                        compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
+                        record["Advance Rate (M61)"] = compare_val
+                        record["Advance Rate Source (M61)"] = "Target Advance Rate"
+                        val_a = compare_val
                 record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
             else:
                 record[liability_label] = val_a
@@ -2711,12 +2792,14 @@ def reconcile(
             record["Fund"] = fund_fallback_display
         record["Effective Date (ACP)"] = record.get("Effective Date") if in_b else pd.NA
         record["Advance Rate (ACP)"] = record.get("Advance Rate") if in_b else pd.NA
-        record["Spread (ACP)"] = record.get("Spread") if in_b else pd.NA
+        record["Spread (ACP)"] = spread_primary
+        if "Spread (M61)" not in record:
+            record["Spread (M61)"] = spread_m61
         record["Undrawn Capacity (ACP)"] = record.get("Current Undrawn Capacity") if in_b else pd.NA
         record["Undrawn Capacity (M61)"] = record.get("Current Undrawn Capacity (M61)")
 
         # ACP-side values
-        record["Index Floor (ACP)"] = record.get("Floor") if in_b else pd.NA
+        record["Index Floor (ACP)"] = _normalize_index_floor_value(floor_primary)
         record["Index Name (ACP)"] = pd.NA
         record["Recourse % (ACP)"] = record.get("Recourse %") if in_b else pd.NA
 
@@ -2729,7 +2812,7 @@ def reconcile(
             record["Index Name (M61)"] = pd.NA
             record["Recourse % (M61)"] = pd.NA
         else:
-            ix_fl = _merged_liab_col(row, label_a, "IndexFloor")
+            ix_fl = _normalize_index_floor_value(_merged_liab_col(row, label_a, "IndexFloor"))
             ix_nm = _merged_liab_col(row, label_a, "IndexName")
             if pd.notna(ix_nm):
                 ix_nm = str(ix_nm).strip() or pd.NA
@@ -2779,6 +2862,16 @@ def reconcile(
         rows.append(record)
 
     df_out = pd.DataFrame(rows).reindex(columns=RECON_ORDERED_COLS).reset_index(drop=True)
+    # Hard guard for Fin Inpt runs: M61 advance display must come only from M61 Target Advance Rate.
+    if (
+        primary_file_type in FIN_INPT_PRIMARY_TYPES
+        and "Advance Rate (M61)" in df_out.columns
+        and "Target Advance Rate (M61)" in df_out.columns
+    ):
+        df_out["Advance Rate (M61)"] = df_out["Target Advance Rate (M61)"]
+        if "Advance Rate Source (M61)" in df_out.columns:
+            has_target = df_out["Target Advance Rate (M61)"].notna()
+            df_out.loc[has_target, "Advance Rate Source (M61)"] = "Target Advance Rate"
     _debug_rows(f"Reconciliation output rows (df_out)={len(df_out)}")
 
     adv_rate_col = f"{p_cfg['display_name']} Advance Rate"
@@ -2982,12 +3075,7 @@ def _fmt_date(v):
 
 
 def _fmt_num(v):
-    if pd.isna(v):
-        return None
-    try:
-        return float(v)
-    except Exception:
-        return None
+    return _coerce_numeric_value(v)
 
 
 def _fmt_str_cell(v):

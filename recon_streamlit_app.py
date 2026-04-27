@@ -581,7 +581,11 @@ def pct(v):
     if v is None:
         return "—"
     try:
-        fv = float(v)
+        s = str(v).strip()
+        if s.endswith("%"):
+            fv = float(s.replace("%", "").replace(",", "").strip()) / 100.0
+        else:
+            fv = float(v)
         if pd.isna(fv):
             return "—"
         return f"{fv:.2%}"
@@ -1180,43 +1184,7 @@ if "df_recon" in st.session_state:
         adv_src_note = "Mixed (" + ", ".join(adv_src_vals) + ")"
     st.caption(f"Advance Rate source: {adv_src_note}")
 
-    with st.expander("Match validation (deal ID, facilities, merge key)", expanded=False):
-        st.caption(
-            "Full reconciliation output (not scoped by sidebar filters). "
-            "Compare **Facility Norm (ACP)** vs **Facility Norm (M61)** when rows fail to pair."
-        )
-        _dbg_cols = [
-            "Deal Name",
-            "Deal ID (ACP)",
-            "M61 Extracted Deal ID",
-            "Liability Name (M61)",
-            "Facility Norm (ACP)",
-            "Facility Norm (M61)",
-            "Effective Date (ACP)",
-            "Effective Date (M61)",
-            "match_key",
-            "ID Match Result",
-        ]
-        _present = [c for c in _dbg_cols if c in df_recon.columns]
-        _missing = [c for c in _dbg_cols if c not in df_recon.columns]
-        if _missing:
-            st.caption(f"Re-run reconciliation to populate: {', '.join(_missing)}")
-        if _present:
-            _dbg_df = df_recon.loc[:, _present].copy()
-            _sort_by = [c for c in ("Deal Name", "ID Match Result") if c in _dbg_df.columns]
-            if _sort_by:
-                _dbg_df = _dbg_df.sort_values(by=_sort_by, ascending=True)
-            _disp = _dbg_df.rename(
-                columns={
-                    "ID Match Result": "Merge status",
-                    "M61 Extracted Deal ID": "M61 deal id (from Liability Note)",
-                    "Facility Norm (ACP)": "ACORE facility normalized",
-                    "Facility Norm (M61)": "M61 facility normalized",
-                }
-            ).reset_index(drop=True)
-            st.dataframe(_disp, use_container_width=True, height=420)
-        else:
-            st.caption("No validation columns available yet.")
+    # Debug expanders intentionally hidden in normal UI.
 
     # Validation/debug expanders hidden from submission UI.
 
@@ -1603,54 +1571,7 @@ if "df_recon" in st.session_state:
                                     df_table_view.index.intersection(keep_idx)
                                 ]
 
-                # ── Debug breakdown expander ─────────────────────────────────────────────
-                _diag_counts = st.session_state.get("recon_row_counts", {}) or {}
-                _cat_counts = _diag_counts.get("m61_note_category_counts", {})
-                _type_counts = _diag_counts.get("m61_liability_type_counts", {})
-                with st.expander("Row breakdown by note category & liability type", expanded=False):
-                    st.caption(
-                        "Counts from the full reconciliation output (all rows, before any display filters). "
-                        "Use this to understand the composition of the M61 data before narrowing the view."
-                    )
-                    _bc1, _bc2 = st.columns(2)
-                    with _bc1:
-                        st.markdown("**By M61 Note Category**")
-                        st.caption(
-                            "Financing = Repo / TBD / CLO · Subline = Subline · "
-                            "Equity/Fund = Fund or Equity in Liability Type"
-                        )
-                        if _cat_counts:
-                            # Preserve the canonical category order.
-                            ordered_cats = [c for c in M61_NOTE_CATEGORIES if c in _cat_counts]
-                            ordered_cats += [c for c in _cat_counts if c not in M61_NOTE_CATEGORIES]
-                            st.dataframe(
-                                pd.DataFrame(
-                                    {
-                                        "Category": ordered_cats,
-                                        "Rows": [_cat_counts[c] for c in ordered_cats],
-                                    }
-                                ),
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-                        else:
-                            st.caption("Run reconciliation to see counts.")
-                    with _bc2:
-                        st.markdown("**By Liability Type (M61 Raw)**")
-                        st.caption("Raw Liability Type column from the M61 export.")
-                        if _type_counts:
-                            st.dataframe(
-                                pd.DataFrame(
-                                    {
-                                        "Liability Type": list(_type_counts.keys()),
-                                        "Rows": list(_type_counts.values()),
-                                    }
-                                ),
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-                        else:
-                            st.caption("Run reconciliation to see counts.")
+                # Debug breakdown expander intentionally hidden in normal UI.
 
                 sort_cols_list = [c for c in df_table_view.columns]
                 if sort_cols_list:
@@ -1922,12 +1843,19 @@ if "df_recon" in st.session_state:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ---- Download ----
+    df_export_ready = df_export_ui.copy()
+    # Export parity with displayed table: table view falls back Spread (ACORE) to raw primary "Spread".
+    if "Spread (ACP)" in df_export_ready.columns and "Spread" in df_export_ready.columns:
+        _sp_acp_blank = df_export_ready["Spread (ACP)"].isna()
+        if _sp_acp_blank.any():
+            df_export_ready.loc[_sp_acp_blank, "Spread (ACP)"] = df_export_ready.loc[_sp_acp_blank, "Spread"]
+
     col_dl1, col_dl2 = st.columns(2)
 
     with col_dl1:
         _excel_payload = b""
         if not is_stale_selection:
-            _excel_payload = to_excel_bytes(df_export_ui, run_primary)
+            _excel_payload = to_excel_bytes(df_export_ready, run_primary)
         st.download_button(
             label="⬇️ Download Excel",
             data=_excel_payload,
@@ -1938,7 +1866,7 @@ if "df_recon" in st.session_state:
 
     with col_dl2:
         csv_data = (
-            df_export_ui.drop(columns=["Target Advance Rate (M61)"], errors="ignore")
+            df_export_ready.drop(columns=["Target Advance Rate (M61)"], errors="ignore")
             .to_csv(index=False)
             .encode("utf-8")
         )
