@@ -486,7 +486,7 @@ with st.sidebar:
     st.checkbox("Mismatch", key="filter_status_mismatch")
 
     # Scope selector is adaptive: hide the toggle when both modes yield the same rows.
-    scope_mode = "All Results"
+    scope_mode = "Selected Fund Only"
     scope_toggle_needed = True
     if "df_recon" in st.session_state:
         _scope_df = st.session_state.get("df_recon", pd.DataFrame())
@@ -501,7 +501,7 @@ with st.sidebar:
         _scope_choice = st.radio(
             "Scope",
             ["Current Upload Results", "Selected Fund View"],
-            index=0,
+            index=1,
             help=(
                 "**Current Upload Results:** full reconciliation output for this run. "
                 "**Selected Fund View:** only rows whose `Fund` belongs to "
@@ -514,14 +514,14 @@ with st.sidebar:
             else "All Results"
         )
     else:
-        scope_mode = "All Results"
+        scope_mode = "Selected Fund Only"
         st.caption("This output is already scoped to the uploaded ACP III business file.")
 
     if "recon_m61_note_category" not in st.session_state:
         st.session_state["recon_m61_note_category"] = "Financing"
     st.selectbox(
         "M61 Note Category",
-        options=["All"] + list(M61_NOTE_CATEGORIES),
+        options=["All", "Financing", "Subline", "Other"],
         key="recon_m61_note_category",
         help=(
             "Filters the **displayed** table, metrics, drilldown, and downloads together with **Scope**. "
@@ -900,9 +900,17 @@ if "df_recon" in st.session_state:
 
     st.markdown('<div class="section-label">Deal filter</div>', unsafe_allow_html=True)
     df_all = df_recon.copy()
+    _primary_only_lbl = get_primary_config(run_primary).get("primary_only_legend_label", "ACORE Only")
+    if "Source Indicator" in df_all.columns:
+        _deal_source_mask = df_all["Source Indicator"].fillna("").astype(str).str.strip().isin(
+            ["Both", _primary_only_lbl]
+        )
+        _deal_pool = df_all.loc[_deal_source_mask].copy()
+    else:
+        _deal_pool = df_all.copy()
     deal_names = (
-        sorted(df_all["Deal Name"].dropna().astype(str).unique().tolist())
-        if "Deal Name" in df_all.columns
+        sorted(_deal_pool["Deal Name"].dropna().astype(str).unique().tolist())
+        if "Deal Name" in _deal_pool.columns
         else []
     )
     deal_options = ["All deals"] + deal_names
@@ -914,7 +922,7 @@ if "df_recon" in st.session_state:
         help="Type in the box to jump to a deal (Streamlit search). Choose **All deals** to clear.",
     )
 
-    # Scoped subset: not In M61-only, then Fin Inpt–anchored (deal + ACP effective date + note + facility).
+    # Scope is applied FIRST from the base reconciliation dataframe.
     df_scoped = filter_recon_scoped_to_business_lines(df_all, run_primary)
     in_scope_ix = set(df_scoped.index)
     if scope_mode == "Selected Fund Only":
@@ -929,52 +937,52 @@ if "df_recon" in st.session_state:
             f"subset to **{run_primary_label}** fund scope (see Scope info)."
         )
 
+    # Deal filter is applied after scope (on the scoped/unscoped base view).
+    if deal_pick and deal_pick != "All deals":
+        df_view = df_view[df_view["Deal Name"] == deal_pick]
+
     # Read note-category selection before source-type narrowing.
     _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
 
     # M61 Note Category (sidebar): same filter for display, metrics, drilldown, and exports.
     if _note_pick != "All":
-        _cat_s = _series_m61_note_category(df_view)
-        _keep = _cat_s.eq(_note_pick)
-        if run_primary == "AOC II" and "Source" in df_view.columns:
-            _src_family = (
-                df_view["Source"]
-                .map(_acore_source_type_family)
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                .str.lower()
-            )
-            _src_fin = _src_family.isin({"repo", "sub debt", "sale", "clo"})
-            _src_other_markers = {"", "none", "nan", "<na>", "nat", "n/a", "na", "tbd", "whole loan"}
-            _src_other = _src_family.isin(_src_other_markers) | (~_src_fin)
-            if _note_pick == "Financing":
-                _keep = _src_fin
-            elif _note_pick == "Other":
-                _keep = _src_other
-        elif run_primary == "AOC I":
-            _liab_family = (
-                df_view.apply(derive_liability_type_for_filter, axis=1)
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                .str.lower()
-            )
-            _liab_fund = _liab_family.eq("fund")
-            _liab_subline = _liab_family.eq("subline")
-            _liab_fin = _liab_family.isin({"non", "sale", "repo", "tbd"})
-            _liab_other = (~_liab_fund) & (~_liab_subline) & (~_liab_fin)
-            if _note_pick == "Equity/Fund":
-                _keep = _liab_fund
-            elif _note_pick == "Subline":
-                _keep = _liab_subline
-            elif _note_pick == "Financing":
-                _keep = _liab_fin
-            elif _note_pick == "Other":
-                _keep = _liab_other
+        _liab_family = (
+            df_view.apply(derive_liability_type_for_filter, axis=1)
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+        _src_family = (
+            df_view["Source"].map(_acore_source_type_family)
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            if "Source" in df_view.columns
+            else pd.Series([""] * len(df_view), index=df_view.index, dtype="object")
+        )
+        _is_subline = _liab_family.eq("subline") | _src_family.eq("subline")
+        if run_primary == "AOC I":
+            _fin_tokens = {"non", "sale", "repo", "tbd", "sub debt"}
+        elif run_primary == "ACP II":
+            _fin_tokens = {"clo", "non", "sale", "repo", "tbd", "sub debt"}
+        else:
+            _fin_tokens = {"clo", "non", "sale", "repo", "tbd", "sub debt"}
+        _is_financing = (
+            _liab_family.isin(_fin_tokens)
+            | _src_family.isin(_fin_tokens)
+        ) & (~_is_subline)
+        _is_other = (~_is_financing) & (~_is_subline)
+        if _note_pick == "Financing":
+            _keep = _is_financing
+        elif _note_pick == "Subline":
+            _keep = _is_subline
+        else:  # Other
+            _keep = _is_other
         df_view = df_view.loc[_keep].copy()
 
-    # Apply status + deal filters on the current view.
+    # Apply status filters on the current view.
     status_filter = []
     if st.session_state.get("filter_status_match", True):
         status_filter.append("MATCH")
@@ -986,8 +994,6 @@ if "df_recon" in st.session_state:
         df_view = df_view[df_view["recon_status"].isin(status_filter)]
     else:
         df_view = df_view.iloc[0:0]
-    if deal_pick and deal_pick != "All deals":
-        df_view = df_view[df_view["Deal Name"] == deal_pick]
 
     # Primary-driven default view: keep M61-only rows behind an explicit toggle.
     if run_primary in ("ACORE", "AOC II", "AOC I"):
@@ -1488,155 +1494,162 @@ if "df_recon" in st.session_state:
 
             df_table_view = df_table.copy()
             if not df_table_view.empty:
-                st.markdown(
-                    '<div class="section-label">Table filters</div>',
-                    unsafe_allow_html=True,
+                enable_table_filters = st.checkbox(
+                    "Enable table filters",
+                    value=False,
+                    key=f"recon_enable_table_filters_{col_tag}",
+                    help="Off by default. Enable to open Fund/Deal/Facility/Type table filters.",
                 )
-                st.caption(
-                    "**M61 Note Category** is set in the sidebar (with **Scope**); it already applies to this table."
-                )
+                if enable_table_filters:
+                    st.markdown(
+                        '<div class="section-label">Table filters</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        "**M61 Note Category** is set in the sidebar (with **Scope**); it already applies to this table."
+                    )
 
-                # ── Rows 1–2: secondary filters, 3 columns each ───────────────────────────
-                # Compute option pools once (scope-aware, not narrowed by status/deal filters).
-                auto_fund_value = ""
-                auto_source_type_filter_vals = None
-                auto_liability_type_filter_val = None
-                if scope_mode == "Selected Fund Only" and not df_display.empty:
-                    if "Fund" in df_display.columns:
-                        fund_vals = (
-                            df_display["Fund"].fillna("").astype(str).str.strip()
-                        )
-                        fund_vals = fund_vals[fund_vals.ne("")]
-                        if not fund_vals.empty:
-                            auto_fund_value = str(fund_vals.value_counts().index[0]).strip()
-                    if "Source" in df_type_opts_base.columns and not df_type_opts_base.empty:
-                        fam_series = df_type_opts_base["Source"].map(_acore_source_type_family)
-                        fam_nonempty = fam_series[fam_series.ne("")]
-                        if not fam_nonempty.empty:
-                            distinct_families = set(fam_nonempty.unique().tolist())
-                            if len(distinct_families) == 1:
-                                sole_family = next(iter(distinct_families))
-                                auto_source_type_filter_vals = [sole_family]
-                                lt = (
-                                    liability_type_opt_series.fillna("").astype(str).str.strip()
-                                )
-                                lt = lt[lt.ne("")]
-                                if not lt.empty and lt.nunique(dropna=False) == 1:
-                                    auto_liability_type_filter_val = str(lt.iloc[0]).strip()
-
-                # Row 1: identity — Fund, Deal Name, Facility
-                # Row 2: source — Source Type (ACORE), Liability Type (M61), Source Status
-                secondary_filter_rows = [
-                    ["Fund", "Deal Name", "Facility"],
-                    ["Source Type (ACORE)", "Liability Type (M61)", "Source Status"],
-                ]
-
-                for row_filters in secondary_filter_rows:
-                    pf_ui_cols = st.columns(len(row_filters))
-                    for i, fc in enumerate(row_filters):
-                        with pf_ui_cols[i]:
-                            if fc == "Source Type (ACORE)":
-                                opts_src = src_type_opt_series
-                            elif fc == "Liability Type (M61)":
-                                opts_src = (
-                                    pd.Series(m61_type_opts_from_diag, dtype="object")
-                                    if m61_type_opts_from_diag
-                                    else liability_type_opt_series
-                                )
-                            else:
-                                opts_src = (
-                                    df_display[fc]
-                                    if fc in df_display.columns
-                                    else pd.Series(dtype="object")
-                                )
-                            opts = sorted(
-                                {
-                                    str(v).strip()
-                                    for v in opts_src.fillna("").astype(str).tolist()
-                                    if str(v).strip()
-                                }
+                    # ── Rows 1–2: secondary filters, 3 columns each ───────────────────────────
+                    # Compute option pools once (scope-aware, not narrowed by status/deal filters).
+                    auto_fund_value = ""
+                    auto_source_type_filter_vals = None
+                    auto_liability_type_filter_val = None
+                    if scope_mode == "Selected Fund Only" and not df_display.empty:
+                        if "Fund" in df_display.columns:
+                            fund_vals = (
+                                df_display["Fund"].fillna("").astype(str).str.strip()
                             )
-                            base_key = f"recon_tbl_primary_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}"
-                            if fc == "Fund" and scope_mode == "Selected Fund Only":
-                                ms_key = f"{base_key}_auto_scope"
-                                if auto_fund_value and auto_fund_value in opts:
-                                    if ms_key not in st.session_state or not st.session_state.get(ms_key):
-                                        st.session_state[ms_key] = [auto_fund_value]
-                            elif fc == "Source Type (ACORE)":
-                                ms_key = f"{base_key}_dispopts"
-                                if scope_mode == "Selected Fund Only" and auto_source_type_filter_vals:
-                                    if all(v in opts for v in auto_source_type_filter_vals):
-                                        if ms_key not in st.session_state or not st.session_state.get(ms_key):
-                                            st.session_state[ms_key] = list(auto_source_type_filter_vals)
-                            elif fc == "Liability Type (M61)":
-                                ms_key = f"{base_key}_dispopts"
-                                if (
-                                    scope_mode == "Selected Fund Only"
-                                    and auto_liability_type_filter_val
-                                    and auto_liability_type_filter_val in opts
-                                ):
-                                    if ms_key not in st.session_state or not st.session_state.get(ms_key):
-                                        st.session_state[ms_key] = [auto_liability_type_filter_val]
-                            else:
-                                ms_key = base_key
+                            fund_vals = fund_vals[fund_vals.ne("")]
+                            if not fund_vals.empty:
+                                auto_fund_value = str(fund_vals.value_counts().index[0]).strip()
+                        if "Source" in df_type_opts_base.columns and not df_type_opts_base.empty:
+                            fam_series = df_type_opts_base["Source"].map(_acore_source_type_family)
+                            fam_nonempty = fam_series[fam_series.ne("")]
+                            if not fam_nonempty.empty:
+                                distinct_families = set(fam_nonempty.unique().tolist())
+                                if len(distinct_families) == 1:
+                                    sole_family = next(iter(distinct_families))
+                                    auto_source_type_filter_vals = [sole_family]
+                                    lt = (
+                                        liability_type_opt_series.fillna("").astype(str).str.strip()
+                                    )
+                                    lt = lt[lt.ne("")]
+                                    if not lt.empty and lt.nunique(dropna=False) == 1:
+                                        auto_liability_type_filter_val = str(lt.iloc[0]).strip()
 
-                            selected_vals = st.multiselect(
-                                fc,
-                                options=opts,
-                                default=[],
-                                key=ms_key,
-                                help="Empty = show all values.",
-                            )
-                            if selected_vals:
-                                allow = set(selected_vals)
-                                if fc == "Source Type (ACORE)" and "Source Type (ACORE)" in df_display.columns:
-                                    fam = df_display["Source Type (ACORE)"].map(_acore_source_type_family)
-                                    keep_idx = df_display.loc[fam.isin(allow)].index
-                                elif fc in df_display.columns:
-                                    keep_idx = df_display[
-                                        df_display[fc].fillna("").astype(str).str.strip().isin(allow)
-                                    ].index
+                    # Row 1: identity — Fund, Deal Name, Facility
+                    # Row 2: source — Source Type (ACORE), Liability Type (M61), Source Status
+                    secondary_filter_rows = [
+                        ["Fund", "Deal Name", "Facility"],
+                        ["Source Type (ACORE)", "Liability Type (M61)", "Source Status"],
+                    ]
+
+                    for row_filters in secondary_filter_rows:
+                        pf_ui_cols = st.columns(len(row_filters))
+                        for i, fc in enumerate(row_filters):
+                            with pf_ui_cols[i]:
+                                if fc == "Source Type (ACORE)":
+                                    opts_src = src_type_opt_series
+                                elif fc == "Liability Type (M61)":
+                                    opts_src = (
+                                        pd.Series(m61_type_opts_from_diag, dtype="object")
+                                        if m61_type_opts_from_diag
+                                        else liability_type_opt_series
+                                    )
                                 else:
-                                    keep_idx = df_display.index[:0]
-                                df_table_view = df_table_view.loc[
-                                    df_table_view.index.intersection(keep_idx)
-                                ]
+                                    opts_src = (
+                                        df_display[fc]
+                                        if fc in df_display.columns
+                                        else pd.Series(dtype="object")
+                                    )
+                                opts = sorted(
+                                    {
+                                        str(v).strip()
+                                        for v in opts_src.fillna("").astype(str).tolist()
+                                        if str(v).strip()
+                                    }
+                                )
+                                base_key = f"recon_tbl_primary_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}"
+                                if fc == "Fund" and scope_mode == "Selected Fund Only":
+                                    ms_key = f"{base_key}_auto_scope"
+                                    if auto_fund_value and auto_fund_value in opts:
+                                        if ms_key not in st.session_state or not st.session_state.get(ms_key):
+                                            st.session_state[ms_key] = [auto_fund_value]
+                                elif fc == "Source Type (ACORE)":
+                                    ms_key = f"{base_key}_dispopts"
+                                    if scope_mode == "Selected Fund Only" and auto_source_type_filter_vals:
+                                        if all(v in opts for v in auto_source_type_filter_vals):
+                                            if ms_key not in st.session_state or not st.session_state.get(ms_key):
+                                                st.session_state[ms_key] = list(auto_source_type_filter_vals)
+                                elif fc == "Liability Type (M61)":
+                                    ms_key = f"{base_key}_dispopts"
+                                    if (
+                                        scope_mode == "Selected Fund Only"
+                                        and auto_liability_type_filter_val
+                                        and auto_liability_type_filter_val in opts
+                                    ):
+                                        if ms_key not in st.session_state or not st.session_state.get(ms_key):
+                                            st.session_state[ms_key] = [auto_liability_type_filter_val]
+                                else:
+                                    ms_key = base_key
 
-                # Debug breakdown expander intentionally hidden in normal UI.
+                                selected_vals = st.multiselect(
+                                    fc,
+                                    options=opts,
+                                    default=[],
+                                    key=ms_key,
+                                    help="Empty = show all values.",
+                                )
+                                if selected_vals:
+                                    allow = set(selected_vals)
+                                    if fc == "Source Type (ACORE)" and "Source Type (ACORE)" in df_display.columns:
+                                        fam = df_display["Source Type (ACORE)"].map(_acore_source_type_family)
+                                        keep_idx = df_display.loc[fam.isin(allow)].index
+                                    elif fc in df_display.columns:
+                                        keep_idx = df_display[
+                                            df_display[fc].fillna("").astype(str).str.strip().isin(allow)
+                                        ].index
+                                    else:
+                                        keep_idx = df_display.index[:0]
+                                    df_table_view = df_table_view.loc[
+                                        df_table_view.index.intersection(keep_idx)
+                                    ]
 
-                sort_cols_list = [c for c in df_table_view.columns]
-                if sort_cols_list:
-                    s1, s2 = st.columns(2)
-                    with s1:
-                        sort_by = st.selectbox(
-                            "Sort by",
-                            options=["(none)"] + sort_cols_list,
-                            index=0,
-                            key=f"recon_tbl_sort_{col_tag}",
-                            help="Applies after filters; uses string order if types differ.",
-                        )
-                    with s2:
-                        sort_asc = st.checkbox(
-                            "Ascending",
-                            value=True,
-                            key=f"recon_tbl_sort_asc_{col_tag}",
-                        )
-                    if sort_by != "(none)":
-                        try:
-                            df_table_view = df_table_view.sort_values(
-                                by=sort_by, ascending=sort_asc, na_position="last"
+                    # Debug breakdown expander intentionally hidden in normal UI.
+
+                    sort_cols_list = [c for c in df_table_view.columns]
+                    if sort_cols_list:
+                        s1, s2 = st.columns(2)
+                        with s1:
+                            sort_by = st.selectbox(
+                                "Sort by",
+                                options=["(none)"] + sort_cols_list,
+                                index=0,
+                                key=f"recon_tbl_sort_{col_tag}",
+                                help="Applies after filters; uses string order if types differ.",
                             )
-                        except TypeError:
-                            t = df_table_view.copy()
-                            t["_sort_tmp"] = t[sort_by].astype(str)
-                            df_table_view = t.sort_values(
-                                "_sort_tmp", ascending=sort_asc
-                            ).drop(columns="_sort_tmp")
+                        with s2:
+                            sort_asc = st.checkbox(
+                                "Ascending",
+                                value=True,
+                                key=f"recon_tbl_sort_asc_{col_tag}",
+                            )
+                        if sort_by != "(none)":
+                            try:
+                                df_table_view = df_table_view.sort_values(
+                                    by=sort_by, ascending=sort_asc, na_position="last"
+                                )
+                            except TypeError:
+                                t = df_table_view.copy()
+                                t["_sort_tmp"] = t[sort_by].astype(str)
+                                df_table_view = t.sort_values(
+                                    "_sort_tmp", ascending=sort_asc
+                                ).drop(columns="_sort_tmp")
 
-                n_after = len(df_table_view)
-                n_before = len(df_table)
-                if n_after != n_before:
-                    st.caption(f"Table filters: showing **{n_after}** of **{n_before}** row(s).")
+                    n_after = len(df_table_view)
+                    n_before = len(df_table)
+                    if n_after != n_before:
+                        st.caption(f"Table filters: showing **{n_after}** of **{n_before}** row(s).")
 
             if not visible_cols and not df_display.empty:
                 st.info(
