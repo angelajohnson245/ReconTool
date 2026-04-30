@@ -573,6 +573,9 @@ AOC_M61_FUND_NAME_I_RE = re.compile(
 )
 
 FLOAT_TOLERANCE = 1e-6
+# Status-only tolerance for rate-like numeric comparisons.
+# Slightly wider than FLOAT_TOLERANCE to avoid false mismatches after percent rounding/serialization.
+RATE_STATUS_TOLERANCE = 5e-5
 ENABLE_DEAL_ID_SUFFIX_FALLBACK = False
 
 ACP_SHEET_COLS = [
@@ -1849,6 +1852,19 @@ def _coerce_numeric_value(v) -> float | None:
     return out / 100.0 if pct else out
 
 
+def _coerce_rate_fraction(v) -> float | None:
+    """Normalize a rate-like value to fraction form for status comparison.
+
+    Accepts either percent-point inputs (e.g. 7.43, 78.14) or fraction inputs (0.0743, 0.7814),
+    including strings with '%' already handled by ``_coerce_numeric_value``.
+    """
+    n = _coerce_numeric_value(v)
+    if n is None:
+        return None
+    # Heuristic: values beyond +/-1 are percent-points, convert to fraction.
+    return (n / 100.0) if abs(n) > 1.0 else n
+
+
 def _normalize_index_floor_value(v):
     """Normalize index-floor-like values; blank/zero-ish values are treated as missing."""
     n = _coerce_numeric_value(v)
@@ -1903,7 +1919,7 @@ def compare_liability_primary_status(val_liab, val_acp, comparison_type, *, miss
     l_ok = _has_compare_value(val_liab)
     p_ok = _has_compare_value(val_acp)
     if not l_ok and not p_ok:
-        return "BOTH MISSING"
+        return "MISSING FROM BOTH FILES"
     if not p_ok and l_ok:
         return f"MISSING IN {missing_in_primary}"
     if p_ok and not l_ok:
@@ -1911,19 +1927,22 @@ def compare_liability_primary_status(val_liab, val_acp, comparison_type, *, miss
     return compare_values(val_liab, val_acp, comparison_type)
 
 
-def compare_optional(val_liab, val_acp, kind="text"):
+def compare_optional(val_liab, val_acp, kind="text", *, missing_in_primary: str = "ACORE"):
     """
-    Optional cross-file fields (index floor/name, recourse).
-    - Both sides blank → N/A
-    - Only one side populated → N/A (values still shown; not a mismatch)
+    Optional cross-file fields (index floor/name, recourse) with explicit missing-side statuses.
+    - Both sides blank → MISSING FROM BOTH FILES
+    - Only M61 side populated → MISSING FROM <primary> FILE
+    - Only primary side populated → MISSING FROM M61 FILE
     - Both populated → MATCH / MISMATCH (never affects recon_status)
     """
     l_ok = not _is_blank_for_compare(val_liab)
     a_ok = not _is_blank_for_compare(val_acp)
     if not l_ok and not a_ok:
-        return "N/A"
-    if not l_ok or not a_ok:
-        return "N/A"
+        return "MISSING FROM BOTH FILES"
+    if l_ok and not a_ok:
+        return f"MISSING FROM {missing_in_primary} FILE"
+    if a_ok and not l_ok:
+        return "MISSING FROM M61 FILE"
     eff_kind = kind
     if kind == "numeric":
         try:
@@ -1974,7 +1993,7 @@ def compare_effective_date_status(val_liability, val_acp, *, missing_in_primary:
     miss_pri = f"MISSING IN {missing_in_primary}"
 
     if not has_acp and not has_liab:
-        return "BOTH MISSING"
+        return "MISSING FROM BOTH FILES"
     if not has_acp:
         return miss_pri
     if not has_liab:
@@ -2020,7 +2039,7 @@ def compare_pledge_date_status(
     miss_pri = f"MISSING IN {missing_in_primary}"
 
     if not has_acp and not has_liab:
-        return "BOTH MISSING"
+        return "MISSING FROM BOTH FILES"
     if not has_acp and has_liab:
         return miss_pri
     if has_acp and not has_liab:
@@ -3074,10 +3093,10 @@ def reconcile(
             else pd.NA
         )
 
-        # Filter-friendly Source: primary "Source" is empty for M61-only rows and sometimes on matches;
-        # use M61 Liability Type + Financial Institution when M61 data exists.
+        # Filter-friendly Source: only for M61-only rows, derive from M61 fields.
+        # Keep matched/primary rows strictly primary-driven for Source Type (ACORE).
         src_pri = _stripped_nonempty_str(record.get("Source"))
-        if not src_pri and in_a:
+        if not src_pri and in_a and not in_b:
             lt = _stripped_nonempty_str(row.get(f"{label_a}_Liability Type"))
             fi = _stripped_nonempty_str(row.get(f"{label_a}_Financial Institution"))
             parts = [p for p in (lt, fi) if p]
@@ -3185,15 +3204,29 @@ def reconcile(
                 continue
 
             if not in_a and not in_b:
-                status = "BOTH MISSING"
+                status = "MISSING FROM BOTH FILES"
             elif not in_b:
                 status = f"MISSING IN {miss_pri}"
             elif not in_a:
                 status = "MISSING IN M61"
             else:
-                status = compare_liability_primary_status(
-                    val_a, val_b, ctype, missing_in_primary=miss_pri
-                )
+                if b_field in ("Advance Rate", "Spread"):
+                    n_a = _coerce_rate_fraction(val_a)
+                    n_b = _coerce_rate_fraction(val_b)
+                    if n_a is not None and n_b is not None:
+                        status = (
+                            "MATCH"
+                            if abs(n_a - n_b) <= RATE_STATUS_TOLERANCE
+                            else "MISMATCH"
+                        )
+                    else:
+                        status = compare_liability_primary_status(
+                            val_a, val_b, ctype, missing_in_primary=miss_pri
+                        )
+                else:
+                    status = compare_liability_primary_status(
+                        val_a, val_b, ctype, missing_in_primary=miss_pri
+                    )
 
             record[f"{b_field} Status"] = status
             if b_field in RECON_STATUS_FIELDS:
@@ -3271,25 +3304,22 @@ def reconcile(
             record.get("Index Floor (M61)"),
             record.get("Index Floor (ACP)"),
             "text",
+            missing_in_primary=miss_pri,
         )
         record["Index Name Status"] = compare_optional(
             record.get("Index Name (M61)"),
             record.get("Index Name (ACP)"),
             "text",
+            missing_in_primary=miss_pri,
         )
         rec_m61 = record.get("Recourse % (M61)")
         rec_acp = record.get("Recourse % (ACP)")
-        rec_m61_has = not _is_blank_for_compare(rec_m61)
-        rec_acp_has = not _is_blank_for_compare(rec_acp)
-        if rec_acp_has and not rec_m61_has:
-            # Display-only status lane; does not feed final recon_status.
-            record["Recourse % Status"] = "MISSING IN M61 FILE"
-        else:
-            record["Recourse % Status"] = compare_optional(
-                rec_m61,
-                rec_acp,
-                "numeric",
-            )
+        record["Recourse % Status"] = compare_optional(
+            rec_m61,
+            rec_acp,
+            "numeric",
+            missing_in_primary=miss_pri,
+        )
 
         src_status = "" if pd.isna(row.get(f"{label_a}_Status")) else str(row.get(f"{label_a}_Status")).strip().lower()
 
@@ -3382,7 +3412,7 @@ def reconcile(
             pk = f"{label_a}_{col}"
             liab_val = row.get(pk) if pk in row.index else pd.NA
             if not in_a and not in_b:
-                result = "BOTH MISSING"
+                result = "MISSING FROM BOTH FILES"
             elif not in_b:
                 result = f"MISSING IN {miss_pri}"
             elif not in_a:
@@ -3793,7 +3823,7 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
             MISSING_BG,
             "7D6608",
             "Record exists in one file only, red-flagged in M61 export, or a key field is "
-            "MISSING IN ACORE / MISSING IN AOC II / MISSING IN M61 / BOTH MISSING.",
+            "MISSING IN ACORE / MISSING IN AOC II / MISSING IN M61 / MISSING FROM BOTH FILES.",
         ),
         (wb_ctx["legend_primary_only_label"], "D9E1F2", "1F3864", wb_ctx["legend_primary_only_detail"]),
         ("Both", "E2EFDA", "375623", "Record found in primary model and M61 — basis for comparison"),

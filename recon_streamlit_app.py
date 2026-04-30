@@ -936,9 +936,22 @@ if "df_recon" in st.session_state:
     if _note_pick != "All":
         _cat_s = _series_m61_note_category(df_view)
         _keep = _cat_s.eq(_note_pick)
-        if run_primary == "AOC II" and _note_pick == "Financing" and "Source" in df_view.columns:
-            _src_family = df_view["Source"].map(_acore_source_type_family).fillna("").astype(str).str.strip().str.lower()
-            _keep |= _src_family.isin({"repo", "non", "sub debt", "sale", "clo", "whole loan"})
+        if run_primary == "AOC II" and "Source" in df_view.columns:
+            _src_family = (
+                df_view["Source"]
+                .map(_acore_source_type_family)
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            _src_fin = _src_family.isin({"repo", "sub debt", "sale", "clo"})
+            _src_other_markers = {"", "none", "nan", "<na>", "nat", "n/a", "na", "tbd", "whole loan"}
+            _src_other = _src_family.isin(_src_other_markers) | (~_src_fin)
+            if _note_pick == "Financing":
+                _keep = _src_fin
+            elif _note_pick == "Other":
+                _keep = _src_other
         df_view = df_view.loc[_keep].copy()
 
     # Apply status + deal filters on the current view.
