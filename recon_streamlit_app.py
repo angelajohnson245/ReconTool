@@ -952,6 +952,26 @@ if "df_recon" in st.session_state:
                 _keep = _src_fin
             elif _note_pick == "Other":
                 _keep = _src_other
+        elif run_primary == "AOC I":
+            _liab_family = (
+                df_view.apply(derive_liability_type_for_filter, axis=1)
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            _liab_fund = _liab_family.eq("fund")
+            _liab_subline = _liab_family.eq("subline")
+            _liab_fin = _liab_family.isin({"non", "sale", "repo", "tbd"})
+            _liab_other = (~_liab_fund) & (~_liab_subline) & (~_liab_fin)
+            if _note_pick == "Equity/Fund":
+                _keep = _liab_fund
+            elif _note_pick == "Subline":
+                _keep = _liab_subline
+            elif _note_pick == "Financing":
+                _keep = _liab_fin
+            elif _note_pick == "Other":
+                _keep = _liab_other
         df_view = df_view.loc[_keep].copy()
 
     # Apply status + deal filters on the current view.
@@ -970,7 +990,7 @@ if "df_recon" in st.session_state:
         df_view = df_view[df_view["Deal Name"] == deal_pick]
 
     # Primary-driven default view: keep M61-only rows behind an explicit toggle.
-    if run_primary in ("ACORE", "AOC II"):
+    if run_primary in ("ACORE", "AOC II", "AOC I"):
         show_m61_only_exceptions = st.checkbox(
             "Show M61-only exceptions",
             value=False,

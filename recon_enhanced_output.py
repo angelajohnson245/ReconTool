@@ -894,7 +894,7 @@ PRIMARY_FILE_CONFIG: dict[str, dict] = {
         "primary_group_header": "ACP I — PRIMARY DATA",
     },
     "AOC I": {
-        "sheet_name": "10) Fin Inpt",
+        "sheet_name": "9) Fin Inpt",
         "header_row": 6,
         "sanitize_fin_inpt_headers": True,
         "column_map": {
@@ -1761,9 +1761,9 @@ def categorize_m61_note_category(
         return "Other"
     if "subline" in s:
         return "Subline"
-    # For AOC II, Whole Loan is a distinct asset class, not a financing facility —
+    # For AOC II / AOC I, Whole Loan is a distinct asset class, not a financing facility —
     # skip it here so it falls through to "Other" and is excluded from Financing filter.
-    if primary_file_type == "AOC II" and ("whole loan" in s or "wholeloan" in s):
+    if primary_file_type in ("AOC II", "AOC I") and ("whole loan" in s or "wholeloan" in s):
         return "Other"
     financing_src_tokens = ("repo", "sale", "non", "clo", "sub debt", "subdebt", "whole loan", "wholeloan")
     if any(tok in s for tok in financing_src_tokens):
@@ -2646,8 +2646,8 @@ def reconcile(
         fin_note_rows = set(a.loc[a["_m61_note_category"].eq("Fin"), "_row_id_a"].tolist())
         matchable_a = matchable_a.intersection(fin_note_rows)
         _scope_ok = pd.Series(True, index=a.index)
-        # Tight fund guard only for ACP II / AOC II where shared Deal IDs across funds are common.
-        if primary_file_type in ("ACP II", "AOC II"):
+        # Tight fund guard for ACP II / AOC II / AOC I where shared Deal IDs across funds are common.
+        if primary_file_type in ("ACP II", "AOC II", "AOC I"):
             a["_m61_note_fund_code"] = a["Liability Note"].apply(
                 lambda v: (parse_liability_note(v).get("fund_code") or "").strip()
             )
@@ -2743,9 +2743,9 @@ def reconcile(
         return len(pairs)
 
     def _pair_note_deal_id_relaxed() -> int:
-        """ACP II / AOC II only: pair by parsed liability-note deal id ``==`` primary ``acp_match_key``
+        """ACP II / AOC II / AOC I only: pair by parsed liability-note deal id ``==`` primary ``acp_match_key``
         after stricter stages fail. Disambiguate by effective date, then facility token; skip if ambiguous."""
-        if primary_file_type not in ("ACP II", "AOC II"):
+        if primary_file_type not in ("ACP II", "AOC II", "AOC I"):
             return 0
         _fac_vals = set(FACILITY_NORM_MAP.values())
         added = 0
@@ -2847,8 +2847,8 @@ def reconcile(
 
     b["id_match_key"] = b["acp_match_key"].astype(str)
     a["id_match_key"] = a["m61_match_key"].astype(str)
-    # AOC II name variants are common; pair by Deal ID + Effective Date for ID-stage matching.
-    if primary_file_type == "AOC II":
+    # AOC II / AOC I name variants are common; pair by Deal ID + Effective Date for ID-stage matching.
+    if primary_file_type in ("AOC II", "AOC I"):
         b["id_match_key"] = b["acp_match_key"].astype(str) + "|" + b["effective_date_key"].astype(str)
         a["id_match_key"] = a["m61_match_key"].astype(str) + "|" + a["effective_date_key"].astype(str)
         _debug_trace_uncommons_m61_match_state(
