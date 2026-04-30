@@ -7,7 +7,7 @@ import sys
 from datetime import date, datetime
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -66,7 +66,7 @@ PRIMARY_TYPE_FUND_CONFIG = {
         # Scoped rows: Fund must spell out Roman II (do not match Opportunistic Credit I).
         "fund_token": "opportunistic credit ii",
         "fund_regex": r"\bopportunistic\s+credit\s+ii\b",
-        "recon_fund_display": "Opportunistic Credit II",
+        "recon_fund_display": "ACORE Opportunistic Credit II",
     },
     "AOC I": {
         "export_label": "ACORE - AOC I",
@@ -88,6 +88,8 @@ def _fund_shorthand_to_canonical_map() -> dict[str, str]:
         for key in (cfg.get("export_label"), cfg.get("scope_label")):
             if key and str(key).strip():
                 out[str(key).strip()] = str(canon).strip()
+    # Legacy / raw fund-name aliases from M61 exports -> canonical display labels.
+    out["Opportunistic Credit II"] = PRIMARY_TYPE_FUND_CONFIG["AOC II"]["recon_fund_display"]
     return out
 
 
@@ -143,6 +145,196 @@ def get_last_recon_diagnostics() -> dict[str, int | str]:
 def _debug_rows(msg: str) -> None:
     """Temporary row-count diagnostics for reconciliation pipeline."""
     print(f"[RECON DEBUG] {msg}")
+
+
+# --- Targeted trace: M61 row LN_Fin_AOCII_25-2820 / UnCommons PE (debug only; remove when resolved) ---
+_TRACE_UNCOMMONS_LN_EXACT = "LN_Fin_AOCII_25-2820"
+
+
+def _mask_trace_uncommons_m61(df: pd.DataFrame | None) -> pd.Series:
+    """Boolean mask for the target M61 row: exact ``LN_Fin_AOCII_25-2820`` only."""
+    if df is None or df.empty or "Liability Note" not in df.columns:
+        return pd.Series(dtype=bool)
+    ln = df["Liability Note"].fillna("").astype(str).str.strip()
+    return ln.eq(_TRACE_UNCOMMONS_LN_EXACT)
+
+
+def _debug_trace_uncommons_m61_load(
+    df: pd.DataFrame,
+    stage: str,
+    *,
+    primary_file_type: str,
+    in_scope_mask: pd.Series | None = None,
+) -> None:
+    """Trace one M61 row through expanded filter (before/after in_scope_mask)."""
+    m = _mask_trace_uncommons_m61(df)
+    if not m.any():
+        _debug_rows(
+            f"TRACE UnCommons M61 [{stage}]: NOT IN DATAFRAME "
+            f"(rows={len(df)} primary_type={primary_file_type!r})"
+        )
+        return
+    hit = df.loc[m]
+    for idx, r in hit.iterrows():
+        note = str(r.get("Liability Note", "") or "").strip()
+        lt_raw = r.get("Liability Type")
+        lt_bucket = _liability_type_bucket(lt_raw)
+        in_type_bucket = lt_bucket in M61_FINANCING_TYPE_BUCKETS
+        fin_tok = bool(_fin_note_scope_mask(pd.Series([note]), primary_file_type).iloc[0])
+        expanded_ok = in_type_bucket or fin_tok
+        scope_note = ""
+        if in_scope_mask is not None and idx in in_scope_mask.index:
+            scope_note = f" in_scope_mask={bool(in_scope_mask.loc[idx])}"
+        parsed = parse_liability_note(note)
+        _debug_rows(
+            f"TRACE UnCommons M61 [{stage}]: FOUND idx={idx} Deal={r.get('Deal Name')!r} "
+            f"Liability Type={lt_raw!r} -> bucket={lt_bucket!r} in_financing_buckets={in_type_bucket} "
+            f"fin_note_token_match={fin_tok} expanded_filter_OR={expanded_ok}{scope_note}"
+        )
+        _debug_rows(f"TRACE UnCommons M61 [{stage}]: parse_liability_note -> {parsed!r}")
+        _debug_rows(
+            f"TRACE UnCommons M61 [{stage}]: Effective Date raw={r.get('Effective Date')!r} "
+            f"Fund Name={r.get('Fund Name')!r}"
+        )
+
+
+def _debug_trace_uncommons_primary_fin_inpt(df_b: pd.DataFrame, *, primary_file_type: str) -> None:
+    """Trace primary rows for UnCommons / deal id 25-2820 on Fin Inpt side."""
+    if df_b is None or df_b.empty:
+        _debug_rows(f"TRACE UnCommons PRIMARY [{primary_file_type}]: empty df_b")
+        return
+    dn = df_b["Deal Name"].fillna("").astype(str).str.lower()
+    m = dn.str.contains("uncommons", na=False)
+    if "deal_id_value" in df_b.columns:
+        did = df_b["deal_id_value"].fillna("").astype(str).str.strip()
+        m = m | did.str.contains("25-2820", na=False)
+    if "acp_extracted_deal_id" in df_b.columns:
+        did2 = df_b["acp_extracted_deal_id"].fillna("").astype(str).str.strip()
+        m = m | did2.str.contains("25-2820", na=False)
+    if not m.any():
+        _debug_rows(
+            f"TRACE UnCommons PRIMARY [{primary_file_type}]: NO ROW with UnCommons / 25-2820 "
+            f"(primary_rows={len(df_b)})"
+        )
+        return
+    cols = [
+        c
+        for c in (
+            "Deal Name",
+            "deal_id_value",
+            "acp_extracted_deal_id",
+            "acp_match_key",
+            "effective_date_key",
+            "match_key",
+            "Note Name",
+            "Facility",
+            "Source",
+            "Effective Date",
+        )
+        if c in df_b.columns
+    ]
+    sub = df_b.loc[m, cols]
+    _debug_rows(
+        f"TRACE UnCommons PRIMARY [{primary_file_type}]: {len(sub)} row(s) — "
+        f"expect match vs M61 on Deal ID + eff date + facility for AOC II"
+    )
+    for i, (_, r) in enumerate(sub.iterrows(), start=1):
+        _debug_rows(f"TRACE UnCommons PRIMARY [{primary_file_type}] #{i}: {r.to_dict()!r}")
+
+
+def _debug_trace_uncommons_m61_match_state(
+    a: pd.DataFrame,
+    *,
+    primary_file_type: str,
+    matchable_a: set,
+    fin_note_rows: set | None,
+    id_anchored: set | None,
+    scope_lbl: str,
+    _scope_ok: pd.Series | None,
+) -> None:
+    """After Fin Inpt guards: show whether trace row is in matchable_a / fin_note / fund scope."""
+    m = _mask_trace_uncommons_m61(a)
+    if not m.any():
+        _debug_rows(
+            f"TRACE UnCommons M61 [match_state]: row absent from df_a (rows={len(a)})"
+        )
+        return
+    for idx, r in a.loc[m].iterrows():
+        rid = int(r["_row_id_a"]) if "_row_id_a" in r.index and pd.notna(r["_row_id_a"]) else -1
+        note = str(r.get("Liability Note", "") or "")
+        pc = parse_liability_note(note)
+        nc = pc.get("note_category", "")
+        in_fin = nc == "Fin"
+        in_scope_fund = bool(r.get("_m61_in_scope")) if "_m61_in_scope" in r.index else True
+        id_in_pri = bool(r.get("_id_in_primary")) if "_id_in_primary" in r.index else False
+        fc = (pc.get("fund_code") or "").strip()
+        ok_scope = True
+        if _scope_ok is not None and idx in _scope_ok.index:
+            ok_scope = bool(_scope_ok.loc[idx])
+        in_matchable = rid in matchable_a if rid >= 0 else False
+        in_fin_note_set = rid in fin_note_rows if fin_note_rows is not None and rid >= 0 else None
+        in_id_anchor = rid in id_anchored if id_anchored is not None and rid >= 0 else None
+        _debug_rows(
+            f"TRACE UnCommons M61 [match_state]: _row_id_a={rid} scope_lbl={scope_lbl!r} "
+            f"parse_note_category={nc!r} (need Fin for fin_note_rows) fund_code={fc!r} "
+            f"_m61_in_scope={in_scope_fund} _scope_ok={ok_scope} _id_in_primary={id_in_pri}"
+        )
+        _debug_rows(
+            f"TRACE UnCommons M61 [match_state]: in fin_note_rows={in_fin_note_set} "
+            f"in id_anchored={in_id_anchor} in matchable_a={in_matchable} "
+            f"| keys: id_match_key={r.get('id_match_key', '')!r} fin_m61_key={r.get('fin_m61_key', '')!r} "
+            f"match_key={r.get('match_key', '')!r}"
+        )
+
+
+def _debug_trace_uncommons_pairing_keys(a: pd.DataFrame, b: pd.DataFrame) -> None:
+    """After id_match_key / fin_* keys exist: compare UnCommons M61 row to primary Fin Inpt rows."""
+    m61_m = _mask_trace_uncommons_m61(a)
+    if not m61_m.any():
+        return
+    for _, ar in a.loc[m61_m].iterrows():
+        _debug_rows(
+            "TRACE UnCommons [pairing_keys] M61: "
+            f"id_match_key={ar.get('id_match_key')!r} fin_m61_key={ar.get('fin_m61_key')!r} "
+            f"strict_key={ar.get('strict_key')!r} eff_key={ar.get('effective_date_key')!r} "
+            f"facility_norm={ar.get('facility_norm')!r} source_bucket={ar.get('source_bucket')!r}"
+        )
+    pb = b["Deal Name"].fillna("").astype(str).str.lower().str.contains("uncommons", na=False)
+    if "acp_match_key" in b.columns:
+        pb = pb | b["acp_match_key"].astype(str).str.contains("25-2820", na=False)
+    if not pb.any():
+        _debug_rows(
+            "TRACE UnCommons [pairing_keys] PRIMARY: no row with UnCommons / 25-2820 in deal_id"
+        )
+        return
+    for _, br in b.loc[pb].iterrows():
+        _debug_rows(
+            "TRACE UnCommons [pairing_keys] PRIMARY: "
+            f"id_match_key={br.get('id_match_key')!r} fin_acp_key={br.get('fin_acp_key')!r} "
+            f"strict_key={br.get('strict_key')!r} deal={br.get('Deal Name')!r} "
+            f"eff_key={br.get('effective_date_key')!r} Source={br.get('Source')!r} "
+            f"facility_norm={br.get('facility_norm')!r}"
+        )
+
+
+def _debug_trace_uncommons_merged(merged: pd.DataFrame, *, label_a: str) -> None:
+    """Locate trace row in assembled merged frame (pre-record loop)."""
+    col = f"{label_a}_Liability Note"
+    if merged.empty or col not in merged.columns:
+        _debug_rows("TRACE UnCommons M61 [merged]: merged empty or no prefixed Liability Note")
+        return
+    ln = merged[col].fillna("").astype(str).str.strip()
+    m = ln.eq(_TRACE_UNCOMMONS_LN_EXACT)
+    if not m.any():
+        _debug_rows(
+            "TRACE UnCommons M61 [merged]: NOT FOUND in merged "
+            f"(merged_rows={len(merged)})"
+        )
+        return
+    hit = merged.loc[m, [c for c in ("_merge", "_match_stage", col, f"{label_a}_Deal Name") if c in merged.columns]]
+    _debug_rows(f"TRACE UnCommons M61 [merged]: FOUND {len(hit)} row(s)")
+    for i, (_, r) in enumerate(hit.iterrows(), start=1):
+        _debug_rows(f"TRACE UnCommons M61 [merged] #{i}: {r.to_dict()!r}")
 
 
 def _debug_m61_load_preview(df: pd.DataFrame, n: int = 5) -> None:
@@ -356,7 +548,7 @@ def default_recon_output_path(
 # 2. CONSTANTS
 # --------------------------------------------------
 M61_FINANCING_TYPES = ["Repo", "Non", "Subline"]
-M61_FINANCING_TYPE_BUCKETS = frozenset({"repo", "non", "subline"})
+M61_FINANCING_TYPE_BUCKETS = frozenset({"repo", "non", "sale", "clo", "subline"})
 
 TARGET_FUNDS = {
     "acore credit partners iii",
@@ -520,6 +712,21 @@ FACILITY_NORM_MAP = {
     "acpi-gs-repo": "gs",
     "acpi-ms-repo": "ms",
     "acpi-boa-repo": "boa",
+    # Plain financial-institution name aliases (no fund prefix / no "-Repo" suffix).
+    # Required so ACORE Facility strings like "JP Morgan" produce the same token ("jpm")
+    # as the M61 note suffix "_JPM", enabling financing_note stage matching.
+    "jp morgan": "jpm",
+    "j.p. morgan": "jpm",
+    "jpmorgan": "jpm",
+    "jpm": "jpm",
+    "jp morgan repo": "jpm",
+    "j.p. morgan repo": "jpm",
+    "goldman sachs": "gs",
+    "goldman sachs repo": "gs",
+    "bank of america": "boa",
+    "bofa": "boa",
+    "morgan stanley": "ms",
+    "morgan stanley repo": "ms",
 }
 
 PRIMARY_INTERNAL_FIELDS = (
@@ -882,10 +1089,37 @@ def safe_parse_date(series):
     return out
 
 
+def _drop_hidden_fin_inpt_rows(df_raw: pd.DataFrame, path: str, cfg: dict, primary_file_type: str) -> pd.DataFrame:
+    """AOC Fin Inpt guard: exclude Excel rows that are hidden/filtered in the source sheet."""
+    if primary_file_type not in ("AOC II", "AOC I"):
+        return df_raw
+    try:
+        wb = load_workbook(path, read_only=False, data_only=True)
+        ws = wb[cfg["sheet_name"]]
+        header_row = int(cfg["header_row"])  # 0-based pandas header row
+        first_data_excel_row = header_row + 2  # 1-based Excel row number
+        keep_mask = []
+        for i in range(len(df_raw)):
+            excel_row = first_data_excel_row + i
+            hidden = bool(ws.row_dimensions[excel_row].hidden)
+            keep_mask.append(not hidden)
+        kept = int(sum(1 for x in keep_mask if x))
+        if kept != len(df_raw):
+            _debug_rows(
+                "Primary hidden-row filter applied "
+                f"primary_type={primary_file_type} kept_rows={kept}/{len(df_raw)} sheet={cfg['sheet_name']!r}"
+            )
+        return df_raw.loc[keep_mask].reset_index(drop=True)
+    except Exception as e:
+        _debug_rows(f"Primary hidden-row filter skipped ({primary_file_type}): {e}")
+        return df_raw
+
+
 def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
     cfg = get_primary_config(primary_file_type)
     df_raw = pd.read_excel(path, sheet_name=cfg["sheet_name"], header=cfg["header_row"])
     df_raw = _sanitize_fin_inpt_raw_df(df_raw, cfg)
+    df_raw = _drop_hidden_fin_inpt_rows(df_raw, path, cfg, primary_file_type)
 
     if "Advance" in df_raw.columns and "Advance Rate" not in df_raw.columns:
         df_raw["Advance Rate"] = df_raw["Advance"]
@@ -1054,6 +1288,12 @@ def load_file_a(
     liab_note_up = df["Liability Note"].fillna("").astype(str).str.upper()
     fin_note_scope_mask = _fin_note_scope_mask(liab_note_up, primary_file_type)
     in_scope_mask = liab_type_mask | fin_note_scope_mask
+    _debug_trace_uncommons_m61_load(
+        df,
+        "load_file_a:before_expanded_filter",
+        primary_file_type=primary_file_type,
+        in_scope_mask=in_scope_mask,
+    )
     _fin_toks = _fin_note_tokens_for_primary(primary_file_type)
     _debug_rows(
         "M61 pre-filter diagnostics (fund labels are informational; rows are NOT dropped by fund here): "
@@ -1099,6 +1339,11 @@ def load_file_a(
                 f"eff={er.get('Effective Date')!r}"
             )
     df = df[in_scope_mask].copy()
+    _debug_trace_uncommons_m61_load(
+        df,
+        "load_file_a:after_expanded_filter",
+        primary_file_type=primary_file_type,
+    )
     _debug_rows(
         "M61 after expanded in-scope filter: "
         f"rows={len(df)} "
@@ -1432,7 +1677,7 @@ def extract_liability_note_suffix(value) -> str:
 
 
 # Ordered category list used by both backend column derivation and UI filter defaults.
-M61_NOTE_CATEGORIES: list[str] = ["Financing", "Subline", "Other"]
+M61_NOTE_CATEGORIES: list[str] = ["Financing", "Subline", "Equity/Fund", "Other"]
 
 # Liability-type substrings / tokens for ``categorize_m61_note_type`` (maintenance-friendly).
 _M61_LT_SUBLINE = "subline"
@@ -1446,12 +1691,12 @@ def categorize_m61_note_type(liability_type_raw) -> str:
 
     Display and filter only; does not affect merge or reconciliation row counts.
 
-    - **Financing**: Repo (excluding Non-Repo), TBD, CLO
+    - **Financing**: Repo, Sale, Non, CLO (and TBD for legacy exports)
     - **Subline**: Subline
     - **Equity/Fund**: Equity
-    - **Other**: blank, missing M61 side, Non-Repo / standalone Non, or anything else
+    - **Other**: blank, missing M61 side, or anything else
 
-    Evaluation order: Subline → TBD / CLO / Repo → Equity/Fund → Other.
+    Evaluation order: Subline → TBD / CLO / Sale / Non / Repo → Equity/Fund → Other.
     """
     if liability_type_raw is None:
         return "Other"
@@ -1470,14 +1715,56 @@ def categorize_m61_note_type(liability_type_raw) -> str:
     if _M61_LT_TBD_RE.search(s) or _M61_LT_CLO_RE.search(s):
         return "Financing"
 
+    if "sale" in s:
+        return "Financing"
+
+    if s in ("non", "non-repo", "non repo") or " non" in f" {s}":
+        return "Financing"
+
     if "repo" in s:
-        if "non" in s:
-            return "Other"
         return "Financing"
 
     if _M61_LT_EQUITY_RE.search(s):
         return "Equity/Fund"
 
+    return "Other"
+
+
+def categorize_m61_note_category(
+    liability_note_raw,
+    liability_type_raw,
+    primary_source_raw=None,
+    primary_file_type: str = "",
+) -> str:
+    """Primary M61 Note Category source = Liability Note parser; fallback = type, then primary source.
+
+    ``primary_file_type`` is used for fund-specific overrides:
+    - AOC II: Whole Loan is NOT Financing (falls through to "Other").  All other funds
+      retain the legacy behaviour where Whole Loan maps to Financing.
+    """
+    p = parse_liability_note(liability_note_raw)
+    by_note = (p.get("note_category") or "").strip()
+    if by_note == "Fin":
+        return "Financing"
+    if by_note == "Sub":
+        return "Subline"
+    if by_note == "Eq/Fund":
+        return "Equity/Fund"
+    by_type = categorize_m61_note_type(liability_type_raw)
+    if by_type != "Other":
+        return by_type
+    s = normalise_text(primary_source_raw)
+    if not s:
+        return "Other"
+    if "subline" in s:
+        return "Subline"
+    # For AOC II, Whole Loan is a distinct asset class, not a financing facility —
+    # skip it here so it falls through to "Other" and is excluded from Financing filter.
+    if primary_file_type == "AOC II" and ("whole loan" in s or "wholeloan" in s):
+        return "Other"
+    financing_src_tokens = ("repo", "sale", "non", "clo", "sub debt", "subdebt", "whole loan", "wholeloan")
+    if any(tok in s for tok in financing_src_tokens):
+        return "Financing"
     return "Other"
 
 
@@ -1826,6 +2113,11 @@ def _fin_m61_key_from_row(row: pd.Series, scope_label: str) -> str:
             row.get("Financial Institution"),
             row.get("Liability Name"),
         )
+        # Only use the FI/name fallback when it is a recognised bank token (jpm/gs/ms/boa/tbd).
+        # Generic liability names such as ``AOCII-3rd Party-Sale`` produce unstable join keys
+        # that diverge from the ACORE facility token and block valid Deal-ID matches.
+        if sx not in FACILITY_NORM_MAP.values():
+            sx = ""
     # When the note has no suffix and name/FI yield no token, match on deal id + effective date only.
     if sx:
         return f"{did}|{eff}|{sx}"
@@ -1987,6 +2279,11 @@ def reconcile(
             left_on="Liability Note",
             right_on="LiabilityNoteID",
         )
+        _debug_trace_uncommons_m61_load(
+            raw_m61,
+            "reconcile:raw_m61_after_CRE_mapping_merge",
+            primary_file_type=primary_file_type,
+        )
         df_a = build_match_key(
             raw_m61,
             "Deal Name",
@@ -2097,13 +2394,32 @@ def reconcile(
         df_b["deal_id_value"] = ""
     # Normalize ACP key via same token extractor used for M61 notes.
     df_b["acp_extracted_deal_id"] = df_b["deal_id_value"].apply(extract_deal_id_token)
+    # Fin Inpt fallback: when Deal ID column is blank, recover id token from Note/Deal text if present.
+    _acp_missing_id = df_b["acp_extracted_deal_id"].astype(str).str.strip().eq("")
+    if _acp_missing_id.any():
+        _note_fallback = (
+            df_b.loc[_acp_missing_id, "Note Name"].apply(extract_deal_id_token)
+            if "Note Name" in df_b.columns
+            else pd.Series("", index=df_b.index[_acp_missing_id], dtype="object")
+        )
+        df_b.loc[_acp_missing_id, "acp_extracted_deal_id"] = _note_fallback
+    _acp_missing_id2 = df_b["acp_extracted_deal_id"].astype(str).str.strip().eq("")
+    if _acp_missing_id2.any():
+        _deal_fallback = df_b.loc[_acp_missing_id2, "Deal Name"].apply(extract_deal_id_token)
+        df_b.loc[_acp_missing_id2, "acp_extracted_deal_id"] = _deal_fallback
     df_b["acp_match_key"] = df_b["acp_extracted_deal_id"].apply(normalise_deal_id_key)
     df_b["deal_id_key"] = df_b["acp_match_key"]
+    _debug_trace_uncommons_primary_fin_inpt(df_b, primary_file_type=primary_file_type)
 
     df_a["m61_extracted_deal_id"] = df_a["Liability Note"].apply(extract_liability_note_suffix)
     df_a["liability_note_suffix"] = df_a["m61_extracted_deal_id"]
     df_a["liability_note_suffix_key"] = df_a["liability_note_suffix"].apply(normalise_deal_id_key)
     df_a["m61_match_key"] = df_a["liability_note_suffix_key"].astype(str)
+    _debug_trace_uncommons_m61_load(
+        df_a,
+        "reconcile:df_a_after_liability_note_suffix",
+        primary_file_type=primary_file_type,
+    )
     _debug_rows(
         "TEMP DEBUG: Deal ID helper readiness — "
         f"primary_nonblank_deal_id={int(df_b['acp_match_key'].ne('').sum())} "
@@ -2303,17 +2619,28 @@ def reconcile(
     unmatched_a = set(a["_row_id_a"].tolist())
     matchable_a = set(a.loc[a["_m61_in_scope"], "_row_id_a"].tolist())
     if primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        scope_lbl = scope_label_for_primary_type(primary_file_type)
         # Fin Inpt reconciliation is financing-only on the M61 side (no Eq/Fund fallback pairing).
         a["_m61_note_category"] = a["Liability Note"].apply(
             lambda v: parse_liability_note(v).get("note_category", "Other")
         )
         fin_note_rows = set(a.loc[a["_m61_note_category"].eq("Fin"), "_row_id_a"].tolist())
         matchable_a = matchable_a.intersection(fin_note_rows)
+        _scope_ok = pd.Series(True, index=a.index)
+        # Tight fund guard only for ACP II / AOC II where shared Deal IDs across funds are common.
+        if primary_file_type in ("ACP II", "AOC II"):
+            a["_m61_note_fund_code"] = a["Liability Note"].apply(
+                lambda v: (parse_liability_note(v).get("fund_code") or "").strip()
+            )
+            _scope_ok = a["_m61_in_scope"] & a["_m61_note_fund_code"].eq(scope_lbl)
+            matchable_a = matchable_a.intersection(set(a.loc[_scope_ok, "_row_id_a"].tolist()))
         # Fin Inpt runs (ACP III / ACP II / AOC II): anchor reconciliation candidates to
         # financing identifiers. Only restrict to ID-matched candidates when Deal IDs are
         # actually present on the primary side; if none exist, fall back to the fund-scope
         # candidate set so rows are not silently dropped.
-        id_anchored = set(a.loc[a["_id_in_primary"], "_row_id_a"].tolist()).intersection(fin_note_rows)
+        id_anchored = set(
+            a.loc[a["_id_in_primary"] & _scope_ok, "_row_id_a"].tolist()
+        ).intersection(fin_note_rows)
         if id_anchored:
             matchable_a = id_anchored
         else:
@@ -2333,7 +2660,6 @@ def reconcile(
     b["fin_acp_key"] = ""
     a["fin_m61_key"] = ""
     if primary_file_type in FIN_INPT_PRIMARY_TYPES:
-        scope_lbl = scope_label_for_primary_type(primary_file_type)
         b["_pri_fac_tok"] = b.apply(
             lambda r: _primary_facility_match_token(r.get("Source"), r.get("Facility")), axis=1
         )
@@ -2342,7 +2668,9 @@ def reconcile(
         tok_stripped = sub_b["_pri_fac_tok"].fillna("").astype(str).str.strip()
         base_k = sub_b["deal_id_key"].astype(str) + "|" + sub_b["effective_date_key"].astype(str)
         fin_vals = base_k + "|" + sub_b["_pri_fac_tok"].fillna("").astype(str)
-        fin_vals.loc[tok_stripped.eq("")] = base_k[tok_stripped.eq("")]
+        _known_fac_toks = frozenset(FACILITY_NORM_MAP.values())
+        bare_cond = tok_stripped.eq("") | ~tok_stripped.isin(_known_fac_toks)
+        fin_vals.loc[bare_cond] = base_k[bare_cond]
         b.loc[msk_b, "fin_acp_key"] = fin_vals
         a["fin_m61_key"] = a.apply(lambda r: _fin_m61_key_from_row(r, scope_lbl), axis=1)
 
@@ -2395,8 +2723,125 @@ def reconcile(
             )
         return len(pairs)
 
+    def _pair_note_deal_id_relaxed() -> int:
+        """ACP II / AOC II only: pair by parsed liability-note deal id ``==`` primary ``acp_match_key``
+        after stricter stages fail. Disambiguate by effective date, then facility token; skip if ambiguous."""
+        if primary_file_type not in ("ACP II", "AOC II"):
+            return 0
+        _fac_vals = set(FACILITY_NORM_MAP.values())
+        added = 0
+
+        def _m61_fac_tok_for_relaxed(ar: pd.Series) -> str:
+            p = parse_liability_note(ar.get("Liability Note"))
+            if p.get("note_category") != "Fin":
+                return ""
+            tok = _normalize_ln_suffix_token(p.get("source_suffix") or "")
+            if not tok:
+                tok = _primary_facility_match_token(
+                    ar.get("Financial Institution"), ar.get("Liability Name")
+                )
+            if tok and tok not in _fac_vals:
+                return ""
+            return tok
+
+        def _pick_primary_row(ar: pd.Series, cand: pd.DataFrame) -> int | None:
+            if cand.empty:
+                return None
+            if len(cand) == 1:
+                return int(cand.iloc[0]["_row_id_b"])
+            eff_m = str(ar.get("effective_date_key") or "")
+            sub_eff = cand[cand["effective_date_key"].astype(str) == eff_m]
+            tok = _m61_fac_tok_for_relaxed(ar)
+
+            if len(sub_eff) == 1:
+                return int(sub_eff.iloc[0]["_row_id_b"])
+
+            if len(sub_eff) > 1:
+                if tok:
+                    hit = sub_eff[sub_eff["_pri_fac_tok"].astype(str).str.strip().eq(tok)]
+                    if len(hit) == 1:
+                        return int(hit.iloc[0]["_row_id_b"])
+                _debug_rows(
+                    "TEMP DEBUG: note_deal_id_relaxed SKIP ambiguous "
+                    "(multiple primary rows same deal id + eff date): "
+                    f"m61_id={int(ar['_row_id_a'])} deal_id={ar.get('m61_match_key')!r} n={len(sub_eff)}"
+                )
+                return None
+
+            # No primary row shares this effective date — try facility token across all candidates.
+            if tok:
+                hit = cand[cand["_pri_fac_tok"].astype(str).str.strip().eq(tok)]
+                if len(hit) == 1:
+                    return int(hit.iloc[0]["_row_id_b"])
+                if len(hit) > 1:
+                    _debug_rows(
+                        "TEMP DEBUG: note_deal_id_relaxed SKIP ambiguous "
+                        f"(facility token matches multiple primaries): m61_id={int(ar['_row_id_a'])} "
+                        f"deal_id={ar.get('m61_match_key')!r} tok={tok!r} n={len(hit)}"
+                    )
+                    return None
+            _debug_rows(
+                "TEMP DEBUG: note_deal_id_relaxed SKIP no unique primary "
+                f"m61_id={int(ar['_row_id_a'])} deal_id={ar.get('m61_match_key')!r} "
+                f"eff_m={eff_m!r} cand={len(cand)} tok={tok!r}"
+            )
+            return None
+
+        la_iter = a[
+            a["_row_id_a"].isin(unmatched_a.intersection(matchable_a))
+            & a["m61_match_key"].astype(str).str.strip().ne("")
+        ].sort_values(["m61_match_key", "effective_date_key", "_row_id_a"])
+
+        for _, ar in la_iter.iterrows():
+            rid_a = int(ar["_row_id_a"])
+            if rid_a not in unmatched_a:
+                continue
+            did = str(ar["m61_match_key"]).strip()
+            if not did:
+                continue
+            cand = b[(b["_row_id_b"].isin(unmatched_b)) & (b["acp_match_key"].astype(str) == did)]
+            rid_pick = _pick_primary_row(ar, cand)
+            if rid_pick is None:
+                continue
+            if rid_pick not in unmatched_b or rid_a not in unmatched_a:
+                continue
+            unmatched_b.remove(rid_pick)
+            unmatched_a.remove(rid_a)
+            pair_rows.append(
+                {
+                    "_row_id_b": rid_pick,
+                    "_row_id_a": rid_a,
+                    "_match_stage": "note_deal_id_relaxed",
+                    "_merge": "both",
+                }
+            )
+            br = b_by_id.loc[rid_pick]
+            _debug_rows(
+                "TEMP DEBUG: selected pair "
+                f"stage=note_deal_id_relaxed acp_id={rid_pick} m61_id={rid_a} "
+                f"deal={br.get('Deal Name')!r} eff_key={br.get('effective_date_key')!r} "
+                f"acp_source={br.get('Source')!r} m61_type={ar.get('Liability Type')!r} "
+                f"reason=note deal id fallback after stricter Fin Inpt stages"
+            )
+            added += 1
+        return added
+
     b["id_match_key"] = b["acp_match_key"].astype(str)
     a["id_match_key"] = a["m61_match_key"].astype(str)
+    # AOC II name variants are common; pair by Deal ID + Effective Date for ID-stage matching.
+    if primary_file_type == "AOC II":
+        b["id_match_key"] = b["acp_match_key"].astype(str) + "|" + b["effective_date_key"].astype(str)
+        a["id_match_key"] = a["m61_match_key"].astype(str) + "|" + a["effective_date_key"].astype(str)
+        _debug_trace_uncommons_m61_match_state(
+            a,
+            primary_file_type=primary_file_type,
+            matchable_a=matchable_a,
+            fin_note_rows=fin_note_rows,
+            id_anchored=id_anchored,
+            scope_lbl=scope_lbl,
+            _scope_ok=_scope_ok,
+        )
+        _debug_trace_uncommons_pairing_keys(a, b)
 
     if primary_file_type in FIN_INPT_PRIMARY_TYPES:
         # Financing-first: parsed M61 liability note (Fin + fund + deal id + eff date + suffix)
@@ -2450,6 +2895,8 @@ def reconcile(
         _debug_rows(f"TEMP DEBUG: Fin Inpt staged matcher source-aware matches={source_n}")
         fallback_n = _pair_by_key("deal_date_key", "deal_date_key", "fallback")
         _debug_rows(f"TEMP DEBUG: Fin Inpt staged matcher fallback matches={fallback_n}")
+        relaxed_ndid_n = _pair_note_deal_id_relaxed()
+        _debug_rows(f"TEMP DEBUG: Fin Inpt note-deal-id relaxed matches={relaxed_ndid_n}")
     else:
         strict_n = _pair_by_key("strict_key", "strict_key", "strict")
         _debug_rows(f"TEMP DEBUG: staged matcher strict matches={strict_n}")
@@ -2535,6 +2982,8 @@ def reconcile(
         how="left",
     )
     _debug_unmatched_after_merge(merged, label_a=label_a, n=10)
+    if primary_file_type == "AOC II":
+        _debug_trace_uncommons_merged(merged, label_a=label_a)
     matched_rows_after_merge = int((merged["_merge"] == "both").sum()) if "_merge" in merged.columns else 0
     _debug_rows(f"TEMP DEBUG: matched rows after merge={matched_rows_after_merge}")
     if "_merge" in merged.columns:
@@ -2764,9 +3213,12 @@ def reconcile(
                 pd.NA if (only_target_from_invis and a_col != "target") else row.get(f"{label_a}_{a_col}")
             )
 
-        # M61 Note Category from Liability Type — display/filter only, no effect on matching.
-        record["M61 Note Category"] = categorize_m61_note_type(
-            record.get("Liability Type (M61 Raw)")
+        # M61 Note Category: prefer parsed Liability Note (LN_Fin/LN_Sub/LN_Eq), fallback to Liability Type.
+        record["M61 Note Category"] = categorize_m61_note_category(
+            row.get(f"{label_a}_Liability Note"),
+            record.get("Liability Type (M61 Raw)"),
+            record.get("Source"),
+            primary_file_type=primary_file_type,
         )
 
         pliab = pd.NA if only_target_from_invis else (row.get(f"{label_a}_Pledge") if in_a else pd.NA)
@@ -2872,7 +3324,55 @@ def reconcile(
         if "Advance Rate Source (M61)" in df_out.columns:
             has_target = df_out["Target Advance Rate (M61)"].notna()
             df_out.loc[has_target, "Advance Rate Source (M61)"] = "Target Advance Rate"
+    _debug_cols = [
+        "Deal Name",
+        "Fund",
+        "Fund (M61)",
+        "Deal ID (ACP)",
+        "Facility",
+        "Liability Name (M61)",
+        "Effective Date (ACP)",
+        "Effective Date (M61)",
+        "Match Stage",
+        "Source Indicator",
+        "Target Advance Rate (M61)",
+        "Advance Rate (ACP)",
+        "recon_status",
+    ]
+    _present_dbg = [c for c in _debug_cols if c in df_out.columns]
+    if _present_dbg:
+        _debug_rows(f"TEMP DEBUG: post-assembly key output snapshot cols={_present_dbg!r}")
+        for i, (_, rr) in enumerate(df_out.loc[:, _present_dbg].head(80).iterrows(), start=1):
+            _debug_rows("TEMP DEBUG: OUT " + f"#{i} " + " | ".join(f"{c}={rr.get(c)!r}" for c in _present_dbg))
     _debug_rows(f"Reconciliation output rows (df_out)={len(df_out)}")
+
+    # ── Temporary per-row diagnostic for FIN_INPT runs ──────────────────────────
+    # Prints to stderr so it appears in the Streamlit server log regardless of
+    # RECON_DEBUG.  Shows every ACORE-driven row with match metadata so mismatches
+    # between ACORE and M61 sides are immediately visible.  Remove once stable.
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        import sys as _sys
+        _dbg_cols = [
+            "Deal ID (ACP)", "Deal Name", "Effective Date",
+            "M61 Extracted Deal ID", "Liability Name (M61)", "Effective Date (M61)",
+            "Liability Type (M61 Raw)", "Source Indicator", "Match Stage", "match_key",
+            "Target Advance Rate (M61)", "Spread (M61)",
+        ]
+        _avail = [c for c in _dbg_cols if c in df_out.columns]
+        _acore_mask = (
+            df_out["Source Indicator"].isin(["Both", p_cfg.get("primary_only_legend_label", "ACORE Only")])
+            if "Source Indicator" in df_out.columns
+            else pd.Series([True] * len(df_out))
+        )
+        _dbg_df = df_out.loc[_acore_mask, _avail].copy()
+        print(
+            f"\n{'='*70}\n"
+            f"[{primary_file_type} ROW DEBUG] ACORE-driven rows: {len(_dbg_df)}\n"
+            f"{_dbg_df.to_string(index=True)}\n"
+            f"{'='*70}",
+            file=_sys.stderr,
+        )
+    # ── End temporary diagnostic ─────────────────────────────────────────────────
 
     adv_rate_col = f"{p_cfg['display_name']} Advance Rate"
     adv_rows = []

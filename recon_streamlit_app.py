@@ -929,20 +929,22 @@ if "df_recon" in st.session_state:
             f"subset to **{run_primary_label}** fund scope (see Scope info)."
         )
 
-    # M61 Note Category (sidebar): same filter for display, metrics, drilldown, and exports.
+    # Read note-category selection before source-type narrowing.
     _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
+
+    # AOC II business rule: exclude Whole Loan from financing comparison output.
+    # Keep Whole Loan visible when category is "All" (no note-category filter requested).
+    if run_primary == "AOC II" and _note_pick == "Financing" and "Source" in df_view.columns:
+        _src_family = df_view["Source"].map(_acore_source_type_family).fillna("").astype(str).str.strip().str.lower()
+        df_view = df_view.loc[_src_family.ne("whole loan")].copy()
+
+    # M61 Note Category (sidebar): same filter for display, metrics, drilldown, and exports.
     if _note_pick != "All":
         _cat_s = _series_m61_note_category(df_view)
         _keep = _cat_s.eq(_note_pick)
-        # Keep primary-only rows in ACP III default output even when M61 note category is filtered.
-        if run_primary == "ACORE" and "Source Indicator" in df_view.columns:
-            _primary_only_lbl = (
-                pl_run.get("primary_only_legend_label")
-                or pl_run.get("source_indicator_primary_only")
-                or "ACORE Only"
-            )
-            _src = df_view["Source Indicator"].fillna("").astype(str).str.strip().str.lower()
-            _keep |= _src.eq(str(_primary_only_lbl).strip().lower())
+        if run_primary == "AOC II" and _note_pick == "Financing" and "Source" in df_view.columns:
+            _src_family = df_view["Source"].map(_acore_source_type_family).fillna("").astype(str).str.strip().str.lower()
+            _keep |= _src_family.isin({"repo", "non", "sub debt", "sale", "clo"})
         df_view = df_view.loc[_keep].copy()
 
     # Apply status + deal filters on the current view.
@@ -960,15 +962,15 @@ if "df_recon" in st.session_state:
     if deal_pick and deal_pick != "All deals":
         df_view = df_view[df_view["Deal Name"] == deal_pick]
 
-    # ACP III default view is primary-driven: keep M61-only rows behind an explicit toggle.
-    if run_primary == "ACORE":
+    # Primary-driven default view: keep M61-only rows behind an explicit toggle.
+    if run_primary in ("ACORE", "AOC II"):
         show_m61_only_exceptions = st.checkbox(
             "Show M61-only exceptions",
             value=False,
             key="recon_show_m61_only_exceptions",
             help=(
-                "Default hides rows that exist only on the M61 side so the main ACP III table stays "
-                "ACORE-driven. Enable to review unmatched M61 exceptions."
+                "Default hides rows that exist only on the M61 side so the main table stays "
+                "primary-driven. Enable to review unmatched M61 exceptions."
             ),
         )
         if not show_m61_only_exceptions and "Source Indicator" in df_view.columns:
