@@ -3074,12 +3074,6 @@ def reconcile(
             else pd.NA
         )
 
-        # Filter-friendly Facility: when the primary model left Facility blank but M61 has a liability name.
-        fac_pri = _stripped_nonempty_str(record.get("Facility"))
-        liab_name = _stripped_nonempty_str(row.get(f"{label_a}_Liability Name"))
-        if not fac_pri and liab_name and in_a:
-            record["Facility"] = liab_name
-
         # Filter-friendly Source: primary "Source" is empty for M61-only rows and sometimes on matches;
         # use M61 Liability Type + Financial Institution when M61 data exists.
         src_pri = _stripped_nonempty_str(record.get("Source"))

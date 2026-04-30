@@ -967,7 +967,9 @@ if "df_recon" in st.session_state:
                 "primary-driven. Enable to review unmatched M61 exceptions."
             ),
         )
-        if not show_m61_only_exceptions and "Source Indicator" in df_view.columns:
+        # When Note Category = All, show full universe (including M61-only rows) by default.
+        hide_m61_only = (not show_m61_only_exceptions) and (_note_pick != "All")
+        if hide_m61_only and "Source Indicator" in df_view.columns:
             _before = len(df_view)
             df_view = df_view.loc[df_view["Source Indicator"].fillna("").astype(str).str.strip().ne("M61 Only")].copy()
             _hidden = _before - len(df_view)
