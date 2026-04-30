@@ -932,19 +932,13 @@ if "df_recon" in st.session_state:
     # Read note-category selection before source-type narrowing.
     _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
 
-    # AOC II business rule: exclude Whole Loan from financing comparison output.
-    # Keep Whole Loan visible when category is "All" (no note-category filter requested).
-    if run_primary == "AOC II" and _note_pick == "Financing" and "Source" in df_view.columns:
-        _src_family = df_view["Source"].map(_acore_source_type_family).fillna("").astype(str).str.strip().str.lower()
-        df_view = df_view.loc[_src_family.ne("whole loan")].copy()
-
     # M61 Note Category (sidebar): same filter for display, metrics, drilldown, and exports.
     if _note_pick != "All":
         _cat_s = _series_m61_note_category(df_view)
         _keep = _cat_s.eq(_note_pick)
         if run_primary == "AOC II" and _note_pick == "Financing" and "Source" in df_view.columns:
             _src_family = df_view["Source"].map(_acore_source_type_family).fillna("").astype(str).str.strip().str.lower()
-            _keep |= _src_family.isin({"repo", "non", "sub debt", "sale", "clo"})
+            _keep |= _src_family.isin({"repo", "non", "sub debt", "sale", "clo", "whole loan"})
         df_view = df_view.loc[_keep].copy()
 
     # Apply status + deal filters on the current view.
