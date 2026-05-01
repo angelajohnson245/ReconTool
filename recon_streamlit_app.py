@@ -6,6 +6,7 @@ import io
 import os
 import re
 import tempfile
+import unicodedata
 from datetime import datetime
  
 import pandas as pd
@@ -21,6 +22,7 @@ from recon_enhanced_output import (
     categorize_m61_note_type,
     filter_recon_to_selected_fund,
     get_primary_config,
+    get_last_recon_context,
     normalise_facility,
     normalise_text,
     normalize_recon_fund_for_output,
@@ -354,6 +356,65 @@ def looks_like_m61_liability_relationship(filename: str | None) -> bool:
     return True
 
 
+def normalize_m61_note_category_label(v: object) -> str:
+    """Normalize category labels for consistent sidebar option/filter matching."""
+    try:
+        if v is pd.NA:
+            v = ""
+    except (TypeError, ValueError):
+        pass
+    s = "" if v is None else str(v)
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\ufeff", "").strip()
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    if s == "all":
+        return "all"
+    if s in ("", "nan", "none", "<na>", "n/a", "na", "unknown", "other"):
+        return "other"
+    # Subline: match "subline", "sub line", unicode variants (after NFKC), etc.
+    if re.search(r"\bsub[\s-]*line\b", s) or re.fullmatch(r"sub[\s-]*line", s):
+        return "subline"
+    if s in ("financing", "repo", "sale", "non", "clo", "sub debt", "tbd"):
+        return "financing"
+    if s in ("equity/fund", "eq/fund", "equity", "fund"):
+        return "other"
+    return "other"
+
+
+def m61_note_category_series_for_ui(df: pd.DataFrame) -> pd.Series:
+    """Row-level M61 note categories used by both sidebar options and filtering."""
+    if df is None or df.empty:
+        return pd.Series(dtype="object")
+    if "M61 Note Category" in df.columns:
+        return df["M61 Note Category"].fillna("Other").astype(str).map(
+            normalize_m61_note_category_label
+        )
+    for col in ("Liability Type (M61 Raw)", "Liability Type (M61)", "Liability Type"):
+        if col in df.columns:
+            return (
+                df[col]
+                .map(categorize_m61_note_type)
+                .fillna("Other")
+                .astype(str)
+                .map(normalize_m61_note_category_label)
+            )
+    return pd.Series(["other"] * len(df), index=df.index, dtype="object")
+
+
+def _date_key_ui(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    dt = pd.to_datetime(v, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return dt.strftime("%Y-%m-%d")
+
+
 # --------------------------------------------------
 # SIDEBAR
 # --------------------------------------------------
@@ -517,15 +578,18 @@ with st.sidebar:
         scope_mode = "Selected Fund Only"
         st.caption("This output is already scoped to the uploaded ACP III business file.")
 
+    _note_options = ["All", "Financing", "Subline", "Other"]
     if "recon_m61_note_category" not in st.session_state:
         st.session_state["recon_m61_note_category"] = "Financing"
+    if st.session_state.get("recon_m61_note_category") not in _note_options:
+        st.session_state["recon_m61_note_category"] = "All"
     st.selectbox(
         "M61 Note Category",
-        options=["All", "Financing", "Subline", "Other"],
+        options=_note_options,
         key="recon_m61_note_category",
         help=(
             "Filters the **displayed** table, metrics, drilldown, and downloads together with **Scope**. "
-            "**Financing** (M61 Liability Type: Repo / TBD / CLO) is the default. "
+            "Values come from row-level **M61 Note Category**. "
             "Choose **All** to show every category."
         ),
     )
@@ -792,6 +856,7 @@ def run_reconciliation_for_selection(
                 df_excluded_type.copy() if df_excluded_type is not None else pd.DataFrame()
             )
             st.session_state["recon_row_counts"] = dict(recon_diag or {})
+            st.session_state["recon_context"] = get_last_recon_context()
             st.session_state["primary_file_type"] = primary_file_type
             st.session_state["primary_upload_name"] = file_b_upload.name
             # Excel is built at download time from the same filtered view as the table.
@@ -936,51 +1001,65 @@ if "df_recon" in st.session_state:
             "**All Results:** full reconciliation output. **Selected Fund Only:** "
             f"subset to **{run_primary_label}** fund scope (see Scope info)."
         )
+    # TEMP DEBUG snapshot — after scope mode applied
+    # Disabled: Backend vs UI row-count expander (was ACORE / AOC II only).
+    # _td_active = run_primary in ("ACORE", "AOC II")
+    _td_active = False
+    _td_after_scope = df_view.copy() if _td_active else None
 
     # Deal filter is applied after scope (on the scoped/unscoped base view).
     if deal_pick and deal_pick != "All deals":
         df_view = df_view[df_view["Deal Name"] == deal_pick]
+    # TEMP DEBUG snapshot — after deal filter
+    _td_after_deal = df_view.copy() if _td_active else None
 
     # Read note-category selection before source-type narrowing.
     _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
 
-    # M61 Note Category (sidebar): same filter for display, metrics, drilldown, and exports.
-    if _note_pick != "All":
-        _liab_family = (
-            df_view.apply(derive_liability_type_for_filter, axis=1)
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .str.lower()
-        )
-        _src_family = (
-            df_view["Source"].map(_acore_source_type_family)
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            if "Source" in df_view.columns
-            else pd.Series([""] * len(df_view), index=df_view.index, dtype="object")
-        )
-        _is_subline = _liab_family.eq("subline") | _src_family.eq("subline")
-        if run_primary == "AOC I":
-            _fin_tokens = {"non", "sale", "repo", "tbd", "sub debt"}
-        elif run_primary == "ACP II":
-            _fin_tokens = {"clo", "non", "sale", "repo", "tbd", "sub debt"}
-        else:
-            _fin_tokens = {"clo", "non", "sale", "repo", "tbd", "sub debt"}
-        _is_financing = (
-            _liab_family.isin(_fin_tokens)
-            | _src_family.isin(_fin_tokens)
-        ) & (~_is_subline)
-        _is_other = (~_is_financing) & (~_is_subline)
-        if _note_pick == "Financing":
-            _keep = _is_financing
-        elif _note_pick == "Subline":
-            _keep = _is_subline
-        else:  # Other
-            _keep = _is_other
+    # M61 Note Category (sidebar): same series as m61_note_category_series_for_ui (single normalize pass).
+    _before_note_filter = len(df_view)
+    _raw_m61_note_cat = (
+        df_view["M61 Note Category"].fillna("Other").astype(str)
+        if "M61 Note Category" in df_view.columns
+        else pd.Series(dtype=str)
+    )
+    _note_unique_raw = sorted(
+        {unicodedata.normalize("NFKC", str(x)).strip() for x in _raw_m61_note_cat.tolist() if str(x).strip()}
+    )
+    _selected_note_norm = normalize_m61_note_category_label(_note_pick)
+    _note_series_pre = m61_note_category_series_for_ui(df_view)
+    _note_unique_norm = sorted({_ for _ in _note_series_pre.unique().tolist() if str(_).strip()})
+    if _selected_note_norm != "all":
+        _keep = _note_series_pre.eq(_selected_note_norm)
         df_view = df_view.loc[_keep].copy()
+    _after_note_filter = len(df_view)
+
+    if False:  # TEMP DEBUG — M61 Note Category filter (diagnostic); set True to re-enable
+        with st.expander("TEMP DEBUG — M61 Note Category filter (diagnostic)", expanded=False):
+            st.caption(f"selected_raw={_note_pick!r} | selected_norm={_selected_note_norm!r}")
+            st.caption(f"unique_raw_M61_Note_Category (before note filter)={_note_unique_raw!r}")
+            st.caption(f"unique_normalized (before note filter)={_note_unique_norm!r}")
+            st.caption(
+                f"rows_before_note_filter={_before_note_filter} | rows_after_note_filter={_after_note_filter}"
+            )
+            if not df_view.empty and "M61 Note Category" in df_view.columns:
+                st.caption("value_counts M61 Note Category (after note filter, before status filter)")
+                _vc_note = (
+                    df_view["M61 Note Category"]
+                    .fillna("<NA>")
+                    .astype(str)
+                    .value_counts(dropna=False)
+                    .rename_axis("M61 Note Category")
+                    .reset_index(name="rows")
+                )
+                st.dataframe(
+                    _vc_note,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(240, 40 + 28 * max(len(_vc_note), 1)),
+                )
+    # TEMP DEBUG snapshot — after note category filter
+    _td_after_note_cat = df_view.copy() if _td_active else None
 
     # Apply status filters on the current view.
     status_filter = []
@@ -994,8 +1073,11 @@ if "df_recon" in st.session_state:
         df_view = df_view[df_view["recon_status"].isin(status_filter)]
     else:
         df_view = df_view.iloc[0:0]
+    # TEMP DEBUG snapshot — after status filter
+    _td_after_status = df_view.copy() if _td_active else None
 
     # Primary-driven default view: keep M61-only rows behind an explicit toggle.
+    _td_after_m61_hide = None  # TEMP DEBUG default
     if run_primary in ("ACORE", "AOC II", "AOC I"):
         show_m61_only_exceptions = st.checkbox(
             "Show M61-only exceptions",
@@ -1014,6 +1096,8 @@ if "df_recon" in st.session_state:
             _hidden = _before - len(df_view)
             if _hidden > 0:
                 st.caption(f"Hidden M61-only exceptions: {_hidden}")
+        # TEMP DEBUG snapshot — after M61-only hide
+        _td_after_m61_hide = df_view.copy() if _td_active else None
 
     # Avoid showing non-contiguous / upstream row positions in the index column (confused with deal IDs).
     df_view = df_view.reset_index(drop=True)
@@ -1277,6 +1361,133 @@ if "df_recon" in st.session_state:
 #         st.metric("Subline", int(lt_counts.get("Subline", 0)))
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # ---- TEMP DEBUG: Backend vs UI row counts (ACP III / AOC II only) ----
+    # Remove this entire block when debugging is complete.
+    if _td_active:
+        def _td_vc(df, col):
+            """Return value_counts DataFrame for col, or empty frame if missing."""
+            if df is None or df.empty or col not in df.columns:
+                return pd.DataFrame(columns=[col, "rows"])
+            vc = (
+                df[col].fillna("<NA>").astype(str).value_counts(dropna=False)
+                .rename("rows").reset_index().rename(columns={"index": col})
+            )
+            return vc
+
+        def _td_stage_summary(label, df):
+            """Return a one-row dict with row count for a pipeline stage."""
+            return {"Stage": label, "Row Count": 0 if df is None else len(df)}
+
+        _td_stages = [
+            ("1. df_all (raw backend)", df_all),
+            ("2. df_scoped (fund/BL scope filter)", df_scoped),
+            ("3. df_view after scope mode", _td_after_scope),
+            ("4. df_view after deal filter", _td_after_deal),
+            ("5. df_view after note category filter", _td_after_note_cat),
+            ("6. df_view after status filter", _td_after_status),
+            ("7. df_view after M61-only hide", _td_after_m61_hide),
+            ("8. df_view final (displayed)", df_view),
+        ]
+
+        with st.expander(f"⚙️ TEMP DEBUG — Backend vs UI Row Counts ({run_primary})", expanded=False):
+            st.caption(
+                "TEMP DEBUG: Counts at each pipeline stage to identify where rows are gained or lost. "
+                "Remove this block when debugging is complete."
+            )
+
+            # --- Row count waterfall ---
+            st.markdown("**Row count at each pipeline stage**")
+            _td_count_df = pd.DataFrame([_td_stage_summary(lbl, df) for lbl, df in _td_stages])
+            st.dataframe(_td_count_df, use_container_width=True, hide_index=True)
+
+            # --- Breakdowns at key stages (df_all, df_scoped, df_view final) ---
+            _td_key_stages = [
+                ("df_all (backend)", df_all),
+                ("df_scoped (BL filter)", df_scoped),
+                ("df_view after scope mode", _td_after_scope),
+                ("df_view final (displayed)", df_view),
+            ]
+
+            st.markdown("**By Fund Name**")
+            _td_fund_cols = []
+            for lbl, sdf in _td_key_stages:
+                _vc = _td_vc(sdf, "Fund Name" if "Fund Name" in (sdf.columns if sdf is not None else []) else "Fund")
+                _col_name = "Fund Name" if (sdf is not None and "Fund Name" in sdf.columns) else "Fund"
+                _vc = _td_vc(sdf, _col_name).rename(columns={"rows": lbl})
+                if _col_name in _vc.columns:
+                    _vc = _vc.set_index(_col_name)
+                _td_fund_cols.append(_vc)
+            if _td_fund_cols:
+                try:
+                    _td_fund_joined = pd.concat(_td_fund_cols, axis=1).fillna(0).astype(int)
+                    st.dataframe(_td_fund_joined, use_container_width=True)
+                except Exception:
+                    for lbl, sdf in _td_key_stages:
+                        _col_name = "Fund Name" if (sdf is not None and "Fund Name" in sdf.columns) else "Fund"
+                        st.caption(lbl)
+                        st.dataframe(_td_vc(sdf, _col_name), use_container_width=True, hide_index=True, height=120)
+
+            st.markdown("**By Source Indicator**")
+            _td_src_cols = []
+            for lbl, sdf in _td_key_stages:
+                _vc = _td_vc(sdf, "Source Indicator").rename(columns={"rows": lbl})
+                if "Source Indicator" in _vc.columns:
+                    _vc = _vc.set_index("Source Indicator")
+                _td_src_cols.append(_vc)
+            if _td_src_cols:
+                try:
+                    _td_src_joined = pd.concat(_td_src_cols, axis=1).fillna(0).astype(int)
+                    st.dataframe(_td_src_joined, use_container_width=True)
+                except Exception:
+                    for lbl, sdf in _td_key_stages:
+                        st.caption(lbl)
+                        st.dataframe(_td_vc(sdf, "Source Indicator"), use_container_width=True, hide_index=True, height=120)
+
+            st.markdown("**By M61 Note Category**")
+            _td_note_cols = []
+            for lbl, sdf in _td_key_stages:
+                _vc = _td_vc(sdf, "M61 Note Category").rename(columns={"rows": lbl})
+                if "M61 Note Category" in _vc.columns:
+                    _vc = _vc.set_index("M61 Note Category")
+                _td_note_cols.append(_vc)
+            if _td_note_cols:
+                try:
+                    _td_note_joined = pd.concat(_td_note_cols, axis=1).fillna(0).astype(int)
+                    st.dataframe(_td_note_joined, use_container_width=True)
+                except Exception:
+                    for lbl, sdf in _td_key_stages:
+                        st.caption(lbl)
+                        st.dataframe(_td_vc(sdf, "M61 Note Category"), use_container_width=True, hide_index=True, height=120)
+
+            st.markdown("**By Liability Type (M61 Raw)**")
+            _td_lt_cols = []
+            for lbl, sdf in _td_key_stages:
+                _vc = _td_vc(sdf, "Liability Type (M61 Raw)").rename(columns={"rows": lbl})
+                if "Liability Type (M61 Raw)" in _vc.columns:
+                    _vc = _vc.set_index("Liability Type (M61 Raw)")
+                _td_lt_cols.append(_vc)
+            if _td_lt_cols:
+                try:
+                    _td_lt_joined = pd.concat(_td_lt_cols, axis=1).fillna(0).astype(int)
+                    st.dataframe(_td_lt_joined, use_container_width=True)
+                except Exception:
+                    for lbl, sdf in _td_key_stages:
+                        st.caption(lbl)
+                        st.dataframe(_td_vc(sdf, "Liability Type (M61 Raw)"), use_container_width=True, hide_index=True, height=120)
+
+            # --- Download row count ---
+            st.markdown(f"**Download (df_export_ui) row count:** {len(df_view)} "
+                        f"*(will equal df_view final — export is set just below)*")
+
+            st.caption(
+                "Active UI filters — "
+                f"Scope mode: **{scope_mode}** | "
+                f"Deal: **{deal_pick}** | "
+                f"Note Category: **{_note_pick}** | "
+                f"Status: **{status_filter}**"
+            )
+    # ---- END TEMP DEBUG ----
 
     # Default export matches df_view; tab1 updates this to the table row set + sort order when applicable.
     df_export_ui = df_view.copy()
@@ -1740,7 +1951,34 @@ if "df_recon" in st.session_state:
             }
             if _status_col_cfg:
                 _df_kwargs["column_config"] = _status_col_cfg
-            st.dataframe(styled, **_df_kwargs)
+            st.caption(
+                "ℹ️ M61 files may contain repeated historical rows for the same liability. "
+                "The reconciliation view shows the most recent matched record; "
+                "earlier history rows that don't represent a meaningful date or field change are collapsed."
+            )
+            _table_sel = st.dataframe(
+                styled,
+                on_select="rerun",
+                selection_mode="single-row",
+                **_df_kwargs,
+            )
+            _sel_rows = []
+            if isinstance(_table_sel, dict):
+                _sel_rows = (
+                    (_table_sel.get("selection") or {}).get("rows")
+                    or []
+                )
+            else:
+                _sel_rows = (
+                    getattr(getattr(_table_sel, "selection", None), "rows", None)
+                    or []
+                )
+            if _sel_rows:
+                _sel_pos = int(_sel_rows[0])
+                if 0 <= _sel_pos < len(df_table_view):
+                    _sel_deal = str(df_table_view.iloc[_sel_pos].get("Deal Name", "")).strip()
+                    if _sel_deal:
+                        st.session_state["drilldown_deal_pick"] = _sel_deal
 
             if len(df_table_view) == 0:
                 df_export_ui = df_view.iloc[0:0].copy()
@@ -1755,7 +1993,25 @@ if "df_recon" in st.session_state:
             st.info("No deals available for the current filters.")
             selected_deal = None
         else:
-            selected_deal = st.selectbox("Select a deal", sorted(deal_names))
+            _deal_sorted = sorted(deal_names)
+            _prefill_deal = (
+                st.session_state.get("drilldown_deal_pick")
+                or (deal_pick if (deal_pick and deal_pick != "All deals") else None)
+            )
+            if _prefill_deal and _prefill_deal in _deal_sorted:
+                st.session_state["deal_drilldown_select"] = _prefill_deal
+            _deal_idx = (
+                _deal_sorted.index(_prefill_deal)
+                if (_prefill_deal and _prefill_deal in _deal_sorted)
+                else 0
+            )
+            selected_deal = st.selectbox(
+                "Select a deal",
+                _deal_sorted,
+                index=_deal_idx,
+                key="deal_drilldown_select",
+                help="Prefilled from sidebar Deal filter when available.",
+            )
  
         if selected_deal:
             deal_rows = df_view[df_view["Deal Name"] == selected_deal]
@@ -1883,6 +2139,197 @@ if "df_recon" in st.session_state:
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+                with st.expander(
+                    f"Show Details — {row.get('Deal Name', 'Deal')} | {fmt_date(ed_acp)}",
+                    expanded=False,
+                ):
+                    ctx = st.session_state.get("recon_context", {}) or {}
+                    df_b_ctx = ctx.get("df_primary_matchable", pd.DataFrame())
+                    df_a_ctx = ctx.get("df_m61_matchable", pd.DataFrame())
+
+                    did = str(row.get("Deal ID Match Key (ACP)") or "").strip()
+                    mid = str(row.get("M61 Extracted Deal ID") or "").strip()
+                    dkey = did or mid
+                    eff_acp_key = _date_key_ui(row.get("Effective Date (ACP)"))
+                    eff_m61_key = _date_key_ui(row.get("Effective Date (M61)"))
+                    eff_key = eff_acp_key or eff_m61_key
+                    note = str(row.get("Liability Note (M61)") or "").strip()
+
+                    st.caption(
+                        "Underlying source rows (same reconciliation keys): "
+                        f"deal_id_key={dkey or '—'}, effective_date_key={eff_key or '—'}, "
+                        f"liability_note={note or '—'}"
+                    )
+                    st.caption(
+                        "Rows with the same Linked Match label are connected by the reconciliation keys. "
+                        "This helps show which ACORE row relates to which M61 row."
+                    )
+                    st.caption("Keys used: Deal ID, Effective Date, Liability Note when available.")
+
+                    b_hit = pd.DataFrame()
+                    a_hit = pd.DataFrame()
+                    if isinstance(df_b_ctx, pd.DataFrame) and not df_b_ctx.empty:
+                        b = df_b_ctx.copy()
+                        mask_b = pd.Series(False, index=b.index)
+                        if dkey and "acp_match_key" in b.columns and eff_key and "effective_date_key" in b.columns:
+                            mask_b = b["acp_match_key"].fillna("").astype(str).eq(dkey) & b[
+                                "effective_date_key"
+                            ].fillna("").astype(str).eq(eff_key)
+                        elif dkey and "acp_match_key" in b.columns:
+                            mask_b = b["acp_match_key"].fillna("").astype(str).eq(dkey)
+                        b_hit = b.loc[mask_b].copy()
+                        if b_hit.empty and dkey and "acp_match_key" in b.columns:
+                            b_hit = b.loc[b["acp_match_key"].fillna("").astype(str).eq(dkey)].copy()
+
+                    if isinstance(df_a_ctx, pd.DataFrame) and not df_a_ctx.empty:
+                        a = df_a_ctx.copy()
+                        mask_a = pd.Series(False, index=a.index)
+                        if dkey and "m61_match_key" in a.columns and eff_key and "effective_date_key" in a.columns:
+                            mask_a = a["m61_match_key"].fillna("").astype(str).eq(dkey) & a[
+                                "effective_date_key"
+                            ].fillna("").astype(str).eq(eff_key)
+                        elif dkey and "m61_match_key" in a.columns:
+                            mask_a = a["m61_match_key"].fillna("").astype(str).eq(dkey)
+                        if note and "Liability Note" in a.columns:
+                            mask_note = a["Liability Note"].fillna("").astype(str).str.strip().eq(note)
+                            mask_a = mask_a | mask_note
+                        a_hit = a.loc[mask_a].copy()
+                        if a_hit.empty and dkey and "m61_match_key" in a.columns:
+                            a_hit = a.loc[a["m61_match_key"].fillna("").astype(str).eq(dkey)].copy()
+
+                    def _row_group_key(rr: pd.Series, side: str) -> str:
+                        dk = ""
+                        if side == "acore" and "acp_match_key" in rr.index:
+                            dk = str(rr.get("acp_match_key") or "").strip()
+                        if side == "m61" and "m61_match_key" in rr.index:
+                            dk = str(rr.get("m61_match_key") or "").strip()
+                        ek = str(rr.get("effective_date_key") or "").strip()
+                        if not ek:
+                            ek = _date_key_ui(rr.get("Effective Date"))
+                        nk = str(rr.get("Liability Note") or "").strip()
+                        if dk or ek:
+                            return f"{dk}|{ek}"
+                        if nk:
+                            return f"note|{nk}"
+                        return "unkeyed"
+
+                    _all_group_keys = []
+                    if not b_hit.empty:
+                        _all_group_keys.extend(
+                            b_hit.apply(lambda rr: _row_group_key(rr, "acore"), axis=1).tolist()
+                        )
+                    if not a_hit.empty:
+                        _all_group_keys.extend(
+                            a_hit.apply(lambda rr: _row_group_key(rr, "m61"), axis=1).tolist()
+                        )
+                    _group_rank = {}
+                    for _g in _all_group_keys:
+                        if _g not in _group_rank:
+                            _group_rank[_g] = len(_group_rank) + 1
+
+                    st.markdown("**Underlying ACORE rows**")
+                    if b_hit.empty:
+                        st.caption("No ACORE source rows found for this key.")
+                    else:
+                        b_cols = [
+                            c
+                            for c in [
+                                "Deal ID",
+                                "Deal Name",
+                                "Facility",
+                                "Source",
+                                "Effective Date",
+                                "Pledge Date",
+                                "Maturity Date",
+                                "Advance Rate",
+                                "Spread",
+                                "Current Undrawn Capacity",
+                                "acp_match_key",
+                                "effective_date_key",
+                            ]
+                            if c in b_hit.columns
+                        ]
+                        b_disp = b_hit.loc[:, b_cols].copy()
+                        _bg = b_hit.apply(lambda rr: _row_group_key(rr, "acore"), axis=1)
+                        b_disp.insert(
+                            0,
+                            "Linked Match",
+                            _bg.map(lambda g: f"Match {_group_rank.get(g, 1)}"),
+                        )
+                        for dc in ("Effective Date", "Pledge Date", "Maturity Date"):
+                            if dc in b_disp.columns:
+                                b_disp[dc] = b_disp[dc].map(fmt_date)
+                        for dc in [c for c in b_disp.columns if c.endswith("_date_key")]:
+                            b_disp[dc] = b_disp[dc].map(fmt_date)
+                        for pc in ("Advance Rate", "Spread", "Floor", "Recourse", "Recourse %"):
+                            if pc in b_disp.columns:
+                                b_disp[pc] = b_disp[pc].map(pct)
+                        st.dataframe(
+                            b_disp.style.set_properties(
+                                subset=["Linked Match"],
+                                **{"background-color": "#eef4ff", "color": "#294a7a", "font-weight": "600"},
+                            ),
+                            use_container_width=True,
+                            height=180,
+                        )
+
+                        st.markdown("**Underlying M61 rows**")
+                        if a_hit.empty:
+                            st.caption("No M61 source rows found for this key.")
+                        else:
+                            a_cols = [
+                                c
+                                for c in [
+                                    "Fund Name",
+                                    "Deal Name",
+                                    "Liability Name",
+                                    "Liability Type",
+                                    "Financial Institution",
+                                    "Status",
+                                    "Pledge Date",
+                                    "Effective Date",
+                                    "Maturity Date",
+                                    "Liability Note",
+                                    "Target Advance Rate",
+                                    "Spread",
+                                    "m61_match_key",
+                                    "effective_date_key",
+                                ]
+                                if c in a_hit.columns
+                            ]
+                            a_disp = a_hit.loc[:, a_cols].copy()
+                            _ag = a_hit.apply(lambda rr: _row_group_key(rr, "m61"), axis=1)
+                            a_disp.insert(
+                                0,
+                                "Linked Match",
+                                _ag.map(lambda g: f"Match {_group_rank.get(g, 1)}"),
+                            )
+                            for dc in ("Effective Date", "Pledge Date", "Maturity Date"):
+                                if dc in a_disp.columns:
+                                    a_disp[dc] = a_disp[dc].map(fmt_date)
+                            for dc in [c for c in a_disp.columns if c.endswith("_date_key")]:
+                                a_disp[dc] = a_disp[dc].map(fmt_date)
+                            for pc in (
+                                "Target Advance Rate",
+                                "Current Advance Rate",
+                                "Deal Level Advance Rate",
+                                "Spread",
+                                "IndexFloor",
+                                "Floor",
+                                "Recourse",
+                                "Recourse %",
+                            ):
+                                if pc in a_disp.columns:
+                                    a_disp[pc] = a_disp[pc].map(pct)
+                            st.dataframe(
+                                a_disp.style.set_properties(
+                                    subset=["Linked Match"],
+                                    **{"background-color": "#eef4ff", "color": "#294a7a", "font-weight": "600"},
+                                ),
+                                use_container_width=True,
+                                height=200,
+                            )
 
     st.markdown("<br>", unsafe_allow_html=True)
 

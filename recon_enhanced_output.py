@@ -73,7 +73,7 @@ PRIMARY_TYPE_FUND_CONFIG = {
         "scope_label": "AOC I",
         "fund_token": "opportunistic credit i",
         "fund_regex": r"\bopportunistic\s+credit\s+i\b",
-        "recon_fund_display": "Opportunistic Credit I",
+        "recon_fund_display": "ACORE Opportunistic Credit I",
     },
 }
 
@@ -90,6 +90,7 @@ def _fund_shorthand_to_canonical_map() -> dict[str, str]:
                 out[str(key).strip()] = str(canon).strip()
     # Legacy / raw fund-name aliases from M61 exports -> canonical display labels.
     out["Opportunistic Credit II"] = PRIMARY_TYPE_FUND_CONFIG["AOC II"]["recon_fund_display"]
+    out["Opportunistic Credit I"] = PRIMARY_TYPE_FUND_CONFIG["AOC I"]["recon_fund_display"]
     return out
 
 
@@ -135,11 +136,20 @@ def _fund_cfg(primary_file_type: str) -> dict:
 FIN_INPT_PRIMARY_TYPES = frozenset({"ACORE", "ACP II", "ACP I", "AOC II", "AOC I"})
 
 LAST_RECON_DIAGNOSTICS: dict[str, int | str] = {}
+LAST_RECON_CONTEXT: dict[str, pd.DataFrame | str] = {}
 
 
 def get_last_recon_diagnostics() -> dict[str, int | str]:
     """Most recent reconcile() row-count diagnostics (display-only helper)."""
     return dict(LAST_RECON_DIAGNOSTICS)
+
+
+def get_last_recon_context() -> dict[str, pd.DataFrame | str]:
+    """Most recent reconcile() source context for UI drill-down (already-loaded data only)."""
+    out: dict[str, pd.DataFrame | str] = {}
+    for k, v in LAST_RECON_CONTEXT.items():
+        out[k] = v.copy() if isinstance(v, pd.DataFrame) else v
+    return out
 
 
 def _debug_rows(msg: str) -> None:
@@ -2270,7 +2280,7 @@ def reconcile(
     uploaded_primary_filename: str | None = None,
     return_diagnostics: bool = False,
 ):
-    global LAST_RECON_DIAGNOSTICS
+    global LAST_RECON_DIAGNOSTICS, LAST_RECON_CONTEXT
     label_a = "in_liability"
     p_cfg = get_primary_config(primary_file_type)
     miss_pri = p_cfg["missing_in_primary_label"]
@@ -2298,6 +2308,21 @@ def reconcile(
             left_on="Liability Note",
             right_on="LiabilityNoteID",
         )
+        # Keep distinct M61 liability lines (Fund vs Repo vs Subline, FI variants) from
+        # collapsing onto the same CRE note id in key-based stages.
+        _cre = raw_m61.get("CRENoteID", pd.Series([""] * len(raw_m61), index=raw_m61.index))
+        _lt = raw_m61.get("Liability Type", pd.Series([""] * len(raw_m61), index=raw_m61.index))
+        _fi = raw_m61.get("Financial Institution", pd.Series([""] * len(raw_m61), index=raw_m61.index))
+        _ln = raw_m61.get("Liability Note", pd.Series([""] * len(raw_m61), index=raw_m61.index))
+        raw_m61["_m61_match_facility"] = (
+            _cre.fillna("").astype(str).str.strip()
+            + " | "
+            + _lt.fillna("").astype(str).str.strip()
+            + " | "
+            + _fi.fillna("").astype(str).str.strip()
+            + " | "
+            + _ln.fillna("").astype(str).str.strip()
+        )
         _debug_trace_uncommons_m61_load(
             raw_m61,
             "reconcile:raw_m61_after_CRE_mapping_merge",
@@ -2306,7 +2331,7 @@ def reconcile(
         df_a = build_match_key(
             raw_m61,
             "Deal Name",
-            "CRENoteID",
+            "_m61_match_facility",
             "Liability Note",
             "Effective Date",
         )
@@ -3480,6 +3505,13 @@ def reconcile(
             if "Liability Type (M61 Raw)" in df_out.columns
             else {}
         ),
+    }
+    LAST_RECON_CONTEXT = {
+        "primary_file_type": primary_file_type,
+        "df_primary_raw": df_pri_raw.copy(),
+        "df_m61_raw": raw_m61.copy(),
+        "df_primary_matchable": df_b.copy(),
+        "df_m61_matchable": df_a.copy(),
     }
     _debug_rows(f"Diagnostics snapshot: {LAST_RECON_DIAGNOSTICS}")
     if return_diagnostics:
