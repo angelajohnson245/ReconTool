@@ -1073,11 +1073,13 @@ if "df_recon" in st.session_state:
         df_view = df_view[df_view["recon_status"].isin(status_filter)]
     else:
         df_view = df_view.iloc[0:0]
+    _after_status_filter = len(df_view)
     # TEMP DEBUG snapshot — after status filter
     _td_after_status = df_view.copy() if _td_active else None
 
     # Primary-driven default view: keep M61-only rows behind an explicit toggle.
     _td_after_m61_hide = None  # TEMP DEBUG default
+    show_m61_only_exceptions = False
     if run_primary in ("ACORE", "AOC II", "AOC I"):
         show_m61_only_exceptions = st.checkbox(
             "Show M61-only exceptions",
@@ -1098,6 +1100,16 @@ if "df_recon" in st.session_state:
                 st.caption(f"Hidden M61-only exceptions: {_hidden}")
         # TEMP DEBUG snapshot — after M61-only hide
         _td_after_m61_hide = df_view.copy() if _td_active else None
+
+    _displayed_rows_final = len(df_view)
+    _note_cat_m61_only_hidden_hint = (
+        run_primary in ("ACORE", "AOC II", "AOC I")
+        and _after_note_filter > 0
+        and _after_status_filter > 0
+        and _displayed_rows_final == 0
+        and not show_m61_only_exceptions
+        and _note_pick != "All"
+    )
 
     # Avoid showing non-contiguous / upstream row positions in the index column (confused with deal IDs).
     df_view = df_view.reset_index(drop=True)
@@ -1497,8 +1509,13 @@ if "df_recon" in st.session_state:
  
     with tab1:
         st.markdown('<div class="section-label">Record-by-Record Reconciliation</div>', unsafe_allow_html=True)
- 
-        if df_view.empty:
+
+        if _note_cat_m61_only_hidden_hint:
+            st.info(
+                f"{_after_note_filter} rows match your selected M61 Note Category, but are hidden because "
+                "'Show M61-only exceptions' is turned off."
+            )
+        elif df_view.empty:
             st.info("No records match the current filters.")
         else:
             # Build display table (aligned with RECON_ORDERED_COLS / Excel export)
