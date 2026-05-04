@@ -135,6 +135,79 @@ def _fund_cfg(primary_file_type: str) -> dict:
 # Primary workbooks that share Fin Inpt + liability-note-driven financing match rules.
 FIN_INPT_PRIMARY_TYPES = frozenset({"ACORE", "ACP II", "ACP I", "AOC II", "AOC I"})
 
+# Optional columns when reconcile(..., match_diagnostics=True). Does not affect matching.
+MATCH_DIAGNOSTIC_COLUMNS = (
+    "Match Method",
+    "Match Confidence",
+    "ACORE Deal ID (match)",
+    "M61 Deal ID (match)",
+    "ACORE Effective Date Key",
+    "M61 Effective Date Key",
+    "Facility Key (ACORE)",
+    "Facility Key (M61)",
+    "Match Diagnostics Warning",
+)
+
+
+def _stage_to_match_method_conf(stage: object) -> tuple[str, str]:
+    """Business labels for staged matchers (pair_rows / _match_stage); confidence per product guidance."""
+    try:
+        if stage is None or (isinstance(stage, float) and pd.isna(stage)):
+            s = ""
+        else:
+            s = str(stage).strip().lower()
+    except (TypeError, ValueError):
+        s = ""
+    if s in ("", "none") or s == "nan":
+        return "—", "—"
+    table = {
+        "financing_note": ("Financing Note Match", "High confidence"),
+        "strict": ("Strict Match", "High confidence"),
+        "deal_id": ("Deal ID Match", "Medium confidence"),
+        "source_aware_facility": ("Source/Facility Match", "Medium confidence"),
+        "source_aware": ("Source/Facility Match", "Medium confidence"),
+        "fallback": ("Fallback Match", "Low confidence"),
+        "note_deal_id_relaxed": ("Deal ID Match (relaxed)", "Low confidence"),
+    }
+    return table.get(s, (str(stage).strip() or "—", "—"))
+
+
+def _match_diagnostic_fields(row: pd.Series, label_a: str, *, in_a: bool, in_b: bool) -> dict[str, object]:
+    """Populate MATCH_DIAGNOSTIC_COLUMNS from merged reconcile row (additive only)."""
+    stage = row.get("_match_stage")
+    method, conf = _stage_to_match_method_conf(stage)
+
+    acp_did = row.get("acp_match_key") if in_b else pd.NA
+    m61_did = row.get(f"{label_a}_m61_match_key") if in_a else pd.NA
+    acp_eff = row.get("effective_date_key") if in_b else pd.NA
+    m61_eff = row.get(f"{label_a}_effective_date_key") if in_a else pd.NA
+    fac_acp = row.get("fin_acp_key") if in_b else pd.NA
+    fac_m61 = row.get(f"{label_a}_fin_m61_key") if in_a else pd.NA
+
+    warns: list[str] = []
+    if in_a and in_b:
+        sa = "" if pd.isna(acp_did) else str(acp_did).strip()
+        sm = "" if pd.isna(m61_did) else str(m61_did).strip()
+        if sa and sm and sa != sm:
+            warns.append("ACORE and M61 Deal ID keys differ for this matched row.")
+        ea = "" if pd.isna(acp_eff) else str(acp_eff).strip()
+        em = "" if pd.isna(m61_eff) else str(m61_eff).strip()
+        if ea and em and ea != em:
+            warns.append("ACORE and M61 Effective Date keys differ for this matched row.")
+
+    return {
+        "Match Method": method,
+        "Match Confidence": conf,
+        "ACORE Deal ID (match)": acp_did,
+        "M61 Deal ID (match)": m61_did,
+        "ACORE Effective Date Key": acp_eff,
+        "M61 Effective Date Key": m61_eff,
+        "Facility Key (ACORE)": fac_acp,
+        "Facility Key (M61)": fac_m61,
+        "Match Diagnostics Warning": " | ".join(warns) if warns else "",
+    }
+
+
 LAST_RECON_DIAGNOSTICS: dict[str, int | str] = {}
 LAST_RECON_CONTEXT: dict[str, pd.DataFrame | str] = {}
 
@@ -980,6 +1053,8 @@ def _canonicalize_m61_columns(df: pd.DataFrame) -> pd.DataFrame:
         "maturity date": "Maturity Date",
         "current advance rate": "Current Advance Rate",
         "target advance rate": "Target Advance Rate",
+        "dealleveladvancerate": "DealLevelAdvanceRate",
+        "deal level advance rate": "DealLevelAdvanceRate",
         "current balance": "Current Balance",
         "undrawn capacity": "Undrawn Capacity",
         "spread": "Spread",
@@ -1362,6 +1437,9 @@ def load_file_a(
         f"rows={len(df)} "
         f"(kept liability buckets={sorted(M61_FINANCING_TYPE_BUCKETS)} OR note tokens={_fin_toks!r})"
     )
+    # Keep DealLevelAdvanceRate when the export provides it (otherwise ensure_columns would add NA).
+    if "DealLevelAdvanceRate" in df.columns and "DealLevelAdvanceRate" not in keep:
+        keep = list(dict.fromkeys(list(keep) + ["DealLevelAdvanceRate"]))
     df = df[keep].copy()
 
     for col in [
@@ -1804,8 +1882,11 @@ def _is_sale_type_fund_or_deal(*, fund_name, liability_type) -> bool:
 
 
 def _m61_deal_level_advance_rate(row: pd.Series, label_a: str):
-    """Deal-level advance rate fallback chain from M61 export fields."""
-    for col in ("Advance Rate", "Advance"):
+    """Deal-level advance rate fallback chain from M61 export fields.
+
+    Prefer ``DealLevelAdvanceRate`` (M61 export) before legacy ``Advance Rate`` / ``Advance`` names.
+    """
+    for col in ("DealLevelAdvanceRate", "Deal Level Advance Rate", "Advance Rate", "Advance"):
         v = row.get(f"{label_a}_{col}")
         if not _is_blank_for_compare(v):
             return v
@@ -1873,6 +1954,13 @@ def _coerce_rate_fraction(v) -> float | None:
         return None
     # Heuristic: values beyond +/-1 are percent-points, convert to fraction.
     return (n / 100.0) if abs(n) > 1.0 else n
+
+
+def _normalize_aoc_ii_m61_adv_value(v):
+    """Null/empty M61 advance cells → NA for display (—); preserve real numeric values."""
+    if _is_blank_for_compare(v):
+        return pd.NA
+    return v
 
 
 def _normalize_index_floor_value(v):
@@ -2279,6 +2367,7 @@ def reconcile(
     mapping_path: str | None = None,
     uploaded_primary_filename: str | None = None,
     return_diagnostics: bool = False,
+    match_diagnostics: bool = False,
 ):
     global LAST_RECON_DIAGNOSTICS, LAST_RECON_CONTEXT
     label_a = "in_liability"
@@ -3145,6 +3234,10 @@ def reconcile(
         record["M61 Extracted Deal ID"] = note_suffix_key if note_suffix_key else pd.NA
         record["ID Match Result"] = row.get("_merge")
         record["Match Stage"] = row.get("_match_stage")
+        if match_diagnostics:
+            record.update(
+                _match_diagnostic_fields(row, label_a, in_a=in_a, in_b=in_b)
+            )
 
         record["Target Advance Rate (M61)"] = (
             row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
@@ -3187,14 +3280,45 @@ def reconcile(
                 continue
 
             # Advance Rate comparison basis:
-            # - Fin Inpt runs (ACORE/ACP/AOC): always compare against M61 Target Advance Rate.
+            # - Fin Inpt runs (ACORE/ACP/AOC I): M61 Target Advance Rate.
+            # - AOC II: Sale-type liabilities → Deal Level advance; else Target; Equity/Fund excluded.
             # - Other flows retain sale-type fallback to deal-level advance.
             if b_field == "Advance Rate":
-                if primary_file_type in FIN_INPT_PRIMARY_TYPES:
+                if primary_file_type == "AOC II":
+                    early_cat = categorize_m61_note_category(
+                        row.get(f"{label_a}_Liability Note"),
+                        row.get(f"{label_a}_Liability Type"),
+                        row.get("Source") if in_b else None,
+                        primary_file_type="AOC II",
+                    )
+                    if early_cat == "Equity/Fund":
+                        compare_val = pd.NA
+                        record["Advance Rate (M61)"] = pd.NA
+                        record["Advance Rate Source (M61)"] = "Equity/Fund (excluded)"
+                        val_a = pd.NA
+                    else:
+                        fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
+                        liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
+                        use_deal_level_adv = _is_sale_type_fund_or_deal(
+                            fund_name=fund_name,
+                            liability_type=liab_type,
+                        )
+                        if use_deal_level_adv:
+                            compare_val = _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
+                            record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
+                            record["Advance Rate Source (M61)"] = "Deal Level Advance Rate"
+                        else:
+                            compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
+                            record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
+                            record["Advance Rate Source (M61)"] = "Target Advance Rate"
+                        val_a = record["Advance Rate (M61)"]
+                    record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
+                elif primary_file_type in FIN_INPT_PRIMARY_TYPES:
                     compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
                     record["Advance Rate (M61)"] = compare_val
                     record["Advance Rate Source (M61)"] = "Target Advance Rate"
                     val_a = compare_val
+                    record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
                 else:
                     fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
                     liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
@@ -3212,7 +3336,7 @@ def reconcile(
                         record["Advance Rate (M61)"] = compare_val
                         record["Advance Rate Source (M61)"] = "Target Advance Rate"
                         val_a = compare_val
-                record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
+                    record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
             else:
                 record[liability_label] = val_a
 
@@ -3362,10 +3486,15 @@ def reconcile(
         record["recon_status"] = recon_status
         rows.append(record)
 
-    df_out = pd.DataFrame(rows).reindex(columns=RECON_ORDERED_COLS).reset_index(drop=True)
-    # Hard guard for Fin Inpt runs: M61 advance display must come only from M61 Target Advance Rate.
+    _out_cols = list(RECON_ORDERED_COLS)
+    if match_diagnostics:
+        _out_cols = _out_cols + list(MATCH_DIAGNOSTIC_COLUMNS)
+    df_out = pd.DataFrame(rows).reindex(columns=_out_cols).reset_index(drop=True)
+    # Hard guard for Fin Inpt runs (except AOC II): M61 advance display uses Target Advance Rate only.
+    # AOC II picks Target vs Deal Level per row upstream.
     if (
         primary_file_type in FIN_INPT_PRIMARY_TYPES
+        and primary_file_type != "AOC II"
         and "Advance Rate (M61)" in df_out.columns
         and "Target Advance Rate (M61)" in df_out.columns
     ):
@@ -3373,6 +3502,7 @@ def reconcile(
         if "Advance Rate Source (M61)" in df_out.columns:
             has_target = df_out["Target Advance Rate (M61)"].notna()
             df_out.loc[has_target, "Advance Rate Source (M61)"] = "Target Advance Rate"
+
     _debug_cols = [
         "Deal Name",
         "Fund",

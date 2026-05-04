@@ -2,12 +2,13 @@
 Financing Line Reconciliation Tool — Streamlit UI
 Run with: streamlit run recon_streamlit_app.py
 """
+import calendar
 import io
 import os
 import re
 import tempfile
 import unicodedata
-from datetime import datetime
+from datetime import date, datetime
  
 import pandas as pd
 import streamlit as st
@@ -415,6 +416,103 @@ def _date_key_ui(v) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+# Columns consulted for display-only effective date range filtering (any match → row matches).
+EFF_DATE_DISPLAY_COLUMNS = (
+    "Effective Date (ACORE)",
+    "Effective Date (ACP)",
+    "Effective Date (M61)",
+    "Effective Date",
+    "effective_date_key",
+)
+
+
+def _coerce_to_date(v) -> date | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        if isinstance(v, pd.Timestamp):
+            return v.date()
+    except Exception:
+        pass
+    ts = pd.to_datetime(v, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.date()
+
+
+def resolve_effective_date_range_bounds(
+    preset: str,
+    custom_start: date | datetime | None,
+    custom_end: date | datetime | None,
+) -> tuple[date | None, date | None]:
+    """Return inclusive (start, end) calendar bounds, or (None, None) when filtering is off."""
+    p = (preset or "All dates").strip()
+    if p == "All dates":
+        return None, None
+    today = date.today()
+    if p == "This month":
+        start = today.replace(day=1)
+        last_d = calendar.monthrange(today.year, today.month)[1]
+        end = today.replace(day=last_d)
+        return start, end
+    if p == "This year":
+        return date(today.year, 1, 1), date(today.year, 12, 31)
+    if p == "2024":
+        return date(2024, 1, 1), date(2024, 12, 31)
+    if p == "2025":
+        return date(2025, 1, 1), date(2025, 12, 31)
+    if p == "Custom range":
+        a = _coerce_to_date(custom_start)
+        b = _coerce_to_date(custom_end)
+        if a is None or b is None:
+            return None, None
+        if a > b:
+            a, b = b, a
+        return a, b
+    return None, None
+
+
+def filter_display_dataframe_by_effective_dates(
+    df: pd.DataFrame,
+    start: date | None,
+    end: date | None,
+) -> pd.DataFrame:
+    """Subset rows for UI/export: keep if any known effective-date column falls in [start, end]."""
+    if df is None:
+        return df
+    if df.empty:
+        return df.copy()
+    if start is None or end is None:
+        return df.copy()
+    cols = [c for c in EFF_DATE_DISPLAY_COLUMNS if c in df.columns]
+    if not cols:
+        return df.copy()
+
+    low = pd.Timestamp(start)
+    high = pd.Timestamp(end)
+    any_in_range = pd.Series(False, index=df.index)
+    has_any_parsed = pd.Series(False, index=df.index)
+    for c in cols:
+        ts = pd.to_datetime(df[c], errors="coerce")
+        valid = ts.notna()
+        has_any_parsed = has_any_parsed | valid
+        day = ts.dt.normalize()
+        in_r = valid & (day >= low) & (day <= high)
+        any_in_range = any_in_range | in_r
+    # Rows with no parseable dates are kept so blanks never hide data unexpectedly.
+    keep = any_in_range | (~has_any_parsed)
+    return df.loc[keep].copy()
+
+
 # --------------------------------------------------
 # SIDEBAR
 # --------------------------------------------------
@@ -522,7 +620,16 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## ⚙️ Options")
     run_on_upload = st.checkbox("Auto-run on upload", value=True)
- 
+    st.checkbox(
+        "Include match diagnostics (debug)",
+        value=False,
+        key="recon_match_diagnostics",
+        help=(
+            "Adds columns describing how each row was matched (method, confidence, deal IDs, keys). "
+            "Re-run reconciliation after toggling."
+        ),
+    )
+
     st.markdown("---")
     st.markdown("## 🔍 Filters")
     st.caption("Recon status")
@@ -588,11 +695,47 @@ with st.sidebar:
         options=_note_options,
         key="recon_m61_note_category",
         help=(
-            "Filters the **displayed** table, metrics, drilldown, and downloads together with **Scope**. "
+            "Filters the **displayed** table, metrics, drilldown, and downloads together with **Scope** "
+            "and **Advanced → Effective date**. "
             "Values come from row-level **M61 Note Category**. "
             "Choose **All** to show every category."
         ),
     )
+
+    with st.expander("Advanced filters", expanded=False):
+        st.caption("Display only — does not change reconciliation. Applies with Scope and other sidebar filters.")
+        st.selectbox(
+            "Effective date range",
+            options=[
+                "All dates",
+                "This month",
+                "This year",
+                "2024",
+                "2025",
+                "Custom range",
+            ],
+            index=0,
+            key="recon_eff_date_preset",
+            help=(
+                "Uses columns present on the output: Effective Date (ACORE), Effective Date (ACP), "
+                "Effective Date (M61), Effective Date, effective_date_key. "
+                "A row matches if any non-blank date falls in the range; rows with no parseable dates stay visible."
+            ),
+        )
+        if st.session_state.get("recon_eff_date_preset") == "Custom range":
+            _ed_c1, _ed_c2 = st.columns(2)
+            with _ed_c1:
+                st.date_input(
+                    "Start",
+                    value=date.today().replace(day=1),
+                    key="recon_eff_date_custom_start",
+                )
+            with _ed_c2:
+                st.date_input(
+                    "End",
+                    value=date.today(),
+                    key="recon_eff_date_custom_end",
+                )
  
     st.markdown("---")
     st.markdown(
@@ -791,11 +934,19 @@ def filter_recon_scoped_to_business_lines(df: pd.DataFrame, run_primary: str) ->
     return filter_recon_to_selected_fund(base, run_primary)
 
 
-def _current_upload_signature(file_a_upload, file_b_upload, mapping_upload):
-    """Track uploads only (not dropdown) so changing type does not auto-rerun."""
+def _current_upload_signature(
+    file_a_upload, file_b_upload, mapping_upload, primary_file_type: str
+):
+    """Uniquely identify a run: selected primary template + file bytes (names/sizes) + optional mapping.
+
+    Including ``primary_file_type`` ensures that after e.g. an AOC II run, switching the sidebar
+    to AOC I with the same uploads still invalidates the last successful signature so
+    **Auto-run on upload** can refresh results (Fund column and scope follow the new template).
+    """
     if not file_a_upload or not file_b_upload:
         return None
     return (
+        str(primary_file_type).strip(),
         file_a_upload.name,
         getattr(file_a_upload, "size", None),
         file_b_upload.name,
@@ -849,6 +1000,9 @@ def run_reconciliation_for_selection(
                 mapping_path=path_map,
                 uploaded_primary_filename=file_b_upload.name,
                 return_diagnostics=True,
+                match_diagnostics=bool(
+                    st.session_state.get("recon_match_diagnostics", False)
+                ),
             )
             df_recon = normalize_recon_fund_for_output(df_recon)
             st.session_state["df_recon"] = df_recon
@@ -869,7 +1023,7 @@ def run_reconciliation_for_selection(
             )
             # Last successful run context for stale-state checks.
             st.session_state["last_successful_upload_signature"] = _current_upload_signature(
-                file_a_upload, file_b_upload, mapping_upload
+                file_a_upload, file_b_upload, mapping_upload, primary_file_type
             )
             # Defer status reset to pre-widget stage (Streamlit-safe session_state mutation).
             st.session_state["reset_status_filters"] = True
@@ -882,7 +1036,9 @@ def run_reconciliation_for_selection(
 has_required_uploads = file_a_upload and file_b_upload and m61_file_valid
 
 manual_run_requested = st.button("▶  Run Reconciliation", type="primary")
-upload_signature = _current_upload_signature(file_a_upload, file_b_upload, mapping_upload)
+upload_signature = _current_upload_signature(
+    file_a_upload, file_b_upload, mapping_upload, primary_file_type
+)
 last_success_sig = st.session_state.get("last_successful_upload_signature")
 auto_run_requested = bool(
     has_required_uploads and run_on_upload and upload_signature and upload_signature != last_success_sig
@@ -1012,6 +1168,15 @@ if "df_recon" in st.session_state:
         df_view = df_view[df_view["Deal Name"] == deal_pick]
     # TEMP DEBUG snapshot — after deal filter
     _td_after_deal = df_view.copy() if _td_active else None
+
+    # Effective date range (display-only; sidebar Advanced filters). Applied before note category / metrics.
+    _eff_preset = str(st.session_state.get("recon_eff_date_preset") or "All dates").strip()
+    _eff_bounds = resolve_effective_date_range_bounds(
+        _eff_preset,
+        st.session_state.get("recon_eff_date_custom_start"),
+        st.session_state.get("recon_eff_date_custom_end"),
+    )
+    df_view = filter_display_dataframe_by_effective_dates(df_view, *_eff_bounds)
 
     # Read note-category selection before source-type narrowing.
     _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
