@@ -193,8 +193,4 @@ Mixed results — review manually in drilldown.
 ### Can I view multiple funds?
 Yes — use **All Uploaded File Results**
 
----
 
-## Notes
-
-For questions or unexpected behavior, contact your data or operations team.
