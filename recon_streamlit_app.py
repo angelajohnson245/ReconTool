@@ -1665,6 +1665,10 @@ if "df_recon" in st.session_state:
  
     with tab1:
         st.markdown('<div class="section-label">Record-by-Record Reconciliation</div>', unsafe_allow_html=True)
+        st.caption(
+            "Rows are matched by Deal ID and Effective Date. If the same deal has a different "
+            "effective date, it is shown separately."
+        )
 
         if _note_cat_m61_only_hidden_hint:
             st.info(
@@ -1733,7 +1737,6 @@ if "df_recon" in st.session_state:
                     "Source Status": row.get("Source Indicator", ""),
                     "Adv Rate Status": _status_display(row.get("Advance Rate Status", "")),
                     "Spread Status": _status_display(row.get("Spread Status", "")),
-                    "Eff Date Status": _status_display(row.get("Effective Date Status", "")),
                     "Pledge Date Status": _status_display(row.get("Pledge Date Status", "")),
                     "Undrawn Capacity Status": _status_display(
                         row.get("Undrawn Capacity Status", "")
@@ -2068,7 +2071,6 @@ if "df_recon" in st.session_state:
                 "Source Status",
                 "Adv Rate Status",
                 "Spread Status",
-                "Eff Date Status",
                 "Pledge Date Status",
                 "Undrawn Capacity Status",
                 "Index Floor Status",
