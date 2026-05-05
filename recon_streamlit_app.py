@@ -14,6 +14,9 @@ import pandas as pd
 import streamlit as st
  
 from recon_enhanced_output import (
+    FILE_SOURCE_ACORE_ONLY,
+    FILE_SOURCE_BOTH,
+    FILE_SOURCE_M61_ONLY,
     PRIMARY_TYPE_FUND_CONFIG,
     STREAMLIT_PRIMARY_FILE_TYPES,
     M61_NOTE_CATEGORIES,
@@ -68,6 +71,23 @@ st.markdown("""
     letter-spacing: 0.04em;
     font-size: 0.78rem;
     text-transform: uppercase;
+  }
+
+  /* Sidebar: make “Advanced filters” expander easier to notice */
+  [data-testid="stSidebar"] [data-testid="stExpander"] {
+    background: rgba(26, 58, 92, 0.55) !important;
+    border: 1px solid rgba(143, 184, 216, 0.5) !important;
+    border-radius: 8px;
+    padding: 0.2rem 0.35rem 0.45rem;
+    margin-top: 0.35rem;
+    margin-bottom: 0.35rem;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22);
+  }
+  [data-testid="stSidebar"] [data-testid="stExpander"] summary,
+  [data-testid="stSidebar"] [data-testid="stExpander"] summary * {
+    color: #e8f4fd !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.03em !important;
   }
  
   /* Main background */
@@ -289,6 +309,8 @@ def format_missing_status_display(
         return ""
 
     su = s.upper()
+    if su in ("MISSING FROM M61", "MISSING FROM ACORE", "MISSING FROM BOTH"):
+        return s
     # Backend bug-shield: effective date path could double-prefix; collapse for display.
     dup_in = "MISSING IN MISSING IN "
     dup_from = "MISSING FROM MISSING FROM "
@@ -486,7 +508,12 @@ def filter_display_dataframe_by_effective_dates(
     start: date | None,
     end: date | None,
 ) -> pd.DataFrame:
-    """Subset rows for UI/export: keep if any known effective-date column falls in [start, end]."""
+    """Subset rows for UI/export: keep if any known effective-date column falls in [start, end].
+
+    Rows with ``recon_status`` MISMATCH are always kept when that column is present, so
+    negative-test cases (wrong dates or rates on one side) stay visible even when every
+    parseable effective date falls outside the selected display window.
+    """
     if df is None:
         return df
     if df.empty:
@@ -510,7 +537,37 @@ def filter_display_dataframe_by_effective_dates(
         any_in_range = any_in_range | in_r
     # Rows with no parseable dates are kept so blanks never hide data unexpectedly.
     keep = any_in_range | (~has_any_parsed)
+    if "recon_status" in df.columns:
+        rs = df["recon_status"].astype(str).str.upper().str.strip()
+        keep = keep | rs.eq("MISMATCH")
     return df.loc[keep].copy()
+
+
+def _mismatch_detail_html(row: pd.Series) -> str:
+    """Short drilldown hint for negative testing: why recon_status is MISMATCH (from status columns)."""
+    if str(row.get("recon_status", "")).upper().strip() != "MISMATCH":
+        return ""
+    parts: list[str] = []
+    ed = str(row.get("Effective Date Status", "") or "").upper()
+    if "NO MATCH" in ed or ("MISMATCH" in ed and "MISSING" not in ed):
+        parts.append("effective date differs between ACORE and M61")
+    ar = str(row.get("Advance Rate Status", "") or "").upper()
+    if "MISMATCH" in ar:
+        parts.append("advance rate differs")
+    sp = str(row.get("Spread Status", "") or "").upper()
+    if "MISMATCH" in sp:
+        parts.append("spread differs")
+    if not parts:
+        return (
+            "<div style='font-size:0.78rem;color:#7b1fa2;margin-top:10px;'>"
+            "<strong>Why mismatch:</strong> see status pills above (key field differs)."
+            "</div>"
+        )
+    return (
+        "<div style='font-size:0.78rem;color:#7b1fa2;margin-top:10px;'>"
+        f"<strong>Why mismatch:</strong> {'; '.join(parts)}."
+        "</div>"
+    )
 
 
 # --------------------------------------------------
@@ -657,19 +714,30 @@ with st.sidebar:
             )
 
     if scope_toggle_needed:
+        _scope_label_all = "All Uploaded File Results"
+        _scope_label_fund = "Selected Primary Fund Only"
         _scope_choice = st.radio(
             "Scope",
-            ["Current Upload Results", "Selected Fund View"],
+            [_scope_label_all, _scope_label_fund],
             index=1,
             help=(
-                "**Current Upload Results:** full reconciliation output for this run. "
-                "**Selected Fund View:** only rows whose `Fund` belongs to "
-                f"{scope_label_for_primary_type(primary_file_type)} scope."
+                f"**{_scope_label_all}:** full reconciliation output for this upload run (every row "
+                "from the matched primary and M61 files). "
+                f"**{_scope_label_fund}:** only rows whose `Fund` belongs to "
+                f"the **{scope_label_for_primary_type(primary_file_type)}** scope. "
+                "All Uploaded File Results may include other funds present in the M61 export. "
+                f"Use {_scope_label_fund} to view only the chosen "
+                f"**{scope_label_for_primary_type(primary_file_type)}** fund."
             ),
+        )
+        st.caption(
+            "All Uploaded File Results may include other funds present in the M61 export. "
+            f"Use **Selected Primary Fund Only** to view only the chosen "
+            f"**{scope_label_for_primary_type(primary_file_type)}** fund."
         )
         scope_mode = (
             "Selected Fund Only"
-            if _scope_choice == "Selected Fund View"
+            if _scope_choice == _scope_label_fund
             else "All Results"
         )
     else:
@@ -687,7 +755,7 @@ with st.sidebar:
         key="recon_m61_note_category",
         help=(
             "Filters the **displayed** table, metrics, drilldown, and downloads together with **Scope** "
-            "and **Advanced → Effective date**. "
+            "and **More filters / Advanced filters → Effective date**. "
             "Values come from row-level **M61 Note Category**. "
             "Choose **All** to show every category."
         ),
@@ -699,10 +767,13 @@ with st.sidebar:
             "Effective date range",
             options=[
                 "All dates",
-                "This month",
-                "This year",
                 "2024",
                 "2025",
+                "2026",
+                "2027",
+                "2028",
+                "2029",
+                "2030",
                 "Custom range",
             ],
             index=0,
@@ -710,7 +781,9 @@ with st.sidebar:
             help=(
                 "Uses columns present on the output: Effective Date (ACORE), Effective Date (ACP), "
                 "Effective Date (M61), Effective Date, effective_date_key. "
-                "A row matches if any non-blank date falls in the range; rows with no parseable dates stay visible."
+                "A row matches if any non-blank date falls in the range; rows with no parseable dates stay visible. "
+                "Rows with reconciliation status **MISMATCH** are always shown, even if all dates are outside the range "
+                "(supports negative testing)."
             ),
         )
         if st.session_state.get("recon_eff_date_preset") == "Custom range":
@@ -720,12 +793,14 @@ with st.sidebar:
                     "Start",
                     value=date.today().replace(day=1),
                     key="recon_eff_date_custom_start",
+                    format="MM/DD/YYYY",
                 )
             with _ed_c2:
                 st.date_input(
                     "End",
                     value=date.today(),
                     key="recon_eff_date_custom_end",
+                    format="MM/DD/YYYY",
                 )
  
     st.markdown("---")
@@ -733,14 +808,16 @@ with st.sidebar:
         f"""
     <div style='font-size:0.7rem; color:#5a7890; line-height:1.6'>
     <strong style='color:#8fb8d8'>Primary Source</strong><br>{_pc["model_descriptor"]}<br><br>
-    <strong style='color:#8fb8d8'>Comparison Source</strong><br>(In) M61 Relationship Export<br><br>
-    <strong style='color:#8fb8d8'>Target Advance Rate</strong><br>From M61 file only
+    <strong style='color:#8fb8d8'>Comparison Source</strong><br>M61 Relationship Export<br><br>
+    
     </div>
     """,
         unsafe_allow_html=True,
     )
  
- 
+# <strong style='color:#8fb8d8'>Target Advance Rate</strong><br>From M61 file only
+
+
 # --------------------------------------------------
 # HEADER
 # --------------------------------------------------
@@ -911,6 +988,30 @@ def filter_recon_to_primary_file_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df.copy() if df is not None else pd.DataFrame()
     return df.copy()
+
+
+def _display_file_source_cell(row: pd.Series) -> str:
+    """Non-blank File Source for the All Results grid (handles NA and legacy ``ID Match Result`` fallback)."""
+    v = row.get("File Source")
+    try:
+        if v is not None and not pd.isna(v):
+            s = str(v).strip()
+            if s and s.lower() not in ("nan", "none", "<na>"):
+                return s
+    except (TypeError, ValueError):
+        pass
+    imr = row.get("ID Match Result")
+    try:
+        if imr is None or pd.isna(imr):
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    k = str(imr).strip().lower()
+    return {
+        "both": FILE_SOURCE_BOTH,
+        "left_only": FILE_SOURCE_ACORE_ONLY,
+        "right_only": FILE_SOURCE_M61_ONLY,
+    }.get(k, "")
 
 
 def filter_recon_scoped_to_business_lines(df: pd.DataFrame, run_primary: str) -> pd.DataFrame:
@@ -1112,10 +1213,9 @@ if "df_recon" in st.session_state:
 
     st.markdown('<div class="section-label">Deal filter</div>', unsafe_allow_html=True)
     df_all = df_recon.copy()
-    _primary_only_lbl = get_primary_config(run_primary).get("primary_only_legend_label", "ACORE Only")
-    if "Source Indicator" in df_all.columns:
-        _deal_source_mask = df_all["Source Indicator"].fillna("").astype(str).str.strip().isin(
-            ["Both", _primary_only_lbl]
+    if "File Source" in df_all.columns:
+        _deal_source_mask = df_all["File Source"].fillna("").astype(str).str.strip().isin(
+            ["Both", "ACORE Only"]
         )
         _deal_pool = df_all.loc[_deal_source_mask].copy()
     else:
@@ -1145,8 +1245,9 @@ if "df_recon" in st.session_state:
     else:
         df_view = df_all.copy()
         st.caption(
-            "**All Results:** full reconciliation output. **Selected Fund Only:** "
-            f"subset to **{run_primary_label}** fund scope (see Scope info)."
+            "**All Uploaded File Results:** full reconciliation output for this run (may include other "
+            "funds from the M61 export). **Selected Primary Fund Only:** "
+            f"subset to **{run_primary_label}** fund scope only (see **Scope** in the sidebar)."
         )
     # TEMP DEBUG snapshot — after scope mode applied
     # Disabled: Backend vs UI row-count expander (was ACORE / AOC II only).
@@ -1248,9 +1349,9 @@ if "df_recon" in st.session_state:
         )
         # When Note Category = All, show full universe (including M61-only rows) by default.
         hide_m61_only = (not show_m61_only_exceptions) and (_note_pick != "All")
-        if hide_m61_only and "Source Indicator" in df_view.columns:
+        if hide_m61_only and "File Source" in df_view.columns:
             _before = len(df_view)
-            df_view = df_view.loc[df_view["Source Indicator"].fillna("").astype(str).str.strip().ne("M61 Only")].copy()
+            df_view = df_view.loc[df_view["File Source"].fillna("").astype(str).str.strip().ne("M61 Only")].copy()
             _hidden = _before - len(df_view)
             if _hidden > 0:
                 st.caption(f"Hidden M61-only exceptions: {_hidden}")
@@ -1349,7 +1450,7 @@ if "df_recon" in st.session_state:
             "Deal Name",
             "Facility",
             "Financial Line",
-            "Source Indicator",
+            "File Source",
             "recon_status",
         )
         if c in df_recon.columns
@@ -1377,12 +1478,12 @@ if "df_recon" in st.session_state:
         st.dataframe(_sample_df(df_recon), use_container_width=True, height=180)
         st.markdown("**Sample: df_scoped (10)**")
         st.dataframe(_sample_df(df_scoped), use_container_width=True, height=180)
-        if "Source Indicator" in df_recon.columns:
+        if "File Source" in df_recon.columns:
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.caption("Source Indicator mix: df_recon")
+                st.caption("File Source mix: df_recon")
                 st.dataframe(
-                    df_recon["Source Indicator"]
+                    df_recon["File Source"]
                     .fillna("<NA>")
                     .astype(str)
                     .value_counts(dropna=False)
@@ -1392,9 +1493,9 @@ if "df_recon" in st.session_state:
                     height=160,
                 )
             with c2:
-                st.caption("Source Indicator mix: df_scoped")
+                st.caption("File Source mix: df_scoped")
                 st.dataframe(
-                    df_scoped["Source Indicator"]
+                    df_scoped["File Source"]
                     .fillna("<NA>")
                     .astype(str)
                     .value_counts(dropna=False)
@@ -1404,9 +1505,9 @@ if "df_recon" in st.session_state:
                     height=160,
                 )
             with c3:
-                st.caption("Source Indicator mix: df_view")
+                st.caption("File Source mix: df_view")
                 st.dataframe(
-                    df_view["Source Indicator"]
+                    df_view["File Source"]
                     .fillna("<NA>")
                     .astype(str)
                     .value_counts(dropna=False)
@@ -1596,12 +1697,12 @@ if "df_recon" in st.session_state:
                         st.caption(lbl)
                         st.dataframe(_td_vc(sdf, _col_name), use_container_width=True, hide_index=True, height=120)
 
-            st.markdown("**By Source Indicator**")
+            st.markdown("**By File Source**")
             _td_src_cols = []
             for lbl, sdf in _td_key_stages:
-                _vc = _td_vc(sdf, "Source Indicator").rename(columns={"rows": lbl})
-                if "Source Indicator" in _vc.columns:
-                    _vc = _vc.set_index("Source Indicator")
+                _vc = _td_vc(sdf, "File Source").rename(columns={"rows": lbl})
+                if "File Source" in _vc.columns:
+                    _vc = _vc.set_index("File Source")
                 _td_src_cols.append(_vc)
             if _td_src_cols:
                 try:
@@ -1610,7 +1711,7 @@ if "df_recon" in st.session_state:
                 except Exception:
                     for lbl, sdf in _td_key_stages:
                         st.caption(lbl)
-                        st.dataframe(_td_vc(sdf, "Source Indicator"), use_container_width=True, hide_index=True, height=120)
+                        st.dataframe(_td_vc(sdf, "File Source"), use_container_width=True, hide_index=True, height=120)
 
             st.markdown("**By M61 Note Category**")
             _td_note_cols = []
@@ -1734,16 +1835,17 @@ if "df_recon" in st.session_state:
                     "Index Name (M61)": fmt_opt_text(row.get("Index Name (M61)")),
                     f"Recourse % ({col_tag})": pct(row.get("Recourse % (ACP)")),
                     "Recourse % (M61)": pct(row.get("Recourse % (M61)")),
-                    "Source Status": row.get("Source Indicator", ""),
+                    "File Source": _display_file_source_cell(row),
+                    "Effective Date Status": _status_display(row.get("Effective Date Status", "")),
+                    "Pledge Date Status": _status_display(row.get("Pledge Date Status", "")),
                     "Adv Rate Status": _status_display(row.get("Advance Rate Status", "")),
                     "Spread Status": _status_display(row.get("Spread Status", "")),
-                    "Pledge Date Status": _status_display(row.get("Pledge Date Status", "")),
                     "Undrawn Capacity Status": _status_display(
                         row.get("Undrawn Capacity Status", "")
                     ),
-                    "Index Floor Status": row.get("Index Floor Status", ""),
-                    "Index Name Status": row.get("Index Name Status", ""),
-                    "Recourse % Status": row.get("Recourse % Status", ""),
+                    "Index Floor Status": _status_display(row.get("Index Floor Status", "")),
+                    "Index Name Status": _status_display(row.get("Index Name Status", "")),
+                    "Recourse % Status": _status_display(row.get("Recourse % Status", "")),
                     "Recon Status": _status_display(row.get("recon_status", "")),
                 }
                 display_rows.append(rec)
@@ -1925,10 +2027,10 @@ if "df_recon" in st.session_state:
                                         auto_liability_type_filter_val = str(lt.iloc[0]).strip()
 
                     # Row 1: identity — Fund, Deal Name, Facility
-                    # Row 2: source — Source Type (ACORE), Liability Type (M61), Source Status
+                    # Row 2: source — Source Type (ACORE), Liability Type (M61), File Source
                     secondary_filter_rows = [
                         ["Fund", "Deal Name", "Facility"],
-                        ["Source Type (ACORE)", "Liability Type (M61)", "Source Status"],
+                        ["Source Type (ACORE)", "Liability Type (M61)", "File Source"],
                     ]
 
                     for row_filters in secondary_filter_rows:
@@ -2068,10 +2170,11 @@ if "df_recon" in st.session_state:
 
             # Single ordered list: Spread Status is the reference column; all share identical UI.
             status_cols = [
-                "Source Status",
+                "File Source",
+                "Effective Date Status",
+                "Pledge Date Status",
                 "Adv Rate Status",
                 "Spread Status",
-                "Pledge Date Status",
                 "Undrawn Capacity Status",
                 "Index Floor Status",
                 "Index Name Status",
@@ -2085,7 +2188,7 @@ if "df_recon" in st.session_state:
             def _status_column_config(col_name: str):
                 if col_name == "Undrawn Capacity Status":
                     return st.column_config.TextColumn(
-                        "Undrawn status",
+                        "Status",
                         width="medium",
                         help="Undrawn Capacity Status",
                     )
@@ -2095,7 +2198,7 @@ if "df_recon" in st.session_state:
                 c: _status_column_config(c)
                 for c in df_table_view.columns
                 if isinstance(c, str)
-                and (c.endswith(" Status") or c == "Recon Status")
+                and (c.endswith(" Status") or c in ("Recon Status", "File Source"))
             }
 
             if df_table_view.empty:
@@ -2312,6 +2415,7 @@ if "df_recon" in st.session_state:
                     <div style='font-size:0.74rem;'>Recourse %: {pill(row.get("Recourse % Status",""))}</div>
                     <div style='font-size:0.74rem;'>Pledge Date: {pill(_deal_status_display(row.get("Pledge Date Status","")))}</div>
                   </div>
+                  {_mismatch_detail_html(row)}
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -2480,19 +2584,34 @@ if "df_recon" in st.session_state:
                                 if c in a_hit.columns
                             ]
                             a_disp = a_hit.loc[:, a_cols].copy()
-                            # Visual-only drilldown aid: compare this card's ACORE effective date to each
-                            # underlying M61 row effective date (does not affect reconciliation/matching).
+                            # Visual-only drilldown aid: ACORE vs M61 effective date, plus rate/spread mismatch hints
+                            # when dates align (does not affect reconciliation/matching).
                             _acore_eff_key = _date_key_ui(ed_acp)
+                            _ar_mismatch = "MISMATCH" in str(
+                                row.get("Advance Rate Status", "") or ""
+                            ).upper()
+                            _sp_mismatch = "MISMATCH" in str(row.get("Spread Status", "") or "").upper()
+
+                            def _match_explain_for_m61_date(m61_k: str) -> str:
+                                if _acore_eff_key and m61_k and m61_k == _acore_eff_key:
+                                    parts: list[str] = []
+                                    if _ar_mismatch:
+                                        parts.append("advance rate differs vs ACORE")
+                                    if _sp_mismatch:
+                                        parts.append("spread differs vs ACORE")
+                                    if parts:
+                                        return "Same date – " + "; ".join(parts)
+                                    return "Matches (same date)"
+                                return "Same deal – different date"
+
                             if "Effective Date" in a_hit.columns:
                                 _m61_eff_key = a_hit["Effective Date"].map(_date_key_ui)
-                                _date_match_status = _m61_eff_key.map(
-                                    lambda k: "Matches (same date)"
-                                    if (_acore_eff_key and k and k == _acore_eff_key)
-                                    else "Same deal – different date"
-                                )
+                                _match_explanation = _m61_eff_key.map(_match_explain_for_m61_date)
                             else:
-                                _date_match_status = pd.Series(
-                                    ["Same deal – different date"] * len(a_hit), index=a_hit.index, dtype="object"
+                                _match_explanation = pd.Series(
+                                    [_match_explain_for_m61_date("") for _ in range(len(a_hit))],
+                                    index=a_hit.index,
+                                    dtype="object",
                                 )
                             if "Effective Date" in a_disp.columns:
                                 _eff_idx = a_disp.columns.get_loc("Effective Date") + 1
@@ -2501,7 +2620,7 @@ if "df_recon" in st.session_state:
                             a_disp.insert(
                                 _eff_idx,
                                 "Match Explanation",
-                                _date_match_status.reindex(a_disp.index),
+                                _match_explanation.reindex(a_disp.index),
                             )
                             # Display-only mirror of reconciliation basis:
                             # follow the already-computed source on the current reconciliation row.

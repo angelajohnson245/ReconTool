@@ -267,7 +267,7 @@ def _debug_trace_uncommons_m61_load(
         lt_bucket = _liability_type_bucket(lt_raw)
         in_type_bucket = lt_bucket in M61_FINANCING_TYPE_BUCKETS
         fin_tok = bool(_fin_note_scope_mask(pd.Series([note]), primary_file_type).iloc[0])
-        expanded_ok = in_type_bucket or fin_tok
+        legacy_type_or_note = in_type_bucket or fin_tok
         scope_note = ""
         if in_scope_mask is not None and idx in in_scope_mask.index:
             scope_note = f" in_scope_mask={bool(in_scope_mask.loc[idx])}"
@@ -275,7 +275,7 @@ def _debug_trace_uncommons_m61_load(
         _debug_rows(
             f"TRACE UnCommons M61 [{stage}]: FOUND idx={idx} Deal={r.get('Deal Name')!r} "
             f"Liability Type={lt_raw!r} -> bucket={lt_bucket!r} in_financing_buckets={in_type_bucket} "
-            f"fin_note_token_match={fin_tok} expanded_filter_OR={expanded_ok}{scope_note}"
+            f"fin_note_token_match={fin_tok} legacy_type_OR_note={legacy_type_or_note}{scope_note}"
         )
         _debug_rows(f"TRACE UnCommons M61 [{stage}]: parse_liability_note -> {parsed!r}")
         _debug_rows(
@@ -664,6 +664,52 @@ FLOAT_TOLERANCE = 1e-6
 RATE_STATUS_TOLERANCE = 5e-5
 ENABLE_DEAL_ID_SUFFIX_FALLBACK = False
 
+# Field-level reconciliation statuses (single vocabulary for business-facing output).
+FIELD_STATUS_MATCH = "MATCH"
+FIELD_STATUS_MISMATCH = "MISMATCH"
+FIELD_STATUS_MISSING_M61 = "MISSING FROM M61"
+FIELD_STATUS_MISSING_ACORE = "MISSING FROM ACORE"
+FIELD_STATUS_MISSING_BOTH = "MISSING FROM BOTH"
+
+FILE_SOURCE_BOTH = "Both"
+FILE_SOURCE_M61_ONLY = "M61 Only"
+FILE_SOURCE_ACORE_ONLY = "ACORE Only"
+
+
+def _file_source_label_from_sides(*, in_a: bool, in_b: bool) -> str:
+    """Which file(s) contributed this reconciliation row (ACORE primary vs M61 liability export)."""
+    if in_a and in_b:
+        return FILE_SOURCE_BOTH
+    if in_b:
+        return FILE_SOURCE_ACORE_ONLY
+    return FILE_SOURCE_M61_ONLY
+
+
+def _ensure_file_source_populated(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure ``File Source`` is never NA/blank before returning from ``reconcile()``."""
+    if df is None or df.empty or "File Source" not in df.columns:
+        return df
+    cur = df["File Source"]
+    missing = cur.isna() | (
+        cur.astype(str).str.strip().isin(("", "nan", "NaN", "None", "<NA>", "<na>"))
+    )
+    if not missing.any():
+        return df
+    if "ID Match Result" not in df.columns:
+        return df
+    imr = df["ID Match Result"].astype(str).str.strip().str.lower()
+    mapping: tuple[tuple[str, str], ...] = (
+        ("both", FILE_SOURCE_BOTH),
+        ("left_only", FILE_SOURCE_ACORE_ONLY),
+        ("right_only", FILE_SOURCE_M61_ONLY),
+    )
+    for key, label in mapping:
+        mask = missing & imr.eq(key)
+        if mask.any():
+            df.loc[mask, "File Source"] = label
+    return df
+
+
 ACP_SHEET_COLS = [
     "Deal Name",
     "Note Name",
@@ -733,7 +779,7 @@ RECON_ORDERED_COLS = [
     "ID Match Result",
     "Match Stage",
     "Source",
-    "Source Indicator",
+    "File Source",
     "Liability Name (M61)",
     "Facility Norm (ACP)",
     "Facility Norm (M61)",
@@ -1378,7 +1424,25 @@ def load_file_a(
     liab_type_mask = df["Liability Type Bucket"].isin(M61_FINANCING_TYPE_BUCKETS)
     liab_note_up = df["Liability Note"].fillna("").astype(str).str.upper()
     fin_note_scope_mask = _fin_note_scope_mask(liab_note_up, primary_file_type)
-    in_scope_mask = liab_type_mask | fin_note_scope_mask
+    # Rows are dropped only when ALL of the following are false:
+    # (1) Liability Type bucket in financing set (repo/non/sale/clo/subline), OR
+    # (2) Liability Note contains primary-specific financing tokens (e.g. LN_FIN_AOCII), OR
+    # (3) Fallback: Fund Name matches this run's primary fund scope (same regex as reconcile
+    #     _m61_in_scope) AND Deal Name is non-blank — avoids silently dropping real fund rows
+    #     that lack both a financing bucket and a parsed note prefix.
+    fcfg = _fund_cfg(primary_file_type)
+    fpattern = fcfg.get("fund_regex") or (
+        re.escape(fcfg["fund_token"]) if fcfg.get("fund_token") else None
+    )
+    if fpattern:
+        primary_fund_row_mask = df["Fund Name"].fillna("").astype(str).str.contains(
+            fpattern, case=False, regex=True, na=False
+        )
+    else:
+        primary_fund_row_mask = pd.Series(False, index=df.index)
+    deal_name_nonempty = df["Deal Name"].fillna("").astype(str).str.strip().ne("")
+    fund_deal_context_keep = primary_fund_row_mask & deal_name_nonempty
+    in_scope_mask = liab_type_mask | fin_note_scope_mask | fund_deal_context_keep
     _debug_trace_uncommons_m61_load(
         df,
         "load_file_a:before_expanded_filter",
@@ -1386,11 +1450,15 @@ def load_file_a(
         in_scope_mask=in_scope_mask,
     )
     _fin_toks = _fin_note_tokens_for_primary(primary_file_type)
+    _fallback_only = fund_deal_context_keep & ~(liab_type_mask | fin_note_scope_mask)
     _debug_rows(
-        "M61 pre-filter diagnostics (fund labels are informational; rows are NOT dropped by fund here): "
+        "M61 pre-filter diagnostics: "
         f"rows_matching_target_fund_labels={int(fund_mask.sum())}/{len(df)} "
         f"rows_matching_liability_types={int(liab_type_mask.sum())}/{len(df)} "
         f"rows_matching_financing_note_token={int(fin_note_scope_mask.sum())}/{len(df)} tokens={_fin_toks!r} "
+        f"rows_primary_fund_regex_match={int(primary_fund_row_mask.sum())}/{len(df)} "
+        f"rows_fund_deal_fallback={int(fund_deal_context_keep.sum())}/{len(df)} "
+        f"rows_retained_only_by_fund_deal_fallback={int(_fallback_only.sum())} "
         f"rows_in_scope_after_expanded_filter={int(in_scope_mask.sum())}/{len(df)} "
         f"blank_deal_name={int(df['Deal Name'].isna().sum())} "
         f"blank_liability_note={int(df['Liability Note'].isna().sum())}"
@@ -1438,7 +1506,8 @@ def load_file_a(
     _debug_rows(
         "M61 after expanded in-scope filter: "
         f"rows={len(df)} "
-        f"(kept liability buckets={sorted(M61_FINANCING_TYPE_BUCKETS)} OR note tokens={_fin_toks!r})"
+        f"(kept liability buckets={sorted(M61_FINANCING_TYPE_BUCKETS)} OR note tokens={_fin_toks!r} "
+        f"OR primary-fund+nonblank-deal fallback pattern={fpattern!r})"
     )
     # Keep DealLevelAdvanceRate when the export provides it (otherwise ensure_columns would add NA).
     if "DealLevelAdvanceRate" in df.columns and "DealLevelAdvanceRate" not in keep:
@@ -1471,6 +1540,8 @@ def load_file_a(
         "m61_raw_rows_loaded": m61_raw_rows_loaded,
         "m61_rows_matching_target_fund_labels": int(fund_mask.sum()),
         "m61_rows_matching_financing_note_token": int(fin_note_scope_mask.sum()),
+        "m61_rows_fund_deal_context_keep": int(fund_deal_context_keep.sum()),
+        "m61_rows_retained_only_by_fund_deal_fallback": int(_fallback_only.sum()),
         "m61_rows_after_liability_type_filter": m61_rows_after_liability_type_filter,
         "m61_rows_excluded_by_liability_type_filter": int(len(excluded_by_type)),
     }
@@ -1986,64 +2057,71 @@ def _normalize_index_floor_value(v):
 
 def compare_values(val_a, val_b, comparison_type):
     if pd.isna(val_a) and pd.isna(val_b):
-        return "MATCH"
+        return FIELD_STATUS_MATCH
     if pd.isna(val_a) or pd.isna(val_b):
-        return "MISMATCH"
+        return FIELD_STATUS_MISMATCH
 
     if comparison_type == "numeric":
         try:
             n_a = _coerce_numeric_value(val_a)
             n_b = _coerce_numeric_value(val_b)
             if n_a is None or n_b is None:
-                return "MISMATCH"
-            return "MATCH" if abs(n_a - n_b) <= FLOAT_TOLERANCE else "MISMATCH"
+                return FIELD_STATUS_MISMATCH
+            return (
+                FIELD_STATUS_MATCH
+                if abs(n_a - n_b) <= FLOAT_TOLERANCE
+                else FIELD_STATUS_MISMATCH
+            )
         except Exception:
-            return "MISMATCH"
+            return FIELD_STATUS_MISMATCH
 
     if comparison_type == "date":
         s_a = safe_parse_date(pd.Series([val_a])).iloc[0]
         s_b = safe_parse_date(pd.Series([val_b])).iloc[0]
         if pd.isna(s_a) and pd.isna(s_b):
-            return "MATCH"
+            return FIELD_STATUS_MATCH
         if pd.isna(s_a) or pd.isna(s_b):
-            return "MISMATCH"
-        return "MATCH" if s_a.normalize().date() == s_b.normalize().date() else "MISMATCH"
+            return FIELD_STATUS_MISMATCH
+        return (
+            FIELD_STATUS_MATCH
+            if s_a.normalize().date() == s_b.normalize().date()
+            else FIELD_STATUS_MISMATCH
+        )
 
-    return "MATCH" if normalise_text(val_a) == normalise_text(val_b) else "MISMATCH"
+    return (
+        FIELD_STATUS_MATCH
+        if normalise_text(val_a) == normalise_text(val_b)
+        else FIELD_STATUS_MISMATCH
+    )
 
 
-def compare_liability_primary_status(val_liab, val_acp, comparison_type, *, missing_in_primary: str):
+def compare_liability_primary_status(val_liab, val_acp, comparison_type):
     """
-    Liability (export) vs primary model: explicit missing-side labels instead of generic MISSING/MISMATCH
-    when a value is absent on one side.
+    Liability (export) vs primary model: MATCH / MISMATCH / MISSING FROM M61 / MISSING FROM ACORE / MISSING FROM BOTH.
     """
     l_ok = _has_compare_value(val_liab)
     p_ok = _has_compare_value(val_acp)
     if not l_ok and not p_ok:
-        return "MISSING FROM BOTH FILES"
+        return FIELD_STATUS_MISSING_BOTH
     if not p_ok and l_ok:
-        return f"MISSING IN {missing_in_primary}"
+        return FIELD_STATUS_MISSING_ACORE
     if p_ok and not l_ok:
-        return "MISSING IN M61"
+        return FIELD_STATUS_MISSING_M61
     return compare_values(val_liab, val_acp, comparison_type)
 
 
-def compare_optional(val_liab, val_acp, kind="text", *, missing_in_primary: str = "ACORE"):
+def compare_optional(val_liab, val_acp, kind="text"):
     """
-    Optional cross-file fields (index floor/name, recourse) with explicit missing-side statuses.
-    - Both sides blank → MISSING FROM BOTH FILES
-    - Only M61 side populated → MISSING FROM <primary> FILE
-    - Only primary side populated → MISSING FROM M61 FILE
-    - Both populated → MATCH / MISMATCH (never affects recon_status)
+    Optional cross-file fields (index floor/name, recourse): same vocabulary as other field statuses.
     """
     l_ok = not _is_blank_for_compare(val_liab)
     a_ok = not _is_blank_for_compare(val_acp)
     if not l_ok and not a_ok:
-        return "MISSING FROM BOTH FILES"
+        return FIELD_STATUS_MISSING_BOTH
     if l_ok and not a_ok:
-        return f"MISSING FROM {missing_in_primary} FILE"
+        return FIELD_STATUS_MISSING_ACORE
     if a_ok and not l_ok:
-        return "MISSING FROM M61 FILE"
+        return FIELD_STATUS_MISSING_M61
     eff_kind = kind
     if kind == "numeric":
         try:
@@ -2088,40 +2166,45 @@ def _effective_date_cell_populated(v):
     return True
 
 
-def compare_effective_date_status(val_liability, val_acp, *, missing_in_primary: str = "ACORE"):
+def compare_effective_date_status(val_liability, val_acp):
     has_acp = _effective_date_cell_populated(val_acp)
     has_liab = _effective_date_cell_populated(val_liability)
-    miss_pri = f"MISSING IN {missing_in_primary}"
 
     if not has_acp and not has_liab:
-        return "MISSING FROM BOTH FILES"
+        return FIELD_STATUS_MISSING_BOTH
     if not has_acp:
-        return miss_pri
+        return FIELD_STATUS_MISSING_ACORE
     if not has_liab:
-        return "MISSING IN M61"
+        return FIELD_STATUS_MISSING_M61
 
     dt_liab = safe_parse_date(pd.Series([val_liability])).iloc[0]
     dt_acp = safe_parse_date(pd.Series([val_acp])).iloc[0]
     if pd.isna(dt_acp):
-        return miss_pri
+        return FIELD_STATUS_MISSING_ACORE
     if pd.isna(dt_liab):
-        return "MISSING IN M61"
-    return "MATCH" if dt_liab.normalize().date() == dt_acp.normalize().date() else "NO MATCH"
+        return FIELD_STATUS_MISSING_M61
+    return (
+        FIELD_STATUS_MATCH
+        if dt_liab.normalize().date() == dt_acp.normalize().date()
+        else FIELD_STATUS_MISMATCH
+    )
 
 
 def _recon_token_for_effective_date_status(display):
-    if display == "MATCH":
+    if display == FIELD_STATUS_MATCH:
         return "MATCH"
-    if display == "NO MATCH":
+    if display in (FIELD_STATUS_MISMATCH, "NO MATCH"):
         return "MISMATCH"
     return "MISSING"
 
 
 def _recon_token_for_compare_status(display):
-    if display == "MATCH":
+    if display == FIELD_STATUS_MATCH:
         return "MATCH"
-    if display == "MISMATCH":
+    if display == FIELD_STATUS_MISMATCH:
         return "MISMATCH"
+    if isinstance(display, str) and display.startswith("MISSING FROM"):
+        return "MISSING"
     return "MISSING"
 
 
@@ -2132,29 +2215,26 @@ def _is_blank_for_compare(v):
     return s in ("", "nan", "none", "nat", "<na>")
 
 
-def compare_pledge_date_status(
-    *, val_liability, val_acp, missing_in_primary: str = "ACORE"
-):
+def compare_pledge_date_status(*, val_liability, val_acp):
     has_acp = _effective_date_cell_populated(val_acp)
     has_liab = _effective_date_cell_populated(val_liability)
-    miss_pri = f"MISSING IN {missing_in_primary}"
 
     if not has_acp and not has_liab:
-        return "MISSING FROM BOTH FILES"
+        return FIELD_STATUS_MISSING_BOTH
     if not has_acp and has_liab:
-        return miss_pri
+        return FIELD_STATUS_MISSING_ACORE
     if has_acp and not has_liab:
-        return "MISSING IN M61"
+        return FIELD_STATUS_MISSING_M61
 
     dt_l = safe_parse_date(pd.Series([val_liability])).iloc[0]
     dt_a = safe_parse_date(pd.Series([val_acp])).iloc[0]
     if pd.isna(dt_a):
-        return miss_pri
+        return FIELD_STATUS_MISSING_ACORE
     if pd.isna(dt_l):
-        return "MISSING IN M61"
+        return FIELD_STATUS_MISSING_M61
     if dt_l.normalize().date() == dt_a.normalize().date():
-        return "MATCH"
-    return "MISMATCH"
+        return FIELD_STATUS_MATCH
+    return FIELD_STATUS_MISMATCH
 
 
 def _primary_facility_match_token(source, facility) -> str:
@@ -2375,8 +2455,6 @@ def reconcile(
     global LAST_RECON_DIAGNOSTICS, LAST_RECON_CONTEXT
     label_a = "in_liability"
     p_cfg = get_primary_config(primary_file_type)
-    miss_pri = p_cfg["missing_in_primary_label"]
-    src_ind_primary = p_cfg.get("primary_only_legend_label") or p_cfg["source_indicator_primary_only"]
     # One fund identity per primary workbook template (no row-level Fund on Fin Inpt).
     business_fund_label = detect_fund_label(uploaded_primary_filename, primary_file_type)
     fund_fallback_display = _fund_cfg(primary_file_type).get("recon_fund_display") or business_fund_label
@@ -2962,6 +3040,74 @@ def reconcile(
             added += 1
         return added
 
+    def _pair_deal_id_ignore_effective_date_fallback() -> int:
+        """Pair still-unmatched rows when ``acp_match_key`` == ``m61_match_key`` (non-blank), ignoring
+        effective date. Runs only after all exact / staged matchers above; does not alter prior pairs.
+
+        Duplicate handling: for each shared deal id, unmatched primary row ids and unmatched M61 row ids
+        are sorted by ``(effective_date_key, row_id)`` then paired in order (first with first, …) up to
+        ``min(count_primary, count_m61)``. Any surplus rows on either side stay unmatched (existing
+        Missing / M61-only behavior).
+        """
+        added = 0
+        b_pool = b[
+            b["_row_id_b"].isin(unmatched_b)
+            & b["acp_match_key"].astype(str).str.strip().ne("")
+        ]
+        a_pool = a[
+            a["_row_id_a"].isin(unmatched_a.intersection(matchable_a))
+            & a["m61_match_key"].astype(str).str.strip().ne("")
+        ]
+        b_ids_by: dict[str, list[int]] = {}
+        for _, r in b_pool.iterrows():
+            k = str(r["acp_match_key"]).strip()
+            b_ids_by.setdefault(k, []).append(int(r["_row_id_b"]))
+        a_ids_by: dict[str, list[int]] = {}
+        for _, r in a_pool.iterrows():
+            k = str(r["m61_match_key"]).strip()
+            a_ids_by.setdefault(k, []).append(int(r["_row_id_a"]))
+        for deal_key in sorted(set(b_ids_by.keys()) & set(a_ids_by.keys())):
+            b_ids = sorted(
+                b_ids_by[deal_key],
+                key=lambda rid: (str(b_by_id.loc[rid, "effective_date_key"]), rid),
+            )
+            a_ids = sorted(
+                a_ids_by[deal_key],
+                key=lambda rid: (str(a_by_id.loc[rid, "effective_date_key"]), rid),
+            )
+            n_pair = min(len(b_ids), len(a_ids))
+            if len(b_ids) != len(a_ids):
+                _debug_rows(
+                    "TEMP DEBUG: deal_id_ignore_eff_date key="
+                    f"{deal_key!r} surplus primary={max(0, len(b_ids) - n_pair)} "
+                    f"surplus_m61={max(0, len(a_ids) - n_pair)} pairing={n_pair}"
+                )
+            for i in range(n_pair):
+                rid_b, rid_a = b_ids[i], a_ids[i]
+                if rid_b not in unmatched_b or rid_a not in unmatched_a:
+                    continue
+                unmatched_b.remove(rid_b)
+                unmatched_a.remove(rid_a)
+                pair_rows.append(
+                    {
+                        "_row_id_b": rid_b,
+                        "_row_id_a": rid_a,
+                        "_match_stage": "deal_id_ignore_eff_date",
+                        "_merge": "both",
+                    }
+                )
+                br = b_by_id.loc[rid_b]
+                ar = a_by_id.loc[rid_a]
+                _debug_rows(
+                    "TEMP DEBUG: selected pair "
+                    f"stage=deal_id_ignore_eff_date acp_id={rid_b} m61_id={rid_a} "
+                    f"deal={br.get('Deal Name')!r} acp_eff={br.get('effective_date_key')!r} "
+                    f"m61_eff={ar.get('effective_date_key')!r} "
+                    f"reason=deal id / note suffix match; effective date may differ"
+                )
+                added += 1
+        return added
+
     b["id_match_key"] = b["acp_match_key"].astype(str)
     a["id_match_key"] = a["m61_match_key"].astype(str)
     # AOC II / AOC I name variants are common; pair by Deal ID + Effective Date for ID-stage matching.
@@ -3087,6 +3233,11 @@ def reconcile(
 
         fallback_n = _pair_by_key("deal_date_key", "deal_date_key", "fallback")
         _debug_rows(f"TEMP DEBUG: staged matcher fallback matches={fallback_n}")
+
+    deal_id_eff_fb_n = _pair_deal_id_ignore_effective_date_fallback()
+    _debug_rows(
+        f"TEMP DEBUG: deal_id_ignore_eff_date fallback (same deal id, date may differ) pairs={deal_id_eff_fb_n}"
+    )
 
     # Build merged-like frame while preserving unmatched rows (outer behavior).
     for rid_b in sorted(unmatched_b):
@@ -3220,13 +3371,6 @@ def reconcile(
             if parts:
                 record["Source"] = " | ".join(parts)
 
-        if in_a and in_b:
-            record["Source Indicator"] = "Both"
-        elif in_b:
-            record["Source Indicator"] = src_ind_primary
-        else:
-            record["Source Indicator"] = "M61 Only"
-
         deal_id_acp = row.get("deal_id_value") if in_b else ""
         note_suffix_m61 = row.get(f"{label_a}_liability_note_suffix") if in_a else ""
         deal_id_key = normalise_deal_id_key(deal_id_acp)
@@ -3277,7 +3421,7 @@ def reconcile(
 
             if only_target_from_invis and a_field != "target":
                 record[liability_label] = pd.NA
-                record[f"{b_field} Status"] = "MISSING IN M61"
+                record[f"{b_field} Status"] = FIELD_STATUS_MISSING_M61
                 if b_field in RECON_STATUS_FIELDS:
                     key_field_statuses.append("MISSING")
                 continue
@@ -3333,40 +3477,36 @@ def reconcile(
 
             if b_field == "Effective Date":
                 if not in_b:
-                    ed_status = f"MISSING IN {miss_pri}"
+                    ed_status = FIELD_STATUS_MISSING_ACORE
                 elif not in_a:
-                    ed_status = "MISSING IN M61"
+                    ed_status = FIELD_STATUS_MISSING_M61
                 else:
-                    ed_status = compare_effective_date_status(val_a, val_b, missing_in_primary=miss_pri)
+                    ed_status = compare_effective_date_status(val_a, val_b)
                 record[f"{b_field} Status"] = ed_status
                 if b_field in RECON_STATUS_FIELDS:
                     key_field_statuses.append(_recon_token_for_effective_date_status(ed_status))
                 continue
 
             if not in_a and not in_b:
-                status = "MISSING FROM BOTH FILES"
+                status = FIELD_STATUS_MISSING_BOTH
             elif not in_b:
-                status = f"MISSING IN {miss_pri}"
+                status = FIELD_STATUS_MISSING_ACORE
             elif not in_a:
-                status = "MISSING IN M61"
+                status = FIELD_STATUS_MISSING_M61
             else:
                 if b_field in ("Advance Rate", "Spread"):
                     n_a = _coerce_rate_fraction(val_a)
                     n_b = _coerce_rate_fraction(val_b)
                     if n_a is not None and n_b is not None:
                         status = (
-                            "MATCH"
+                            FIELD_STATUS_MATCH
                             if abs(n_a - n_b) <= RATE_STATUS_TOLERANCE
-                            else "MISMATCH"
+                            else FIELD_STATUS_MISMATCH
                         )
                     else:
-                        status = compare_liability_primary_status(
-                            val_a, val_b, ctype, missing_in_primary=miss_pri
-                        )
+                        status = compare_liability_primary_status(val_a, val_b, ctype)
                 else:
-                    status = compare_liability_primary_status(
-                        val_a, val_b, ctype, missing_in_primary=miss_pri
-                    )
+                    status = compare_liability_primary_status(val_a, val_b, ctype)
 
             record[f"{b_field} Status"] = status
             if b_field in RECON_STATUS_FIELDS:
@@ -3400,7 +3540,6 @@ def reconcile(
         record["Pledge Date Status"] = compare_pledge_date_status(
             val_liability=pdt_liab,
             val_acp=pdt_acp,
-            missing_in_primary=miss_pri,
         )
 
         m61_fund_s = _stripped_nonempty_str(row.get(f"{label_a}_Fund Name")) if in_a else None
@@ -3422,8 +3561,11 @@ def reconcile(
         record["Index Name (ACP)"] = pd.NA
         record["Recourse % (ACP)"] = record.get("Recourse %") if in_b else pd.NA
 
-        # expose existing Undrawn comparison status
-        record["Undrawn Capacity Status"] = record.get("Current Undrawn Capacity Status", "N/A")
+        record["Undrawn Capacity Status"] = compare_liability_primary_status(
+            record.get("Undrawn Capacity (M61)"),
+            record.get("Undrawn Capacity (ACP)"),
+            "numeric",
+        )
 
         # Liability-side values
         if only_target_from_invis or not in_a:
@@ -3444,13 +3586,11 @@ def reconcile(
             record.get("Index Floor (M61)"),
             record.get("Index Floor (ACP)"),
             "text",
-            missing_in_primary=miss_pri,
         )
         record["Index Name Status"] = compare_optional(
             record.get("Index Name (M61)"),
             record.get("Index Name (ACP)"),
             "text",
-            missing_in_primary=miss_pri,
         )
         rec_m61 = record.get("Recourse % (M61)")
         rec_acp = record.get("Recourse % (ACP)")
@@ -3458,7 +3598,6 @@ def reconcile(
             rec_m61,
             rec_acp,
             "numeric",
-            missing_in_primary=miss_pri,
         )
 
         src_status = "" if pd.isna(row.get(f"{label_a}_Status")) else str(row.get(f"{label_a}_Status")).strip().lower()
@@ -3475,6 +3614,8 @@ def reconcile(
             recon_status = "MATCH"
 
         record["recon_status"] = recon_status
+        # Set last so nothing in the row payload overwrites; drives UI "File Source" column.
+        record["File Source"] = _file_source_label_from_sides(in_a=in_a, in_b=in_b)
         rows.append(record)
 
     _out_cols = list(RECON_ORDERED_COLS)
@@ -3494,6 +3635,8 @@ def reconcile(
             has_target = df_out["Target Advance Rate (M61)"].notna()
             df_out.loc[has_target, "Advance Rate Source (M61)"] = "Target Advance Rate"
 
+    df_out = _ensure_file_source_populated(df_out)
+
     _debug_cols = [
         "Deal Name",
         "Fund",
@@ -3504,7 +3647,7 @@ def reconcile(
         "Effective Date (ACP)",
         "Effective Date (M61)",
         "Match Stage",
-        "Source Indicator",
+        "File Source",
         "Target Advance Rate (M61)",
         "Advance Rate (ACP)",
         "recon_status",
@@ -3525,13 +3668,13 @@ def reconcile(
         _dbg_cols = [
             "Deal ID (ACP)", "Deal Name", "Effective Date",
             "M61 Extracted Deal ID", "Liability Name (M61)", "Effective Date (M61)",
-            "Liability Type (M61 Raw)", "Source Indicator", "Match Stage", "match_key",
+            "Liability Type (M61 Raw)", "File Source", "Match Stage", "match_key",
             "Target Advance Rate (M61)", "Spread (M61)",
         ]
         _avail = [c for c in _dbg_cols if c in df_out.columns]
         _acore_mask = (
-            df_out["Source Indicator"].isin(["Both", p_cfg.get("primary_only_legend_label", "ACORE Only")])
-            if "Source Indicator" in df_out.columns
+            df_out["File Source"].isin([FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY])
+            if "File Source" in df_out.columns
             else pd.Series([True] * len(df_out))
         )
         _dbg_df = df_out.loc[_acore_mask, _avail].copy()
@@ -3558,15 +3701,13 @@ def reconcile(
             pk = f"{label_a}_{col}"
             liab_val = row.get(pk) if pk in row.index else pd.NA
             if not in_a and not in_b:
-                result = "MISSING FROM BOTH FILES"
+                result = FIELD_STATUS_MISSING_BOTH
             elif not in_b:
-                result = f"MISSING IN {miss_pri}"
+                result = FIELD_STATUS_MISSING_ACORE
             elif not in_a:
-                result = "MISSING IN M61"
+                result = FIELD_STATUS_MISSING_M61
             else:
-                result = compare_liability_primary_status(
-                    liab_val, acp_adv, "numeric", missing_in_primary=miss_pri
-                )
+                result = compare_liability_primary_status(liab_val, acp_adv, "numeric")
             adv_rows.append(
                 {
                     "Deal": deal,
@@ -3690,7 +3831,7 @@ COL_DEFS = [
     ("Deal ID (ACP)", 14, False, False, "ACP"),
     ("Liability Note Suffix (M61)", 20, False, False, "LIB"),
     ("Source", 9, False, False, "ID"),
-    ("Source Indicator", 15, False, False, "ID"),
+    ("File Source", 15, False, False, "ID"),
     ("Effective Date (ACP)", 14, False, True, "ACP"),
     ("Effective Date (M61)", 16, False, True, "LIB"),
     ("Pledge Date (ACP)", 14, False, True, "ACP"),
@@ -3906,7 +4047,7 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
             _fmt_str_cell(row.get("Deal ID (ACP)", "")),
             _fmt_str_cell(row.get("Liability Note Suffix (M61)", "")),
             _fmt_str_cell(row.get("Source", "")),
-            _fmt_str_cell(row.get("Source Indicator", "")),
+            _fmt_str_cell(row.get("File Source", "")),
             _fmt_date(row.get("Effective Date (ACP)")),
             _fmt_date(row.get("Effective Date (M61)")),
             _fmt_date(row.get("Pledge Date (ACP)")),
@@ -3976,9 +4117,9 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
             MISSING_BG,
             "7D6608",
             "Record exists in one file only, red-flagged in M61 export, or a key field is "
-            "MISSING IN ACORE / MISSING IN AOC II / MISSING IN M61 / MISSING FROM BOTH FILES.",
+            "MISSING FROM ACORE / MISSING FROM M61 / MISSING FROM BOTH.",
         ),
-        (wb_ctx["legend_primary_only_label"], "D9E1F2", "1F3864", wb_ctx["legend_primary_only_detail"]),
+        (FILE_SOURCE_ACORE_ONLY, "D9E1F2", "1F3864", wb_ctx["legend_primary_only_detail"]),
         ("Both", "E2EFDA", "375623", "Record found in primary model and M61 — basis for comparison"),
     ]
 
