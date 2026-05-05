@@ -620,15 +620,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## ⚙️ Options")
     run_on_upload = st.checkbox("Auto-run on upload", value=True)
-    st.checkbox(
-        "Include match diagnostics (debug)",
-        value=False,
-        key="recon_match_diagnostics",
-        help=(
-            "Adds columns describing how each row was matched (method, confidence, deal IDs, keys). "
-            "Re-run reconciliation after toggling."
-        ),
-    )
 
     st.markdown("---")
     st.markdown("## 🔍 Filters")
@@ -2474,6 +2465,8 @@ if "df_recon" in st.session_state:
                                     "Maturity Date",
                                     "Liability Note",
                                     "Target Advance Rate",
+                                    "DealLevelAdvanceRate",
+                                    "Deal Level Advance Rate",
                                     "Spread",
                                     "m61_match_key",
                                     "effective_date_key",
@@ -2481,6 +2474,27 @@ if "df_recon" in st.session_state:
                                 if c in a_hit.columns
                             ]
                             a_disp = a_hit.loc[:, a_cols].copy()
+                            # Display-only mirror of reconciliation basis:
+                            # follow the already-computed source on the current reconciliation row.
+                            _adv_src = str(row.get("Advance Rate Source (M61)") or "").strip().lower()
+                            _use_deal_level = _adv_src == "deal level advance rate"
+                            _tgt_adv = (
+                                a_hit["Target Advance Rate"]
+                                if "Target Advance Rate" in a_hit.columns
+                                else pd.Series(pd.NA, index=a_hit.index)
+                            )
+                            if "DealLevelAdvanceRate" in a_hit.columns:
+                                _dl_adv = a_hit["DealLevelAdvanceRate"]
+                            elif "Deal Level Advance Rate" in a_hit.columns:
+                                _dl_adv = a_hit["Deal Level Advance Rate"]
+                            else:
+                                _dl_adv = pd.Series(pd.NA, index=a_hit.index)
+                            _eff_adv = _dl_adv.copy() if _use_deal_level else _tgt_adv.copy()
+                            a_disp.insert(
+                                len(a_disp.columns),
+                                "Advance Rate Used (M61)",
+                                _eff_adv.reindex(a_disp.index),
+                            )
                             _ag = a_hit.apply(lambda rr: _row_group_key(rr, "m61"), axis=1)
                             a_disp.insert(
                                 0,
@@ -2495,7 +2509,9 @@ if "df_recon" in st.session_state:
                             for pc in (
                                 "Target Advance Rate",
                                 "Current Advance Rate",
+                                "DealLevelAdvanceRate",
                                 "Deal Level Advance Rate",
+                                "Advance Rate Used (M61)",
                                 "Spread",
                                 "IndexFloor",
                                 "Floor",
