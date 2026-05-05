@@ -6,7 +6,7 @@ ________________
 
 
 Overview
-This tool compares two data sources — ACORE (your primary model file) and M61 (the comparison export) — to identify where records match, where they differ, and where data may be missing from one side or the other.
+\nThis tool compares two data sources — ACORE (your primary model file) and M61 (the comparison export) — to identify where records match, where they differ, and where data may be missing from one side or the other.
 
 
 The goal is to surface meaningful discrepancies quickly, without requiring you to manually cross-reference spreadsheets. The tool handles the matching logic automatically and presents results in a clear, reviewable format.
