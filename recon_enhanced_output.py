@@ -134,6 +134,9 @@ def _fund_cfg(primary_file_type: str) -> dict:
 
 # Primary workbooks that share Fin Inpt + liability-note-driven financing match rules.
 FIN_INPT_PRIMARY_TYPES = frozenset({"ACORE", "ACP II", "ACP I", "AOC II", "AOC I"})
+# Funds where Sale rows should compare against M61 DealLevelAdvanceRate.
+# ACP III/ACORE intentionally excluded for now (keeps Target Advance Rate behavior).
+SALE_DEALLEVEL_PRIMARY_TYPES = frozenset({"ACP II", "ACP I", "AOC II", "AOC I"})
 
 # Optional columns when reconcile(..., match_diagnostics=True). Does not affect matching.
 MATCH_DIAGNOSTIC_COLUMNS = (
@@ -3280,38 +3283,26 @@ def reconcile(
                 continue
 
             # Advance Rate comparison basis:
-            # - Fin Inpt runs (ACORE/ACP/AOC I): M61 Target Advance Rate.
-            # - AOC II: Sale-type liabilities → Deal Level advance; else Target; Equity/Fund excluded.
-            # - Other flows retain sale-type fallback to deal-level advance.
+            # - ACP II / ACP I / AOC II / AOC I: Sale-type liabilities → Deal Level advance; else Target.
+            # - ACORE (ACP III): keep Target-only behavior.
+            # - Other flows retain legacy sale-type fallback to deal-level advance.
             if b_field == "Advance Rate":
-                if primary_file_type == "AOC II":
-                    early_cat = categorize_m61_note_category(
-                        row.get(f"{label_a}_Liability Note"),
-                        row.get(f"{label_a}_Liability Type"),
-                        row.get("Source") if in_b else None,
-                        primary_file_type="AOC II",
+                if primary_file_type in SALE_DEALLEVEL_PRIMARY_TYPES:
+                    fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
+                    liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
+                    use_deal_level_adv = _is_sale_type_fund_or_deal(
+                        fund_name=fund_name,
+                        liability_type=liab_type,
                     )
-                    if early_cat == "Equity/Fund":
-                        compare_val = pd.NA
-                        record["Advance Rate (M61)"] = pd.NA
-                        record["Advance Rate Source (M61)"] = "Equity/Fund (excluded)"
-                        val_a = pd.NA
+                    if use_deal_level_adv:
+                        compare_val = _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
+                        record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
+                        record["Advance Rate Source (M61)"] = "Deal Level Advance Rate"
                     else:
-                        fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
-                        liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
-                        use_deal_level_adv = _is_sale_type_fund_or_deal(
-                            fund_name=fund_name,
-                            liability_type=liab_type,
-                        )
-                        if use_deal_level_adv:
-                            compare_val = _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
-                            record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
-                            record["Advance Rate Source (M61)"] = "Deal Level Advance Rate"
-                        else:
-                            compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
-                            record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
-                            record["Advance Rate Source (M61)"] = "Target Advance Rate"
-                        val_a = record["Advance Rate (M61)"]
+                        compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
+                        record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
+                        record["Advance Rate Source (M61)"] = "Target Advance Rate"
+                    val_a = record["Advance Rate (M61)"]
                     record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
                 elif primary_file_type in FIN_INPT_PRIMARY_TYPES:
                     compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
@@ -3490,11 +3481,11 @@ def reconcile(
     if match_diagnostics:
         _out_cols = _out_cols + list(MATCH_DIAGNOSTIC_COLUMNS)
     df_out = pd.DataFrame(rows).reindex(columns=_out_cols).reset_index(drop=True)
-    # Hard guard for Fin Inpt runs (except AOC II): M61 advance display uses Target Advance Rate only.
-    # AOC II picks Target vs Deal Level per row upstream.
+    # Hard guard for Fin Inpt runs that remain Target-only (ACORE / ACP III).
+    # SALE_DEALLEVEL_PRIMARY_TYPES pick Target vs Deal Level per row upstream.
     if (
         primary_file_type in FIN_INPT_PRIMARY_TYPES
-        and primary_file_type != "AOC II"
+        and primary_file_type not in SALE_DEALLEVEL_PRIMARY_TYPES
         and "Advance Rate (M61)" in df_out.columns
         and "Target Advance Rate (M61)" in df_out.columns
     ):

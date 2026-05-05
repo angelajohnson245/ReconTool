@@ -2448,6 +2448,10 @@ if "df_recon" in st.session_state:
                         )
 
                         st.markdown("**Underlying M61 rows**")
+                        st.caption(
+                            "Rows are matched by Deal ID and Effective Date. If the deal is the same "
+                            "but the date is different, it will show as 'Same deal – different date'."
+                        )
                         if a_hit.empty:
                             st.caption("No M61 source rows found for this key.")
                         else:
@@ -2474,6 +2478,29 @@ if "df_recon" in st.session_state:
                                 if c in a_hit.columns
                             ]
                             a_disp = a_hit.loc[:, a_cols].copy()
+                            # Visual-only drilldown aid: compare this card's ACORE effective date to each
+                            # underlying M61 row effective date (does not affect reconciliation/matching).
+                            _acore_eff_key = _date_key_ui(ed_acp)
+                            if "Effective Date" in a_hit.columns:
+                                _m61_eff_key = a_hit["Effective Date"].map(_date_key_ui)
+                                _date_match_status = _m61_eff_key.map(
+                                    lambda k: "Matches (same date)"
+                                    if (_acore_eff_key and k and k == _acore_eff_key)
+                                    else "Same deal – different date"
+                                )
+                            else:
+                                _date_match_status = pd.Series(
+                                    ["Same deal – different date"] * len(a_hit), index=a_hit.index, dtype="object"
+                                )
+                            if "Effective Date" in a_disp.columns:
+                                _eff_idx = a_disp.columns.get_loc("Effective Date") + 1
+                            else:
+                                _eff_idx = len(a_disp.columns)
+                            a_disp.insert(
+                                _eff_idx,
+                                "Match Explanation",
+                                _date_match_status.reindex(a_disp.index),
+                            )
                             # Display-only mirror of reconciliation basis:
                             # follow the already-computed source on the current reconciliation row.
                             _adv_src = str(row.get("Advance Rate Source (M61)") or "").strip().lower()
