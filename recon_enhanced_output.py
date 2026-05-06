@@ -583,8 +583,27 @@ def scope_label_for_primary_type(primary_file_type: str) -> str:
     return cfg.get("scope_label", primary_file_type)
 
 
+def _fund_series_matches_regex(s: pd.Series, pattern: str | None) -> pd.Series:
+    if not pattern:
+        return pd.Series(True, index=s.index)
+    return s.fillna("").astype(str).str.contains(pattern, case=False, regex=True, na=False)
+
+
+def _fund_series_contains_label_token(s: pd.Series, lab: str | None) -> pd.Series:
+    """Match primary fund labels without substring false positives (e.g. ``AOC I`` vs ``AOC II``)."""
+    if not lab or not str(lab).strip():
+        return pd.Series(False, index=s.index)
+    esc = re.escape(str(lab).strip())
+    pat = rf"(?<![A-Za-z0-9]){esc}(?![A-Za-z0-9])"
+    return s.fillna("").astype(str).str.contains(pat, case=False, regex=True, na=False)
+
+
 def filter_recon_to_selected_fund(df_recon: pd.DataFrame, primary_file_type: str) -> pd.DataFrame:
     """Filter reconciliation rows by selected fund scope (display/export helper).
+
+    Uses the same fund regex as ``_m61_in_scope`` / ``PRIMARY_TYPE_FUND_CONFIG``, token-safe
+    primary labels, optional ``Fund (M61)`` alignment, and (for ACP II / AOC II / AOC I) the same
+    liability-note ``fund_code`` guard as staged matching—without changing merge or pairing.
 
     Returns a row subset only; does not change any column values (including ``Fund``).
     """
@@ -596,19 +615,35 @@ def filter_recon_to_selected_fund(df_recon: pd.DataFrame, primary_file_type: str
         return df_recon.copy()
     pattern = cfg.get("fund_regex") or re.escape(token)
     fund_series = df_recon["Fund"].fillna("").astype(str)
-    mask_m61 = fund_series.str.contains(pattern, case=False, regex=True, na=False)
-    # Rows tagged with the business-file fund label (ACORE-only / primary-side Fund fill).
+
+    mask_regex_main = _fund_series_matches_regex(df_recon["Fund"], pattern)
+    if "Fund (M61)" in df_recon.columns:
+        m61f = df_recon["Fund (M61)"]
+        has_m61_fund = m61f.notna() & m61f.astype(str).str.strip().ne("")
+        m61_col_ok = _fund_series_matches_regex(m61f, pattern)
+        mask_regex_main = mask_regex_main & (~has_m61_fund | m61_col_ok)
+
+    scope_lbl = scope_label_for_primary_type(primary_file_type)
+    if primary_file_type in ("ACP II", "AOC II", "AOC I") and "Liability Note (M61)" in df_recon.columns:
+        fc = df_recon["Liability Note (M61)"].map(
+            lambda n: (parse_liability_note(n).get("fund_code") or "").strip()
+        )
+        note_scope_ok = fc.eq("") | fc.eq(scope_lbl)
+    else:
+        note_scope_ok = pd.Series(True, index=df_recon.index)
+
     mask_primary = pd.Series(False, index=df_recon.index)
     for lab in (cfg.get("export_label"), cfg.get("scope_label"), cfg.get("recon_fund_display")):
         if not lab:
             continue
-        mask_primary |= fund_series.str.contains(
-            re.escape(str(lab).strip()), case=False, regex=True, na=False
-        )
-    out = df_recon[(mask_m61 | mask_primary)].copy()
+        mask_primary |= _fund_series_contains_label_token(fund_series, lab)
+
+    combined = (mask_regex_main | mask_primary) & note_scope_ok
+    out = df_recon[combined].copy()
     _debug_rows(
         f"Scoped filter ({primary_file_type}) rows: in={len(df_recon)} out={len(out)} "
-        f"mask_m61={int(mask_m61.sum())} mask_primary={int(mask_primary.sum())}"
+        f"mask_regex={int(mask_regex_main.sum())} mask_primary={int(mask_primary.sum())} "
+        f"note_scope_ok={int(note_scope_ok.sum())}"
     )
     return out
 

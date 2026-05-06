@@ -701,39 +701,55 @@ with st.sidebar:
     st.checkbox("Missing", key="filter_status_missing")
     st.checkbox("Mismatch", key="filter_status_mismatch")
 
-    # Scope selector is adaptive: hide the toggle when both modes yield the same rows.
+    # Developer / debug UI hidden from finance users — uncomment to expose full-M61 reconciliation toggle.
+    # with st.expander("Developer / debug", expanded=False):
+    #     st.checkbox(
+    #         "Show full reconciliation (all M61 funds)",
+    #         key="recon_debug_full_m61",
+    #         help=(
+    #             "Entire reconciliation output, including liabilities for other funds present in the "
+    #             "M61 export. For troubleshooting only — finance views stay scoped to the uploaded primary fund."
+    #         ),
+    #     )
+
+    # Session key still honored if set elsewhere; without the widget it defaults to False.
+    _debug_full_sidebar = bool(st.session_state.get("recon_debug_full_m61", False))
+
+    # Scope: both finance modes use the uploaded primary fund only; "Selected" additionally drops M61-only rows.
     scope_mode = "Selected Fund Only"
     scope_toggle_needed = True
-    if "df_recon" in st.session_state:
+    if _debug_full_sidebar:
+        scope_toggle_needed = False
+    elif "df_recon" in st.session_state:
         _scope_df = st.session_state.get("df_recon", pd.DataFrame())
         _scope_primary = st.session_state.get("primary_file_type", primary_file_type)
         if isinstance(_scope_df, pd.DataFrame) and not _scope_df.empty:
-            _scope_subset = filter_recon_to_selected_fund(_scope_df, _scope_primary)
-            scope_toggle_needed = not _scope_df.sort_index().equals(
-                _scope_subset.sort_index()
-            )
+            _fund = filter_recon_to_selected_fund(_scope_df, _scope_primary)
+            _has_other_funds = not _scope_df.sort_index().equals(_fund.sort_index())
+            _has_m61_only = False
+            if "File Source" in _fund.columns:
+                _fs = _fund["File Source"].fillna("").astype(str).str.strip()
+                _has_m61_only = bool(_fs.eq(FILE_SOURCE_M61_ONLY).any())
+            scope_toggle_needed = _has_other_funds or _has_m61_only
 
     if scope_toggle_needed:
-        _scope_label_all = "All Uploaded File Results"
+        _scope_label_all = "All Results for Uploaded Primary Fund"
         _scope_label_fund = "Selected Primary Fund Only"
         _scope_choice = st.radio(
             "Scope",
             [_scope_label_all, _scope_label_fund],
             index=1,
             help=(
-                f"**{_scope_label_all}:** full reconciliation output for this upload run (every row "
-                "from the matched primary and M61 files). "
-                f"**{_scope_label_fund}:** only rows whose `Fund` belongs to "
-                f"the **{scope_label_for_primary_type(primary_file_type)}** scope. "
-                "All Uploaded File Results may include other funds present in the M61 export. "
-                f"Use {_scope_label_fund} to view only the chosen "
-                f"**{scope_label_for_primary_type(primary_file_type)}** fund."
+                f"**{_scope_label_all}:** All records for **{scope_label_for_primary_type(primary_file_type)}** "
+                "in this run, including lines that appear only on the comparison export. "
+                f"**{_scope_label_fund}:** Shows ACORE records for this fund and their matches in M61. "
+                "M61-only rows are hidden."
             ),
         )
         st.caption(
-            "All Uploaded File Results may include other funds present in the M61 export. "
-            f"Use **Selected Primary Fund Only** to view only the chosen "
-            f"**{scope_label_for_primary_type(primary_file_type)}** fund."
+            f"Both stay on **{scope_label_for_primary_type(primary_file_type)}**. "
+            f"**{_scope_label_all}** is the full picture. **{_scope_label_fund}:** Shows ACORE records for this fund "
+            "and their matches in M61. M61-only rows are hidden."
         )
         scope_mode = (
             "Selected Fund Only"
@@ -742,7 +758,14 @@ with st.sidebar:
         )
     else:
         scope_mode = "Selected Fund Only"
-        st.caption("This output is already scoped to the uploaded ACP III business file.")
+        if _debug_full_sidebar:
+            st.caption(
+                "**Developer:** Scope choices are hidden while full-export view is on. Turn it off to use Scope again."
+            )
+        else:
+            st.caption(
+                f"Everything here is already for **{scope_label_for_primary_type(primary_file_type)}** only."
+            )
 
     _note_options = ["All", "Financing", "Subline", "Other"]
     if "recon_m61_note_category" not in st.session_state:
@@ -980,16 +1003,6 @@ def to_excel_bytes(df_recon, primary_file_type: str):
     return buf.read()
 
 
-def filter_recon_to_primary_file_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Scoped UI rows for selected-fund view.
-
-    Keep full outer-merge visibility (Both / primary-only / M61-only).
-    """
-    if df is None or df.empty:
-        return df.copy() if df is not None else pd.DataFrame()
-    return df.copy()
-
-
 def _display_file_source_cell(row: pd.Series) -> str:
     """Non-blank File Source for the All Results grid (handles NA and legacy ``ID Match Result`` fallback)."""
     v = row.get("File Source")
@@ -1014,16 +1027,15 @@ def _display_file_source_cell(row: pd.Series) -> str:
     }.get(k, "")
 
 
-def filter_recon_scoped_to_business_lines(df: pd.DataFrame, run_primary: str) -> pd.DataFrame:
-    """Selected Fund view: only rows in the chosen fund scope.
-
-    Keeps side-by-side behavior for that fund (Both / primary-only / M61-only),
-    and excludes rows from other funds.
-    """
-    base = filter_recon_to_primary_file_rows(df)
-    if base.empty:
-        return base
-    return filter_recon_to_selected_fund(base, run_primary)
+def _scope_mode_display(scope_mode: str, debug_full: bool) -> str:
+    """Short labels for debug readouts (internal scope_mode values unchanged)."""
+    if debug_full:
+        return "Full export (developer)"
+    if scope_mode == "Selected Fund Only":
+        return "Selected primary fund"
+    if scope_mode == "All Results":
+        return "All results for primary fund"
+    return scope_mode
 
 
 def _current_upload_signature(
@@ -1212,10 +1224,17 @@ if "df_recon" in st.session_state:
                     st.stop()
 
     st.markdown('<div class="section-label">Deal filter</div>', unsafe_allow_html=True)
-    df_all = df_recon.copy()
+
+    _debug_full = bool(st.session_state.get("recon_debug_full_m61", False))
+    df_scoped = filter_recon_to_selected_fund(df_recon.copy(), run_primary)
+    if _debug_full:
+        df_all = df_recon.copy()
+    else:
+        df_all = df_scoped.copy()
+
     if "File Source" in df_all.columns:
         _deal_source_mask = df_all["File Source"].fillna("").astype(str).str.strip().isin(
-            ["Both", "ACORE Only"]
+            [FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY]
         )
         _deal_pool = df_all.loc[_deal_source_mask].copy()
     else:
@@ -1234,20 +1253,33 @@ if "df_recon" in st.session_state:
         help="Type in the box to jump to a deal (Streamlit search). Choose **All deals** to clear.",
     )
 
-    # Scope is applied FIRST from the base reconciliation dataframe.
-    df_scoped = filter_recon_scoped_to_business_lines(df_all, run_primary)
-    in_scope_ix = set(df_scoped.index)
-    if scope_mode == "Selected Fund Only":
-        df_view = df_all.loc[df_all.index.isin(in_scope_ix)].copy()
+    # Scope (finance): primary fund only via df_all; Selected drops M61-only rows within that fund.
+    if "File Source" in df_all.columns:
+        _fs_scope = df_all["File Source"].fillna("").astype(str).str.strip()
+        in_scope_ix_primary_tied = set(
+            df_all.index[
+                _fs_scope.isin([FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY])
+            ].tolist()
+        )
+    else:
+        in_scope_ix_primary_tied = set(df_all.index)
+
+    if _debug_full:
+        df_view = df_recon.copy()
+        st.warning(
+            "**Developer view:** Showing every fund in this run. Use standard Scope when you return to the main workflow."
+        )
+    elif scope_mode == "Selected Fund Only":
+        df_view = df_all.loc[df_all.index.isin(in_scope_ix_primary_tied)].copy()
         st.info(
-            f"Scoped rows: **{run_primary_label}** fund scope only "
+            "**Selected Primary Fund Only:** Shows ACORE records for this fund and their matches in M61. "
+            "M61-only rows are hidden."
         )
     else:
         df_view = df_all.copy()
         st.caption(
-            "**All Uploaded File Results:** full reconciliation output for this run (may include other "
-            "funds from the M61 export). **Selected Primary Fund Only:** "
-            f"subset to **{run_primary_label}** fund scope only (see **Scope** in the sidebar)."
+            f"**All results for {run_primary_label}:** Every record for this fund—matches, gaps, and export-only lines. "
+            "Other funds are not shown."
         )
     # TEMP DEBUG snapshot — after scope mode applied
     # Disabled: Backend vs UI row-count expander (was ACORE / AOC II only).
@@ -1334,21 +1366,12 @@ if "df_recon" in st.session_state:
     # TEMP DEBUG snapshot — after status filter
     _td_after_status = df_view.copy() if _td_active else None
 
-    # Primary-driven default view: keep M61-only rows behind an explicit toggle.
+    # For selected primary types: when Note Category is not All, drop M61-only rows (same as prior default
+    # with the removed "Show M61-only exceptions" checkbox always off).
     _td_after_m61_hide = None  # TEMP DEBUG default
-    show_m61_only_exceptions = False
     if run_primary in ("ACORE", "AOC II", "AOC I"):
-        show_m61_only_exceptions = st.checkbox(
-            "Show M61-only exceptions",
-            value=False,
-            key="recon_show_m61_only_exceptions",
-            help=(
-                "Default hides rows that exist only on the M61 side so the main table stays "
-                "primary-driven. Enable to review unmatched M61 exceptions."
-            ),
-        )
-        # When Note Category = All, show full universe (including M61-only rows) by default.
-        hide_m61_only = (not show_m61_only_exceptions) and (_note_pick != "All")
+        # When Note Category = All, show full universe (including M61-only rows).
+        hide_m61_only = _note_pick != "All"
         if hide_m61_only and "File Source" in df_view.columns:
             _before = len(df_view)
             df_view = df_view.loc[df_view["File Source"].fillna("").astype(str).str.strip().ne("M61 Only")].copy()
@@ -1364,7 +1387,6 @@ if "df_recon" in st.session_state:
         and _after_note_filter > 0
         and _after_status_filter > 0
         and _displayed_rows_final == 0
-        and not show_m61_only_exceptions
         and _note_pick != "All"
     )
 
@@ -1540,21 +1562,21 @@ if "df_recon" in st.session_state:
         <div class="metric-card mc-match">
           <div class="label">✓ Match</div>
           <div class="value">{n_match}</div>
-          <div class="sub">{match_rate:.0f}% match rate</div>
+          <div class="sub">{match_rate:.0f}% of records match</div>
         </div>""", unsafe_allow_html=True)
     with c3:
         st.markdown(f"""
         <div class="metric-card mc-missing">
           <div class="label">⚠ Missing</div>
           <div class="value">{n_miss}</div>
-          <div class="sub">Not in M61 file</div>
+          <div class="sub">Missing from M61</div>
         </div>""", unsafe_allow_html=True)
     with c4:
         st.markdown(f"""
         <div class="metric-card mc-mismatch">
           <div class="label">✗ Mismatch</div>
           <div class="value">{n_mismatch}</div>
-          <div class="sub">Requires review</div>
+          <div class="sub">Values do not match</div>
         </div>""", unsafe_allow_html=True)
 
     adv_src_vals = []
@@ -1751,7 +1773,7 @@ if "df_recon" in st.session_state:
 
             st.caption(
                 "Active UI filters — "
-                f"Scope mode: **{scope_mode}** | "
+                f"Scope: **{_scope_mode_display(scope_mode, _debug_full)}** | "
                 f"Deal: **{deal_pick}** | "
                 f"Note Category: **{_note_pick}** | "
                 f"Status: **{status_filter}**"
@@ -1773,8 +1795,9 @@ if "df_recon" in st.session_state:
 
         if _note_cat_m61_only_hidden_hint:
             st.info(
-                f"{_after_note_filter} rows match your selected M61 Note Category, but are hidden because "
-                "'Show M61-only exceptions' is turned off."
+                f"{_after_note_filter} rows match your selected M61 Note Category, but none appear here because "
+                "M61-only lines are hidden when a specific category is selected. Try **All** in M61 Note Category "
+                "or use **All Results for Uploaded Primary Fund** in Scope."
             )
         elif df_view.empty:
             st.info("No records match the current filters.")
@@ -1853,13 +1876,15 @@ if "df_recon" in st.session_state:
             df_display = pd.DataFrame(display_rows).reset_index(drop=True)
 
             # Option pools for **Source Type (ACORE)** / **Liability Type (M61)** table filters:
-            # - Selected Fund Only → rows in ``df_all`` whose index is in ``in_scope_ix``
-            #   (same fund scope as the initial ``df_view`` *before* status/deal narrowing).
-            # - All Results → full ``df_all``.
+            # - Selected Fund Only → primary-tied rows only (``File Source`` Both / ACORE Only).
+            # - All Results for uploaded primary fund → all rows for that fund (including M61-only).
+            # - Developer full-M61 → full ``df_recon`` when debug is enabled.
             # Intentionally excludes sidebar recon-status checkboxes and the Deal picker so
             # type dropdowns are scope-aware but not over-reduced vs. the displayed row set.
-            if scope_mode == "Selected Fund Only":
-                df_type_opts_base = df_all.loc[df_all.index.isin(in_scope_ix)].copy()
+            if _debug_full:
+                df_type_opts_base = df_recon.copy()
+            elif scope_mode == "Selected Fund Only":
+                df_type_opts_base = df_all.loc[df_all.index.isin(in_scope_ix_primary_tied)].copy()
             else:
                 df_type_opts_base = df_all.copy()
             src_type_opt_series = (
@@ -2716,9 +2741,8 @@ if "df_recon" in st.session_state:
             disabled=is_stale_selection,
         )
     st.caption(
-        "Excel and CSV use the **same row set and order** as the **All Results** table after "
-        "**Scope**, **M61 Note Category**, status/deal filters, **table filters**, and **sort** "
-        "(full reconciliation columns in the files)."
+        "Excel and CSV match the **Results** table: same rows and order after **Scope**, **M61 Note Category**, "
+        "status and deal filters, **table filters**, and **sort**."
     )
     if is_stale_selection:
         st.caption("Downloads are disabled until you rerun with the current selection.")
