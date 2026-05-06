@@ -11,6 +11,9 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+FILE_SOURCE_ACORE_ONLY = "ACORE Only"
+FILE_SOURCE_M61_ONLY = "M61 Only"
+FILE_SOURCE_BOTH = "Both"
 
 # --------------------------------------------------
 # 1. FILE PATHS
@@ -670,10 +673,6 @@ FIELD_STATUS_MISMATCH = "MISMATCH"
 FIELD_STATUS_MISSING_M61 = "MISSING FROM M61"
 FIELD_STATUS_MISSING_ACORE = "MISSING FROM ACORE"
 FIELD_STATUS_MISSING_BOTH = "MISSING FROM BOTH"
-
-FILE_SOURCE_BOTH = "Both"
-FILE_SOURCE_M61_ONLY = "M61 Only"
-FILE_SOURCE_ACORE_ONLY = "ACORE Only"
 
 
 def _file_source_label_from_sides(*, in_a: bool, in_b: bool) -> str:
@@ -4120,7 +4119,7 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
             "MISSING FROM ACORE / MISSING FROM M61 / MISSING FROM BOTH.",
         ),
         (FILE_SOURCE_ACORE_ONLY, "D9E1F2", "1F3864", wb_ctx["legend_primary_only_detail"]),
-        ("Both", "E2EFDA", "375623", "Record found in primary model and M61 — basis for comparison"),
+        (FILE_SOURCE_BOTH, "E2EFDA", "375623", "Record found in primary model and M61 — basis for comparison"),
     ]
 
     for r, (lbl, bg_hex, fc, desc) in enumerate(legends, 3):
