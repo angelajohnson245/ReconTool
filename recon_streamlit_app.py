@@ -1180,8 +1180,19 @@ def _col(row, *keys):
 
 
 def fmt_num_plain(v):
+    # Treat None, NA, and numeric zero as blank for display purposes.
+    # Undrawn Capacity = 0 in M61 exports is an Excel artifact for blank cells,
+    # not a meaningful "fully-drawn" value distinct from missing.
+    if v is None:
+        return "—"
     try:
-        return f"{float(v):,.0f}"
+        if pd.isna(v):
+            return "—"
+    except (TypeError, ValueError):
+        pass
+    try:
+        f = float(v)
+        return "—" if f == 0 else f"{f:,.0f}"
     except Exception:
         return "—"
 
