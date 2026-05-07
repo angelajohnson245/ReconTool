@@ -2825,6 +2825,11 @@ def categorize_m61_note_category(
     """
     p = parse_liability_note(liability_note_raw)
     by_note = (p.get("note_category") or "").strip()
+    pft = str(primary_file_type or "").strip()
+    if pft == "ACP II" and by_note == "Eq/Fund":
+        # ACP II override: LN-Eq liabilities map to Fund/Equity source family but
+        # are categorized as "Other" (not Financing / Equity-Fund).
+        return "Other"
     if by_note == "Fin":
         return "Financing"
     if by_note == "Sub":
@@ -2839,6 +2844,10 @@ def categorize_m61_note_category(
         return "Other"
     if "subline" in s:
         return "Subline"
+    if pft == "ACP II":
+        # ACP II "Other" bucket explicitly includes these Source/Type families.
+        if "whole loan" in s or "wholeloan" in s or "wl-cpace" in s or "fund" in s or "equity" in s:
+            return "Other"
     # For AOC II / AOC I, Whole Loan is a distinct asset class, not a financing facility —
     # skip it here so it falls through to "Other" and is excluded from Financing filter.
     if primary_file_type in ("AOC II", "AOC I") and ("whole loan" in s or "wholeloan" in s):
@@ -2849,10 +2858,37 @@ def categorize_m61_note_category(
     return "Other"
 
 
-def _source_bucket(value) -> str:
+def _source_bucket(value, *, primary_file_type: str = "", liability_note_raw=None, is_m61: bool = False) -> str:
     s = normalise_text(value)
+    pft = str(primary_file_type or "").strip()
+    if is_m61 and pft == "ACP II":
+        # ACP II connector override driven by M61 Liability Note prefix:
+        # - LN-Sub -> Subline
+        # - LN-Eq  -> Fund/Equity source family
+        # - LN-Fin -> financing source family from Liability Type token
+        p = parse_liability_note(liability_note_raw)
+        by_note = (p.get("note_category") or "").strip()
+        if by_note == "Sub":
+            return "subline"
+        if by_note == "Eq/Fund":
+            return "fund"
+        if by_note == "Fin":
+            if "repo" in s:
+                return "repo"
+            if s in ("non", "non-repo", "non repo") or " non" in f" {s}":
+                return "non"
+            if "sale" in s:
+                return "sale"
+            if "clo" in s:
+                return "clo"
+            if "tbd" in s:
+                return "tbd"
+            # Keep non-financing/noise tokens out of ACP II financing connector matches.
+            return ""
     if not s:
         return ""
+    if pft == "ACP II" and ("fund" in s or "equity" in s):
+        return "fund"
     if "subline" in s:
         return "subline"
     if "repo" in s:
@@ -3693,8 +3729,24 @@ def reconcile(
     )
     b["deal_date_key"] = b["deal_norm"] + " | " + b["effective_date_key"]
     a["deal_date_key"] = a["deal_norm"] + " | " + a["effective_date_key"]
-    b["source_bucket"] = b["Source"].apply(_source_bucket) if "Source" in b.columns else ""
-    a["source_bucket"] = a["Liability Type"].apply(_source_bucket) if "Liability Type" in a.columns else ""
+    b["source_bucket"] = (
+        b["Source"].apply(lambda v: _source_bucket(v, primary_file_type=primary_file_type))
+        if "Source" in b.columns
+        else ""
+    )
+    a["source_bucket"] = (
+        a.apply(
+            lambda r: _source_bucket(
+                r.get("Liability Type"),
+                primary_file_type=primary_file_type,
+                liability_note_raw=r.get("Liability Note"),
+                is_m61=True,
+            ),
+            axis=1,
+        )
+        if "Liability Type" in a.columns
+        else ""
+    )
     b["source_aware_key"] = b["deal_date_key"] + " | " + b["source_bucket"]
     a["source_aware_key"] = a["deal_date_key"] + " | " + a["source_bucket"]
     b["source_aware_facility_key"] = b["source_aware_key"] + " | " + b["facility_norm"]
