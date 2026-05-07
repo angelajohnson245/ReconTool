@@ -2823,9 +2823,16 @@ def categorize_m61_note_category(
     - AOC II: Whole Loan is NOT Financing (falls through to "Other").  All other funds
       retain the legacy behaviour where Whole Loan maps to Financing.
     """
+    pft = str(primary_file_type or "").strip()
+    s = normalise_text(primary_source_raw)
+    # AOC I / AOC II override: Whole Loan (including WL-CPACE variants) is an "Other"
+    # bucket for filtering/categorization, even when M61 Liability Type is Sale.
+    if pft in ("AOC II", "AOC I") and (
+        "whole loan" in s or "wholeloan" in s or "wl-cpace" in s or "wlcpace" in s
+    ):
+        return "Other"
     p = parse_liability_note(liability_note_raw)
     by_note = (p.get("note_category") or "").strip()
-    pft = str(primary_file_type or "").strip()
     if pft == "ACP II" and by_note == "Eq/Fund":
         # ACP II override: LN-Eq liabilities map to Fund/Equity source family but
         # are categorized as "Other" (not Financing / Equity-Fund).
@@ -2839,7 +2846,6 @@ def categorize_m61_note_category(
     by_type = categorize_m61_note_type(liability_type_raw)
     if by_type != "Other":
         return by_type
-    s = normalise_text(primary_source_raw)
     if not s:
         return "Other"
     if "subline" in s:
@@ -3270,9 +3276,31 @@ def _facility_norm_for_debug_cell(v) -> str:
 
 
 def _fin_m61_key_from_row(row: pd.Series, scope_label: str) -> str:
-    """Composite financing key on M61 rows: deal id + eff date + optional suffix; ``Fin`` + fund scope only."""
+    """Composite financing key on M61 rows: deal id + eff date + optional suffix; ``Fin`` + fund scope only.
+
+    ACP II extension: ``Sub`` (subline) rows also produce a bare deal-id + effective-date key so
+    they can match ACORE "Sub Debt" rows via the financing_note stage.  LN_Sub notes carry no
+    source suffix, and ACORE "Sub Debt" rows with unrecognised facilities (e.g. Bank OZK) also
+    fall back to the bare key — so the two sides naturally align.
+    """
     p = parse_liability_note(row.get("Liability Note"))
-    if p.get("note_category") != "Fin":
+    nc = p.get("note_category")
+    # ACP II-only: LN_Sub rows produce a keyed ``|sub`` token so they exclusively match
+    # ACORE "Sub Debt" source rows (which also carry the ``|sub`` discriminator on the
+    # ACORE side).  Using a bare deal+date key would cause LN_Sub rows to steal matches
+    # from Repo/NoN/CLO ACORE rows that share the same bare key (unrecognised facility).
+    if nc == "Sub" and scope_label == "ACP II":
+        did = normalise_deal_id_key(p.get("deal_id") or "")
+        if not did:
+            return ""
+        fc = (p.get("fund_code") or "").strip()
+        if fc and fc != scope_label:
+            return ""
+        if not fc and not bool(row.get("_m61_in_scope")):
+            return ""
+        eff = str(row.get("effective_date_key") or "")
+        return f"{did}|{eff}|sub"
+    if nc != "Fin":
         return ""
     did = normalise_deal_id_key(p.get("deal_id") or "")
     if not did:
@@ -3831,7 +3859,14 @@ def reconcile(
         a["_m61_note_category"] = a["Liability Note"].apply(
             lambda v: parse_liability_note(v).get("note_category", "Other")
         )
-        fin_note_rows = set(a.loc[a["_m61_note_category"].eq("Fin"), "_row_id_a"].tolist())
+        # ACP II: include LN_Sub (Subline) rows alongside LN_Fin so ACORE "Sub Debt" rows
+        # can match their M61 counterparts.  All other Fin Inpt types remain Fin-only.
+        if primary_file_type == "ACP II":
+            fin_note_rows = set(
+                a.loc[a["_m61_note_category"].isin({"Fin", "Sub"}), "_row_id_a"].tolist()
+            )
+        else:
+            fin_note_rows = set(a.loc[a["_m61_note_category"].eq("Fin"), "_row_id_a"].tolist())
         matchable_a = matchable_a.intersection(fin_note_rows)
         _scope_ok = pd.Series(True, index=a.index)
         # Tight fund guard for ACP II / AOC II / AOC I where shared Deal IDs across funds are common.
@@ -3879,6 +3914,18 @@ def reconcile(
         bare_cond = tok_stripped.eq("") | ~tok_stripped.isin(_known_fac_toks)
         fin_vals.loc[bare_cond] = base_k[bare_cond]
         b.loc[msk_b, "fin_acp_key"] = fin_vals
+        # ACP II: override fin_acp_key for "Sub Debt" source rows to use the ``|sub``
+        # discriminator token, matching the M61 LN_Sub key.  This ensures Sub Debt rows
+        # only pair with LN_Sub counterparts and never compete with Repo/NoN/CLO rows
+        # whose bare deal+date key would otherwise collide.
+        if primary_file_type == "ACP II":
+            sub_debt_mask = msk_b & b["Source"].fillna("").astype(str).str.lower().str.strip().eq("sub debt")
+            if sub_debt_mask.any():
+                sub_b2 = b.loc[sub_debt_mask]
+                b.loc[sub_debt_mask, "fin_acp_key"] = (
+                    sub_b2["deal_id_key"].astype(str) + "|" +
+                    sub_b2["effective_date_key"].astype(str) + "|sub"
+                )
         a["fin_m61_key"] = a.apply(lambda r: _fin_m61_key_from_row(r, scope_lbl), axis=1)
 
     pair_rows: list[dict] = []
@@ -4123,6 +4170,20 @@ def reconcile(
         # aligned to primary Deal ID + eff date + facility/source token.
         fin_note_n = _pair_by_key("fin_acp_key", "fin_m61_key", "financing_note")
         _debug_rows(f"TEMP DEBUG: Fin Inpt financing-note composite matches={fin_note_n}")
+
+        # ACP II: after financing_note stage, withdraw any still-unmatched LN_Sub rows from
+        # matchable_a so they cannot pair with Repo/NoN/CLO ACORE rows at later stages.
+        # Unmatched LN_Sub rows remain in unmatched_a and appear as "MISSING FROM ACORE",
+        # which is correct — their deal has no Sub Debt counterpart on the ACORE side.
+        if primary_file_type == "ACP II":
+            sub_row_ids = set(
+                a.loc[a["_m61_note_category"].eq("Sub"), "_row_id_a"].tolist()
+            )
+            matchable_a.difference_update(sub_row_ids)
+            _debug_rows(
+                f"TEMP DEBUG: ACP II post-financing_note — removed {len(sub_row_ids)} LN_Sub rows from matchable_a; "
+                f"matchable_a now={len(matchable_a)}"
+            )
 
         # Deal ID key merge (when Deal IDs are present); then staged matchers for remaining rows.
         lb = b[b["_row_id_b"].isin(unmatched_b)].copy()
