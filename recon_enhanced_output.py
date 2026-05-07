@@ -2904,6 +2904,13 @@ def _source_bucket(value, *, primary_file_type: str = "", liability_note_raw=Non
     return s
 
 
+def _is_whole_loan_or_cpace_source(value) -> bool:
+    s = normalise_text(value)
+    if not s:
+        return False
+    return ("whole loan" in s) or ("wholeloan" in s) or ("wl-cpace" in s) or ("wlcpace" in s)
+
+
 def _is_sale_type_fund_or_deal(*, fund_name, liability_type) -> bool:
     """Business override: sale-type funds compare against deal-level advance rate."""
     fn = normalise_text(fund_name)
@@ -3025,6 +3032,24 @@ def _normalize_index_floor_value(v):
     n = _coerce_numeric_value(v)
     if n is not None:
         return pd.NA if abs(n) <= FLOAT_TOLERANCE else n
+    if v is None:
+        return pd.NA
+    try:
+        if pd.isna(v):
+            return pd.NA
+    except (TypeError, ValueError):
+        return pd.NA
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", "<na>", "nat"):
+        return pd.NA
+    return s
+
+
+def _normalize_primary_index_floor_value(v):
+    """Primary/ACORE index-floor normalization; preserve explicit zero floor values."""
+    n = _coerce_numeric_value(v)
+    if n is not None:
+        return n
     if v is None:
         return pd.NA
     try:
@@ -4395,6 +4420,21 @@ def reconcile(
         spread_primary = row.get("Spread") if in_b else pd.NA
         spread_m61 = row.get(f"{label_a}_Spread") if in_a else pd.NA
         floor_primary = row.get("Floor") if in_b else pd.NA
+        index_floor_primary = row.get("Index Floor") if in_b else pd.NA
+        if _is_blank_for_compare(index_floor_primary):
+            index_floor_primary = floor_primary
+        # Whole Loan / WL-CPACE rows sometimes carry the floor under alternate sheet headers.
+        # Keep the override narrow to those source types only.
+        if (
+            in_b
+            and _is_whole_loan_or_cpace_source(row.get("Source"))
+            and _is_blank_for_compare(index_floor_primary)
+        ):
+            for alt_floor_col in ("Index Floor", "IndexFloor"):
+                alt_floor_val = row.get(alt_floor_col)
+                if not _is_blank_for_compare(alt_floor_val):
+                    index_floor_primary = alt_floor_val
+                    break
 
         record = {col: row.get(col) for col in ACP_SHEET_COLS}
 
@@ -4644,7 +4684,7 @@ def reconcile(
         record["Undrawn Capacity (M61)"] = record.get("Current Undrawn Capacity (M61)")
 
         # ACP-side values
-        record["Index Floor (ACP)"] = _normalize_index_floor_value(floor_primary)
+        record["Index Floor (ACP)"] = _normalize_primary_index_floor_value(index_floor_primary)
         record["Index Name (ACP)"] = pd.NA
         record["Recourse % (ACP)"] = record.get("Recourse %") if in_b else pd.NA
 
