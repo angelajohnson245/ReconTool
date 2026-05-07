@@ -67,10 +67,77 @@ st.markdown("""
   [data-testid="stSidebar"] h2,
   [data-testid="stSidebar"] h3 {
     color: #e8f4fd !important;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    font-size: 0.92rem;
     text-transform: uppercase;
+    margin-top: 0.55rem;
+    margin-bottom: 0.5rem;
+    line-height: 1.3;
+  }
+
+  /* Subheaders: Show Records, Scope, M61 Note Category (below FILTERS / section titles) */
+  .sidebar-subheader {
+    color: #e8f4fd !important;
+    font-size: 0.94rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.03em !important;
+    line-height: 1.4;
+    margin: 0.55rem 0 0.5rem 0 !important;
+  }
+  .sidebar-subheader-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.35rem;
+    margin: 0.55rem 0 0.5rem 0 !important;
+  }
+  .sidebar-subheader-row .sidebar-subheader-inline {
+    color: #e8f4fd !important;
+    font-size: 0.94rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.03em !important;
+    line-height: 1.4;
+    margin: 0 !important;
+  }
+  .sidebar-subheader-hint {
+    font-size: 0.8rem !important;
+    opacity: 0.82;
+    cursor: help;
+    color: #8fb8d8 !important;
+  }
+
+  /* Extra vertical separation between Show Records / Scope / M61 blocks */
+  .sidebar-section-gap {
+    display: block;
+    height: 0;
+    margin: 0.9rem 0 0.35rem 0;
+  }
+  .sidebar-subheader--after-gap {
+    margin-top: 0.15rem !important;
+  }
+
+  /* Scope radio: tuck under subheader with same vertical rhythm as other groups */
+  [data-testid="stSidebar"] .stRadio {
+    margin-top: 0 !important;
+  }
+
+  /* M61 Note Category (and other sidebar selects): clearer control surface */
+  [data-testid="stSidebar"] div[data-baseweb="select"] > div {
+    background-color: rgba(22, 48, 74, 0.92) !important;
+    border: 1px solid rgba(143, 184, 216, 0.65) !important;
+    border-radius: 8px !important;
+    min-height: 2.65rem !important;
+    padding-left: 0.65rem !important;
+    padding-right: 0.5rem !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+  [data-testid="stSidebar"] div[data-baseweb="select"] > div:hover {
+    border-color: rgba(168, 205, 232, 0.85) !important;
+    background-color: rgba(28, 58, 90, 0.95) !important;
+  }
+  [data-testid="stSidebar"] div[data-baseweb="select"] [aria-selected="true"],
+  [data-testid="stSidebar"] div[data-baseweb="select"] span {
+    color: #e8f4fd !important;
   }
 
   /* Sidebar: make “Advanced filters” expander easier to notice */
@@ -164,6 +231,7 @@ st.markdown("""
   .mc-total   { background: #e8f0fe; border-color: #b8cdf8; color: #1a3a6c; }
   .mc-match   { background: #e6f4ea; border-color: #a8d5b5; color: #1e5c35; }
   .mc-missing { background: #fef9e7; border-color: #f5d878; color: #7d5a00; }
+  .mc-needs   { background: #fff3e0; border-color: #ffcc80; color: #bf360c; }
   .mc-mismatch{ background: #fdecea; border-color: #f4b8b5; color: #8c1c15; }
  
   /* Status pills */
@@ -177,10 +245,11 @@ st.markdown("""
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-  .pill-match   { background: #c6efce; color: #375623; }
-  .pill-missing { background: #ffeb9c; color: #7d6608; }
-  .pill-mismatch{ background: #ffc7ce; color: #9c0006; }
-  .pill-na      { background: #e0e0e0; color: #555; }
+  .pill-match      { background: #c6efce; color: #375623; }
+  .pill-missing    { background: #ffeb9c; color: #7d6608; }
+  .pill-incomplete { background: #ffeb9c; color: #7d6608; }
+  .pill-mismatch   { background: #ffc7ce; color: #9c0006; }
+  .pill-na         { background: #e0e0e0; color: #555; }
  
   /* Section headers */
   .section-label {
@@ -438,6 +507,92 @@ def _date_key_ui(v) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def _target_22203_mask_ui(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    m = pd.Series(True, index=df.index)
+    if "Deal Name" in df.columns:
+        m &= df["Deal Name"].fillna("").astype(str).str.strip().str.lower().eq("block 21 san mateo")
+    if "Facility" in df.columns:
+        m &= df["Facility"].fillna("").astype(str).str.strip().str.lower().eq("tbk bank")
+    if "Deal ID Match Key (ACP)" in df.columns:
+        did = df["Deal ID Match Key (ACP)"].fillna("").astype(str).str.strip()
+        if did.ne("").any():
+            m &= did.eq("222203")
+    elif "Deal ID (ACP)" in df.columns:
+        did2 = (
+            df["Deal ID (ACP)"]
+            .fillna("")
+            .astype(str)
+            .str.replace(r"[^A-Za-z0-9]", "", regex=True)
+            .str.lower()
+        )
+        if did2.ne("").any():
+            m &= did2.eq("222203")
+    eff_acp_col = next((c for c in ("Effective Date (ACP)", "Eff Date (AOC I)", "Eff Date (ACP)") if c in df.columns), None)
+    if eff_acp_col:
+        m &= pd.to_datetime(df[eff_acp_col], errors="coerce").dt.strftime("%Y-%m-%d").eq("2022-08-22")
+    pl_acp_col = next((c for c in ("Pledge Date (ACP)", "Pledge Date (AOC I)", "Pledge Date (ACP)") if c in df.columns), None)
+    if pl_acp_col:
+        m &= pd.to_datetime(df[pl_acp_col], errors="coerce").dt.strftime("%Y-%m-%d").eq("2023-08-31")
+    src_col = next((c for c in ("Source Type (ACORE)", "Source") if c in df.columns), None)
+    if src_col:
+        m &= df[src_col].fillna("").astype(str).str.lower().str.contains(r"\bsale\b", regex=True, na=False)
+    return m
+
+
+def _target_22203_stage_rows(stage: str, df: pd.DataFrame) -> list[dict[str, object]]:
+    out_cols = [
+        "Stage",
+        "Row Count Found",
+        "Deal ID",
+        "Deal Name",
+        "Source Type (ACORE)",
+        "File Source",
+        "Eff Date (AOC I)",
+        "Eff Date (M61)",
+        "Pledge Date (AOC I)",
+        "Pledge Date (M61)",
+        "Adv Rate (M61)",
+        "Spread (M61)",
+        "Index Floor (M61)",
+    ]
+    if df is None or df.empty:
+        return [{c: (stage if c == "Stage" else (0 if c == "Row Count Found" else "")) for c in out_cols}]
+    mask = _target_22203_mask_ui(df)
+    hit = df.loc[mask].copy()
+    if hit.empty:
+        return [{c: (stage if c == "Stage" else (0 if c == "Row Count Found" else "")) for c in out_cols}]
+
+    def _pick(rr: pd.Series, *keys: str):
+        for k in keys:
+            if k in rr.index and pd.notna(rr.get(k)):
+                return rr.get(k)
+        return ""
+
+    rows = []
+    cnt = int(len(hit))
+    for _, rr in hit.iterrows():
+        rows.append(
+            {
+                "Stage": stage,
+                "Row Count Found": cnt,
+                "Deal ID": _pick(rr, "Deal ID (ACP)", "Deal ID Match Key (ACP)"),
+                "Deal Name": _pick(rr, "Deal Name"),
+                "Source Type (ACORE)": _pick(rr, "Source Type (ACORE)", "Source"),
+                "File Source": _pick(rr, "File Source"),
+                "Eff Date (AOC I)": _pick(rr, "Eff Date (AOC I)", "Eff Date (ACP)", "Effective Date (ACP)"),
+                "Eff Date (M61)": _pick(rr, "Eff Date (M61)", "Effective Date (M61)"),
+                "Pledge Date (AOC I)": _pick(rr, "Pledge Date (AOC I)", "Pledge Date (ACP)"),
+                "Pledge Date (M61)": _pick(rr, "Pledge Date (M61)"),
+                "Adv Rate (M61)": _pick(rr, "Adv Rate (M61)", "Advance Rate (M61)"),
+                "Spread (M61)": _pick(rr, "Spread (M61)"),
+                "Index Floor (M61)": _pick(rr, "Index Floor (M61)"),
+            }
+        )
+    return rows
+
+
 # Columns consulted for display-only effective date range filtering (any match → row matches).
 EFF_DATE_DISPLAY_COLUMNS = (
     "Effective Date (ACORE)",
@@ -510,7 +665,7 @@ def filter_display_dataframe_by_effective_dates(
 ) -> pd.DataFrame:
     """Subset rows for UI/export: keep if any known effective-date column falls in [start, end].
 
-    Rows with ``recon_status`` MISMATCH are always kept when that column is present, so
+    Rows with ``recon_status`` mismatch signals are always kept when that column is present, so
     negative-test cases (wrong dates or rates on one side) stay visible even when every
     parseable effective date falls outside the selected display window.
     """
@@ -538,14 +693,40 @@ def filter_display_dataframe_by_effective_dates(
     # Rows with no parseable dates are kept so blanks never hide data unexpectedly.
     keep = any_in_range | (~has_any_parsed)
     if "recon_status" in df.columns:
-        rs = df["recon_status"].astype(str).str.upper().str.strip()
-        keep = keep | rs.eq("MISMATCH")
+        rs_kind = df["recon_status"].map(_recon_status_bucket)
+        keep = keep | rs_kind.eq("MISMATCH")
     return df.loc[keep].copy()
+
+
+def _recon_status_bucket(v: object) -> str:
+    """Map business-facing recon status text to MATCH / MISSING / MISMATCH buckets."""
+    s = "" if v is None else str(v).strip().upper()
+    if not s:
+        return ""
+    # One-sided row — entire record absent from one source.
+    if s.startswith("MISSING IN "):
+        return "MISSING"
+    if "MATCH WITH DIFFERENCES" in s or "DIFFERENCE" in s or "NO MATCH" in s:
+        return "MISMATCH"
+    if "MATCH WITH MISSING FIELDS" in s or "MISSING FIELDS" in s:
+        return "MISSING"
+    # Legacy labels (kept for backward compatibility with older cached results).
+    if s.startswith("MISMATCH"):
+        return "MISMATCH"
+    if s.startswith("INCOMPLETE"):
+        return "MISSING"
+    if s == "MATCH":
+        return "MATCH"
+    if "MISSING" in s:
+        return "MISSING"
+    if "MATCH" in s:
+        return "MATCH"
+    return ""
 
 
 def _mismatch_detail_html(row: pd.Series) -> str:
     """Short drilldown hint for negative testing: why recon_status is MISMATCH (from status columns)."""
-    if str(row.get("recon_status", "")).upper().strip() != "MISMATCH":
+    if _recon_status_bucket(row.get("recon_status", "")) != "MISMATCH":
         return ""
     parts: list[str] = []
     ed = str(row.get("Effective Date Status", "") or "").upper()
@@ -680,26 +861,82 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("## 🔍 Filters")
-    st.caption("Recon status")
+    st.markdown(
+        '<div class="sidebar-subheader-row">'
+        '<span class="sidebar-subheader-inline">Show Records</span>'
+        '<span class="sidebar-subheader-hint" title="Choose which rows appear in the results table. '
+        "Clean Matches are fully aligned records. Records Needing Review groups mismatches, one-sided missing "
+        'records, and incomplete matches — refine with Advanced Review Filters.">ⓘ</span>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
     # Apply M61 note-category default *before* the selectbox is instantiated (same-run safe).
     if st.session_state.pop("recon_pending_m61_note_category_reset", False):
         st.session_state["recon_m61_note_category"] = "Financing"
 
     if st.session_state.pop("reset_status_filters", False):
-        st.session_state["filter_status_match"] = True
-        st.session_state["filter_status_missing"] = True
-        st.session_state["filter_status_mismatch"] = True
-    if "filter_status_match" not in st.session_state:
-        st.session_state["filter_status_match"] = True
-    if "filter_status_missing" not in st.session_state:
-        st.session_state["filter_status_missing"] = True
-    if "filter_status_mismatch" not in st.session_state:
-        st.session_state["filter_status_mismatch"] = True
+        st.session_state["filter_needs_review_bundle"] = True
+        st.session_state["filter_review_clean_matches"] = False
+        st.session_state["filter_review_missing_fields"] = True
+        st.session_state["filter_review_differences"] = True
+        st.session_state["filter_review_missing_m61"] = True
+        st.session_state["filter_review_missing_acore"] = True
+    if "filter_needs_review_bundle" not in st.session_state:
+        st.session_state["filter_needs_review_bundle"] = True
+    if "filter_review_clean_matches" not in st.session_state:
+        st.session_state["filter_review_clean_matches"] = False
+    if "filter_review_missing_fields" not in st.session_state:
+        st.session_state["filter_review_missing_fields"] = True
+    if "filter_review_differences" not in st.session_state:
+        st.session_state["filter_review_differences"] = True
+    if "filter_review_missing_m61" not in st.session_state:
+        st.session_state["filter_review_missing_m61"] = True
+    if "filter_review_missing_acore" not in st.session_state:
+        st.session_state["filter_review_missing_acore"] = True
+    st.checkbox(
+        "Clean Matches",
+        key="filter_review_clean_matches",
+        help="Include rows that are a clean **MATCH** (fully aligned between ACORE and M61).",
+    )
+    st.checkbox(
+        "Records Needing Review",
+        key="filter_needs_review_bundle",
+        help=(
+            "Include rows that typically need follow-up: mismatches, missing on M61 or ACORE, "
+            "or incomplete / one-sided missing fields. Use **Advanced Review Filters** to narrow."
+        ),
+    )
+    with st.expander("Advanced Review Filters", expanded=False):
+        st.caption(
+            "Applies when **Records Needing Review** is checked. Same row categories as before — "
+            "only organized here for clarity."
+        )
+        st.checkbox(
+            "Mismatches",
+            key="filter_review_differences",
+            help="Value differences and field-level mismatches.",
+        )
+        st.checkbox(
+            "Missing in M61",
+            key="filter_review_missing_m61",
+            help="ACORE-side rows with no matching M61 record.",
+        )
+        st.checkbox(
+            "Missing in ACORE",
+            key="filter_review_missing_acore",
+            help="Rows present in M61 but not in ACORE (M61-only lines).",
+        )
+        st.checkbox(
+            "Incomplete (one-sided missing)",
+            key="filter_review_missing_fields",
+            help="Matched rows with missing fields on one side.",
+        )
 
-    st.checkbox("Match", key="filter_status_match")
-    st.checkbox("Missing", key="filter_status_missing")
-    st.checkbox("Mismatch", key="filter_status_mismatch")
+    st.markdown(
+        '<div class="sidebar-section-gap" aria-hidden="true"></div>',
+        unsafe_allow_html=True,
+    )
 
     # Developer / debug UI hidden from finance users — uncomment to expose full-M61 reconciliation toggle.
     # with st.expander("Developer / debug", expanded=False):
@@ -735,10 +972,15 @@ with st.sidebar:
     if scope_toggle_needed:
         _scope_label_all = "All Results for Uploaded Primary Fund"
         _scope_label_fund = "Selected Primary Fund Only"
+        st.markdown(
+            '<div class="sidebar-subheader sidebar-subheader--after-gap">Scope</div>',
+            unsafe_allow_html=True,
+        )
         _scope_choice = st.radio(
             "Scope",
             [_scope_label_all, _scope_label_fund],
             index=1,
+            label_visibility="collapsed",
             help=(
                 f"**{_scope_label_all}:** All records for **{scope_label_for_primary_type(primary_file_type)}** "
                 "in this run, including lines that appear only on the comparison export. "
@@ -747,9 +989,10 @@ with st.sidebar:
             ),
         )
         st.caption(
-            f"Both stay on **{scope_label_for_primary_type(primary_file_type)}**. "
-            f"**{_scope_label_all}** is the full picture. **{_scope_label_fund}:** Shows ACORE records for this fund "
-            "and their matches in M61. M61-only rows are hidden."
+            "All Results shows the full reconciliation output for the uploaded primary fund, "
+            "including related M61-only records. "
+            f"Selected Primary Fund Only focuses on records tied to the uploaded "
+            f"**{scope_label_for_primary_type(primary_file_type)}** fund and hides unrelated M61-only rows."
         )
         scope_mode = (
             "Selected Fund Only"
@@ -767,18 +1010,28 @@ with st.sidebar:
                 f"Everything here is already for **{scope_label_for_primary_type(primary_file_type)}** only."
             )
 
+    st.markdown(
+        '<div class="sidebar-section-gap" aria-hidden="true"></div>',
+        unsafe_allow_html=True,
+    )
+
     _note_options = ["All", "Financing", "Subline", "Other"]
     if "recon_m61_note_category" not in st.session_state:
         st.session_state["recon_m61_note_category"] = "Financing"
     if st.session_state.get("recon_m61_note_category") not in _note_options:
         st.session_state["recon_m61_note_category"] = "All"
+    st.markdown(
+        '<div class="sidebar-subheader sidebar-subheader--after-gap">M61 Note Category</div>',
+        unsafe_allow_html=True,
+    )
     st.selectbox(
         "M61 Note Category",
         options=_note_options,
         key="recon_m61_note_category",
+        label_visibility="collapsed",
         help=(
-            "Filters the **displayed** table, metrics, drilldown, and downloads together with **Scope** "
-            "and **More filters / Advanced filters → Effective date**. "
+            "Filters the **displayed** table, drilldown, and downloads together with **Scope**, "
+            "**Show Records**, and **More filters / Advanced filters → Effective date**. "
             "Values come from row-level **M61 Note Category**. "
             "Choose **All** to show every category."
         ),
@@ -870,6 +1123,13 @@ def pill(status):
         return f'<span class="pill pill-match">✓ {status}</span>'
     if "MISMATCH" in su or "DIFFERENT" in su or "NO MATCH" in su:
         return f'<span class="pill pill-mismatch">✗ {status}</span>'
+    if su.startswith("INCOMPLETE"):
+        # One-sided missing fields only — amber, same weight as MISSING.
+        return f'<span class="pill pill-incomplete">⚠ {status}</span>'
+    # MISSING FROM BOTH = absent on both sides, not a real issue — render muted, not amber.
+    # Must be checked before the general MISSING branch.
+    if "MISSING FROM BOTH" in su:
+        return f'<span class="pill pill-na">— {status}</span>'
     if "MISSING" in su:
         return f'<span class="pill pill-missing">⚠ {status}</span>'
     return f'<span class="pill pill-na">{status}</span>'
@@ -1285,13 +1545,13 @@ if "df_recon" in st.session_state:
     # Disabled: Backend vs UI row-count expander (was ACORE / AOC II only).
     # _td_active = run_primary in ("ACORE", "AOC II")
     _td_active = False
-    _td_after_scope = df_view.copy() if _td_active else None
+    _td_after_scope = df_view.copy()
 
     # Deal filter is applied after scope (on the scoped/unscoped base view).
     if deal_pick and deal_pick != "All deals":
         df_view = df_view[df_view["Deal Name"] == deal_pick]
     # TEMP DEBUG snapshot — after deal filter
-    _td_after_deal = df_view.copy() if _td_active else None
+    _td_after_deal = df_view.copy()
 
     # Effective date range (display-only; sidebar Advanced filters). Applied before note category / metrics.
     _eff_preset = str(st.session_state.get("recon_eff_date_preset") or "All dates").strip()
@@ -1348,23 +1608,67 @@ if "df_recon" in st.session_state:
                     height=min(240, 40 + 28 * max(len(_vc_note), 1)),
                 )
     # TEMP DEBUG snapshot — after note category filter
-    _td_after_note_cat = df_view.copy() if _td_active else None
+    _td_after_note_cat = df_view.copy()
 
-    # Apply status filters on the current view.
-    status_filter = []
-    if st.session_state.get("filter_status_match", True):
-        status_filter.append("MATCH")
-    if st.session_state.get("filter_status_missing", True):
-        status_filter.append("MISSING")
-    if st.session_state.get("filter_status_mismatch", True):
-        status_filter.append("MISMATCH")
-    if status_filter:
-        df_view = df_view[df_view["recon_status"].isin(status_filter)]
+    # Apply status filters on the current view (same categories as before; gated by Show Records UI).
+    review_filter = []
+    if st.session_state.get("filter_review_clean_matches", False):
+        review_filter.append("Clean Matches")
+    _needs_bundle_on = st.session_state.get("filter_needs_review_bundle", True)
+    if _needs_bundle_on:
+        if st.session_state.get("filter_review_missing_fields", True):
+            review_filter.append("Matches with Missing Fields")
+        if st.session_state.get("filter_review_differences", True):
+            review_filter.append("Differences / Mismatches")
+        if st.session_state.get("filter_review_missing_m61", True):
+            review_filter.append("Missing in M61")
+        if st.session_state.get("filter_review_missing_acore", True):
+            review_filter.append("Missing in ACORE")
+    if review_filter:
+        rs_upper = (
+            df_view["recon_status"].fillna("").astype(str).str.upper().str.strip()
+            if "recon_status" in df_view.columns
+            else pd.Series([""] * len(df_view), index=df_view.index, dtype="object")
+        )
+        fs = (
+            df_view["File Source"].fillna("").astype(str).str.strip()
+            if "File Source" in df_view.columns
+            else pd.Series([""] * len(df_view), index=df_view.index, dtype="object")
+        )
+        mask = pd.Series(False, index=df_view.index)
+        # Field-level status columns used for "Differences / Mismatches" grouping.
+        _field_status_cols = [
+            "Advance Rate Status",
+            "Spread Status",
+            "Effective Date Status",
+            "Undrawn Capacity Status",
+            "Index Floor Status",
+            "Index Name Status",
+            "Recourse % Status",
+            "Pledge Date Status",
+        ]
+        _has_field_mismatch = pd.Series(False, index=df_view.index)
+        for _c in _field_status_cols:
+            if _c in df_view.columns:
+                _has_field_mismatch |= (
+                    df_view[_c].fillna("").astype(str).str.upper().str.contains("MISMATCH", regex=False, na=False)
+                )
+        if "Clean Matches" in review_filter:
+            mask |= rs_upper.eq("MATCH")
+        if "Matches with Missing Fields" in review_filter:
+            mask |= rs_upper.str.contains("MATCH WITH MISSING FIELDS", regex=False, na=False)
+        if "Differences / Mismatches" in review_filter:
+            mask |= rs_upper.str.contains("MATCH WITH DIFFERENCES", regex=False, na=False) | _has_field_mismatch
+        if "Missing in M61" in review_filter:
+            mask |= rs_upper.str.contains("MISSING IN M61", regex=False, na=False) | fs.eq(FILE_SOURCE_ACORE_ONLY)
+        if "Missing in ACORE" in review_filter:
+            mask |= rs_upper.str.contains("MISSING IN ACORE", regex=False, na=False) | fs.eq(FILE_SOURCE_M61_ONLY)
+        df_view = df_view.loc[mask].copy()
     else:
         df_view = df_view.iloc[0:0]
     _after_status_filter = len(df_view)
     # TEMP DEBUG snapshot — after status filter
-    _td_after_status = df_view.copy() if _td_active else None
+    _td_after_status = df_view.copy()
 
     # For selected primary types: when Note Category is not All, drop M61-only rows (same as prior default
     # with the removed "Show M61-only exceptions" checkbox always off).
@@ -1379,7 +1683,7 @@ if "df_recon" in st.session_state:
             if _hidden > 0:
                 st.caption(f"Hidden M61-only exceptions: {_hidden}")
         # TEMP DEBUG snapshot — after M61-only hide
-        _td_after_m61_hide = df_view.copy() if _td_active else None
+        _td_after_m61_hide = df_view.copy()
 
     _displayed_rows_final = len(df_view)
     _note_cat_m61_only_hidden_hint = (
@@ -1392,6 +1696,14 @@ if "df_recon" in st.session_state:
 
     # Avoid showing non-contiguous / upstream row positions in the index column (confused with deal IDs).
     df_view = df_view.reset_index(drop=True)
+    _target_tracking_rows: list[dict[str, object]] = []
+    _diag_target = st.session_state.get("recon_row_counts", {}) or {}
+    _s1 = pd.DataFrame(_diag_target.get("target_22203_stage1_rows", []) or [])
+    _s2 = pd.DataFrame(_diag_target.get("target_22203_stage2_rows", []) or [])
+    _target_tracking_rows.extend(_target_22203_stage_rows("1. after reconciliation output", _s1))
+    _target_tracking_rows.extend(_target_22203_stage_rows("2. after related-M61 enhancement", _s2))
+    _target_tracking_rows.extend(_target_22203_stage_rows("3. after scope filter", _td_after_scope if _td_after_scope is not None else df_view))
+    _target_tracking_rows.extend(_target_22203_stage_rows("4. after Show Records filter", _td_after_status if _td_after_status is not None else df_view))
 
     if False and run_primary == "ACORE":
         diag_counts = st.session_state.get("recon_row_counts", {}) or {}
@@ -1542,59 +1854,71 @@ if "df_recon" in st.session_state:
     if False:  # validation block hidden
         pass
  
-    # ---- Metric cards ----
-    total    = len(df_view)
-    n_match  = (df_view["recon_status"] == "MATCH").sum()
-    n_miss   = (df_view["recon_status"] == "MISSING").sum()
-    n_mismatch = (df_view["recon_status"] == "MISMATCH").sum()
-    match_rate = (n_match / total * 100) if total else 0
- 
+    # ---- Metric cards (ACORE-primary interpretation; excludes M61-only rows) ----
+    if "File Source" in df_all.columns:
+        _fs_dash = df_all["File Source"].fillna("").astype(str).str.strip()
+        df_dash_acore = df_all.loc[_fs_dash.isin([FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY])].copy()
+    else:
+        df_dash_acore = df_all.copy()
+
+    n_total_acore = int(len(df_dash_acore))
+    if n_total_acore and "recon_status" in df_dash_acore.columns:
+        _fs_ac = df_dash_acore["File Source"].fillna("").astype(str).str.strip()
+        _rs_ac = df_dash_acore["recon_status"].fillna("").astype(str).str.strip().str.upper()
+        _m_missing_m61 = _fs_ac.eq(FILE_SOURCE_ACORE_ONLY) | _rs_ac.str.contains(
+            "MISSING IN M61", regex=False, na=False
+        )
+        _m_clean_match = _rs_ac.eq("MATCH")
+        n_missing_m61_dash = int(_m_missing_m61.sum())
+        n_match_dash = int((~_m_missing_m61 & _m_clean_match).sum())
+        n_needs_review_dash = int((~_m_missing_m61 & ~_m_clean_match).sum())
+        match_rate_acore = (n_match_dash / n_total_acore * 100) if n_total_acore else 0.0
+    else:
+        n_missing_m61_dash = 0
+        n_match_dash = 0
+        n_needs_review_dash = 0
+        match_rate_acore = 0.0
+
+    match_subtitle = f"{match_rate_acore:.0f}% of ACORE records fully match"
+    needs_subtitle = "Mismatches, incomplete fields, or other review (paired rows)"
+    miss_m61_subtitle = "ACORE rows with no M61 match"
+
+    st.caption(
+        "Table reflects your **Show Records** filter, deal, dates, and note category. "
+        f"**{len(df_view)}** row(s) in the current view."
+    )
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(f"""
         <div class="metric-card mc-total">
-          <div class="label">Total Records</div>
-          <div class="value">{total}</div>
-          <div class="sub">Rows in current view</div>
+          <div class="label">Total ACORE Records</div>
+          <div class="value">{n_total_acore}</div>
+          <div class="sub">Rows tied to ACORE (excl. M61-only)</div>
         </div>""", unsafe_allow_html=True)
     with c2:
         st.markdown(f"""
         <div class="metric-card mc-match">
-          <div class="label">✓ Match</div>
-          <div class="value">{n_match}</div>
-          <div class="sub">{match_rate:.0f}% of records match</div>
+          <div class="label">✓ Matches</div>
+          <div class="value">{n_match_dash}</div>
+          <div class="sub">{match_subtitle}</div>
         </div>""", unsafe_allow_html=True)
     with c3:
         st.markdown(f"""
-        <div class="metric-card mc-missing">
-          <div class="label">⚠ Missing</div>
-          <div class="value">{n_miss}</div>
-          <div class="sub">Missing from M61</div>
+        <div class="metric-card mc-needs">
+          <div class="label">⚠ Needs Review</div>
+          <div class="value">{n_needs_review_dash}</div>
+          <div class="sub">{needs_subtitle}</div>
         </div>""", unsafe_allow_html=True)
     with c4:
         st.markdown(f"""
-        <div class="metric-card mc-mismatch">
-          <div class="label">✗ Mismatch</div>
-          <div class="value">{n_mismatch}</div>
-          <div class="sub">Values do not match</div>
+        <div class="metric-card mc-missing">
+          <div class="label">○ Missing in M61</div>
+          <div class="value">{n_missing_m61_dash}</div>
+          <div class="sub">{miss_m61_subtitle}</div>
         </div>""", unsafe_allow_html=True)
 
-    adv_src_vals = []
-    if "Advance Rate Source (M61)" in df_view.columns:
-        adv_src_vals = sorted(
-            {
-                str(v).strip()
-                for v in df_view["Advance Rate Source (M61)"].fillna("").astype(str).tolist()
-                if str(v).strip()
-            }
-        )
-    if not adv_src_vals:
-        adv_src_note = "Target Advance Rate"
-    elif len(adv_src_vals) == 1:
-        adv_src_note = adv_src_vals[0]
-    else:
-        adv_src_note = "Mixed (" + ", ".join(adv_src_vals) + ")"
-    st.caption(f"Advance Rate source: {adv_src_note}")
+    st.caption("Metrics based on ACORE (primary file)")
 
     # Debug expanders intentionally hidden in normal UI.
 
@@ -1776,7 +2100,7 @@ if "df_recon" in st.session_state:
                 f"Scope: **{_scope_mode_display(scope_mode, _debug_full)}** | "
                 f"Deal: **{deal_pick}** | "
                 f"Note Category: **{_note_pick}** | "
-                f"Status: **{status_filter}**"
+                f"Show Records: **{review_filter}**"
             )
     # ---- END TEMP DEBUG ----
 
@@ -1828,13 +2152,35 @@ if "df_recon" in st.session_state:
                         s, primary_scope_label=primary_missing_scope_lbl
                     )
 
+                def _m61_missing_by_status(status_col: str) -> bool:
+                    if status_col not in row.index:
+                        return False
+                    s = str(row.get(status_col, "") or "").strip().upper()
+                    return ("MISSING FROM M61" in s) or ("MISSING FROM BOTH" in s)
+
                 rec = {
                     "Fund": "" if pd.isna(row.get("Fund")) else str(row.get("Fund")),
                     "Deal Name": row.get("Deal Name", ""),
                     "Facility": row.get("Facility", ""),
                     "Financial Line": row.get("Financial Line", ""),
                     "Source Type (ACORE)": row.get("Source", ""),
-                    "Liability Type (M61)": derive_liability_type_for_filter(row),
+                    "Liability Type (M61)": (
+                        (
+                            str(row.get("Liability Type (M61 Raw)") or "").strip()
+                            if pd.notna(row.get("Liability Type (M61 Raw)"))
+                            else ""
+                        )
+                        or (
+                            str(row.get("Liability Type (M61)") or "").strip()
+                            if pd.notna(row.get("Liability Type (M61)"))
+                            else ""
+                        )
+                        or (
+                            str(row.get("Liability Type") or "").strip()
+                            if pd.notna(row.get("Liability Type"))
+                            else ""
+                        )
+                    ),
                     "M61 Note Category": str(row.get("M61 Note Category") or "Other"),
                     f"Eff Date ({col_tag})": fmt_date(ed_acp),
                     "Eff Date (M61)": fmt_date(row.get("Effective Date (M61)")),
@@ -1843,25 +2189,35 @@ if "df_recon" in st.session_state:
                     ),
                     "Pledge Date (M61)": fmt_date(row.get("Pledge Date (M61)")),
                     f"Adv Rate ({col_tag})": pct(adv_acp),
-                    "Adv Rate (M61)": pct(row.get("Advance Rate (M61)")),
+                    "Adv Rate (M61)": (
+                        "—" if _m61_missing_by_status("Advance Rate Status") else pct(row.get("Advance Rate (M61)"))
+                    ),
                     f"Spread ({col_tag})": pct(sp_acp),
-                    "Spread (M61)": pct(row.get("Spread (M61)")),
+                    "Spread (M61)": (
+                        "—" if _m61_missing_by_status("Spread Status") else pct(row.get("Spread (M61)"))
+                    ),
                     f"Undrawn ({col_tag})": fmt_num_plain(und_acp),
-                    "Undrawn (M61)": fmt_num_plain(und_liab),
+                    "Undrawn (M61)": (
+                        "—" if _m61_missing_by_status("Undrawn Capacity Status") else fmt_num_plain(und_liab)
+                    ),
                     f"Index Floor ({col_tag})": fmt_fraction_as_pct(
                         row.get("Index Floor (ACP)"), ndigits=3
                     ),
-                    "Index Floor (M61)": fmt_fraction_as_pct(
-                        row.get("Index Floor (M61)"), ndigits=3
+                    "Index Floor (M61)": (
+                        "—"
+                        if _m61_missing_by_status("Index Floor Status")
+                        else fmt_fraction_as_pct(row.get("Index Floor (M61)"), ndigits=3)
                     ),
                     f"Index Name ({col_tag})": fmt_opt_text(row.get("Index Name (ACP)")),
                     "Index Name (M61)": fmt_opt_text(row.get("Index Name (M61)")),
                     f"Recourse % ({col_tag})": pct(row.get("Recourse % (ACP)")),
-                    "Recourse % (M61)": pct(row.get("Recourse % (M61)")),
+                    "Recourse % (M61)": (
+                        "—" if _m61_missing_by_status("Recourse % Status") else pct(row.get("Recourse % (M61)"))
+                    ),
                     "File Source": _display_file_source_cell(row),
                     "Effective Date Status": _status_display(row.get("Effective Date Status", "")),
                     "Pledge Date Status": _status_display(row.get("Pledge Date Status", "")),
-                    "Adv Rate Status": _status_display(row.get("Advance Rate Status", "")),
+                    "Advance Rate Status": _status_display(row.get("Advance Rate Status", "")),
                     "Spread Status": _status_display(row.get("Spread Status", "")),
                     "Undrawn Capacity Status": _status_display(
                         row.get("Undrawn Capacity Status", "")
@@ -1869,8 +2225,25 @@ if "df_recon" in st.session_state:
                     "Index Floor Status": _status_display(row.get("Index Floor Status", "")),
                     "Index Name Status": _status_display(row.get("Index Name Status", "")),
                     "Recourse % Status": _status_display(row.get("Recourse % Status", "")),
-                    "Recon Status": _status_display(row.get("recon_status", "")),
+                    # Keep full business-friendly recon summary text (no bucket/missing remap here).
+                    "Overall Recon Status": (
+                        ""
+                        if pd.isna(row.get("recon_status"))
+                        else str(row.get("recon_status", "")).strip()
+                    ),
                 }
+                _is_target_ui = (
+                    str(row.get("Deal Name") or "").strip().lower() == "block 21 san mateo"
+                    and str(row.get("Facility") or "").strip().lower() == "tbk bank"
+                    and str(row.get("Source") or "").strip().lower() == "sale"
+                    and _date_key_ui(row.get("Effective Date (ACP)")) == "2022-08-22"
+                )
+                if _is_target_ui:
+                    print(
+                        "UNDRAWN TRACE 5 (after UI formatting): "
+                        f"raw_undrawn_m61={und_liab!r} "
+                        f"formatted_undrawn_m61={rec.get('Undrawn (M61)')!r}"
+                    )
                 display_rows.append(rec)
 
             df_display = pd.DataFrame(display_rows).reset_index(drop=True)
@@ -2083,7 +2456,8 @@ if "df_recon" in st.session_state:
                                         if str(v).strip()
                                     }
                                 )
-                                base_key = f"recon_tbl_primary_ms_{re.sub(r'\\W+', '_', fc)}_{col_tag}"
+                                _fc_safe = re.sub(r'\W+', '_', fc)
+                                base_key = f"recon_tbl_primary_ms_{_fc_safe}_{col_tag}"
                                 if fc == "Fund" and scope_mode == "Selected Fund Only":
                                     ms_key = f"{base_key}_auto_scope"
                                     if auto_fund_value and auto_fund_value in opts:
@@ -2164,6 +2538,9 @@ if "df_recon" in st.session_state:
                     n_before = len(df_table)
                     if n_after != n_before:
                         st.caption(f"Table filters: showing **{n_after}** of **{n_before}** row(s).")
+            _target_tracking_rows.extend(
+                _target_22203_stage_rows("5. after table filters", df_table_view)
+            )
 
             if not visible_cols and not df_display.empty:
                 st.info(
@@ -2185,45 +2562,62 @@ if "df_recon" in st.session_state:
                 v = str(val).strip().upper()
                 if v in ("N/A", "", "—", "-", "NAN", "NONE"):
                     return ""
-                if "DIFFERENT" in v or "MISMATCH" in v or "NO MATCH" in v:
+                # MISSING FROM BOTH = absent on both sides, not a real issue — render muted/gray.
+                # Must be checked before the general MISSING branch.
+                if "MISSING FROM BOTH" in v:
+                    return "background-color: #f0f0f0; color: #aaaaaa; font-style: italic;"
+                if "DIFFERENCE" in v or "DIFFERENT" in v or "MISMATCH" in v or "NO MATCH" in v:
                     return "background-color: #ffc7ce; color: #9c0006; font-weight: 600;"
-                if "MATCH" in v and "MIS" not in v:
-                    return "background-color: #c6efce; color: #375623; font-weight: 600;"
                 if "MISSING" in v:
                     return "background-color: #ffeb9c; color: #7d6608; font-weight: 600;"
+                if "MATCH" in v and "MIS" not in v:
+                    return "background-color: #c6efce; color: #375623; font-weight: 600;"
                 return ""
 
-            # Single ordered list: Spread Status is the reference column; all share identical UI.
+            # Single ordered list driving column visibility + styling.
+            # Order: File Source → field-level statuses → Overall Recon Status (summary last).
             status_cols = [
                 "File Source",
                 "Effective Date Status",
                 "Pledge Date Status",
-                "Adv Rate Status",
+                "Advance Rate Status",
                 "Spread Status",
                 "Undrawn Capacity Status",
                 "Index Floor Status",
                 "Index Name Status",
                 "Recourse % Status",
-                "Recon Status",
+                "Overall Recon Status",
             ]
             status_cols_visible = [c for c in status_cols if c in df_table_view.columns]
 
             # Same Streamlit width + Styler box for every status column; shorter header label
             # for Undrawn only so the column is not widened by a long title vs. peers.
             def _status_column_config(col_name: str):
-                if col_name == "Undrawn Capacity Status":
+                if col_name == "Overall Recon Status":
                     return st.column_config.TextColumn(
-                        "Status",
-                        width="medium",
-                        help="Undrawn Capacity Status",
+                        width="large",
+                        help="Business summary of matched fields, differences, and missing fields.",
                     )
+                if col_name == "File Source":
+                    return st.column_config.TextColumn(width="medium")
+                if col_name in (
+                    "Effective Date Status",
+                    "Pledge Date Status",
+                    "Advance Rate Status",
+                    "Spread Status",
+                    "Undrawn Capacity Status",
+                    "Index Floor Status",
+                    "Index Name Status",
+                    "Recourse % Status",
+                ):
+                    return st.column_config.TextColumn(width="medium")
                 return st.column_config.TextColumn(width="medium")
 
             _status_col_cfg = {
                 c: _status_column_config(c)
                 for c in df_table_view.columns
                 if isinstance(c, str)
-                and (c.endswith(" Status") or c in ("Recon Status", "File Source"))
+                and (c.endswith(" Status") or c in ("Overall Recon Status", "File Source"))
             }
 
             if df_table_view.empty:
@@ -2254,10 +2648,13 @@ if "df_recon" in st.session_state:
             }
             if _status_col_cfg:
                 _df_kwargs["column_config"] = _status_col_cfg
+            _target_tracking_rows.extend(
+                _target_22203_stage_rows("6. final displayed dataframe", df_table_view)
+            )
             st.caption(
-                "ℹ️ M61 files may contain repeated historical rows for the same liability. "
-                "The reconciliation view shows the most recent matched record; "
-                "earlier history rows that don't represent a meaningful date or field change are collapsed."
+                "ℹ️ M61 may include repeated historical rows for the same liability. "
+                "This view keeps the most relevant current record and collapses older rows "
+                "that do not change the reconciliation result."
             )
             _table_sel = st.dataframe(
                 styled,
@@ -2287,6 +2684,8 @@ if "df_recon" in st.session_state:
                 df_export_ui = df_view.iloc[0:0].copy()
             else:
                 df_export_ui = df_view.loc[df_table_view.index].copy()
+
+            # Spread MISMATCH diagnostic expander removed after percent-normalized Spread Status compare.
 
     with tab2:
         st.markdown('<div class="section-label">Deal Drilldown</div>', unsafe_allow_html=True)
@@ -2326,8 +2725,12 @@ if "df_recon" in st.session_state:
             """, unsafe_allow_html=True)
  
             for _, row in deal_rows.iterrows():
-                recon = str(row.get("recon_status", "")).upper()
-                border_color = "#4caf50" if "MATCH" in recon and "MIS" not in recon else ("#f44336" if "MISMATCH" in recon else "#ffc107")
+                recon_bucket = _recon_status_bucket(row.get("recon_status", ""))
+                border_color = (
+                    "#4caf50"
+                    if recon_bucket == "MATCH"
+                    else ("#f44336" if recon_bucket == "MISMATCH" else "#ffc107")
+                )
                 ed_acp = _col(row, "Effective Date (ACP)", "Effective Date")
                 adv_acp = _col(row, "Advance Rate (ACP)", "Advance Rate")
                 sp_acp = _col(row, "Spread (ACP)", "Spread")
@@ -2457,29 +2860,33 @@ if "df_recon" in st.session_state:
                     dkey = did or mid
                     eff_acp_key = _date_key_ui(row.get("Effective Date (ACP)"))
                     eff_m61_key = _date_key_ui(row.get("Effective Date (M61)"))
-                    eff_key = eff_acp_key or eff_m61_key
                     note = str(row.get("Liability Note (M61)") or "").strip()
 
                     st.caption(
-                        "Underlying source rows (same reconciliation keys): "
-                        f"deal_id_key={dkey or '—'}, effective_date_key={eff_key or '—'}, "
+                        "Underlying source rows: "
+                        f"deal_id_key={dkey or '—'}, "
+                        f"ACORE effective_date_key={eff_acp_key or '—'}, "
+                        f"M61 effective_date_key (from this recon row)={eff_m61_key or '—'}, "
                         f"liability_note={note or '—'}"
                     )
                     st.caption(
-                        "Rows with the same Linked Match label are connected by the reconciliation keys. "
-                        "This helps show which ACORE row relates to which M61 row."
+                        "ACORE table: filtered by deal ID + **ACORE** effective date. "
+                        "M61 table: **all** liability lines for this deal ID (each row keeps its own M61 Effective Date / "
+                        "effective_date_key — not overwritten by ACORE)."
                     )
-                    st.caption("Keys used: Deal ID, Effective Date, Liability Note when available.")
+                    st.caption(
+                        "Linked Match groups rows that share the same deal id + effective-date key on each side."
+                    )
 
                     b_hit = pd.DataFrame()
                     a_hit = pd.DataFrame()
                     if isinstance(df_b_ctx, pd.DataFrame) and not df_b_ctx.empty:
                         b = df_b_ctx.copy()
                         mask_b = pd.Series(False, index=b.index)
-                        if dkey and "acp_match_key" in b.columns and eff_key and "effective_date_key" in b.columns:
+                        if dkey and "acp_match_key" in b.columns and eff_acp_key and "effective_date_key" in b.columns:
                             mask_b = b["acp_match_key"].fillna("").astype(str).eq(dkey) & b[
                                 "effective_date_key"
-                            ].fillna("").astype(str).eq(eff_key)
+                            ].fillna("").astype(str).eq(eff_acp_key)
                         elif dkey and "acp_match_key" in b.columns:
                             mask_b = b["acp_match_key"].fillna("").astype(str).eq(dkey)
                         b_hit = b.loc[mask_b].copy()
@@ -2488,16 +2895,13 @@ if "df_recon" in st.session_state:
 
                     if isinstance(df_a_ctx, pd.DataFrame) and not df_a_ctx.empty:
                         a = df_a_ctx.copy()
-                        mask_a = pd.Series(False, index=a.index)
-                        if dkey and "m61_match_key" in a.columns and eff_key and "effective_date_key" in a.columns:
-                            mask_a = a["m61_match_key"].fillna("").astype(str).eq(dkey) & a[
-                                "effective_date_key"
-                            ].fillna("").astype(str).eq(eff_key)
-                        elif dkey and "m61_match_key" in a.columns:
+                        if dkey and "m61_match_key" in a.columns:
+                            # Deal cohort only — do not require M61 effective_date_key to match ACORE (avoids wrong filter).
                             mask_a = a["m61_match_key"].fillna("").astype(str).eq(dkey)
-                        if note and "Liability Note" in a.columns:
-                            mask_note = a["Liability Note"].fillna("").astype(str).str.strip().eq(note)
-                            mask_a = mask_a | mask_note
+                        elif note and "Liability Note" in a.columns:
+                            mask_a = a["Liability Note"].fillna("").astype(str).str.strip().eq(note)
+                        else:
+                            mask_a = pd.Series(False, index=a.index)
                         a_hit = a.loc[mask_a].copy()
                         if a_hit.empty and dkey and "m61_match_key" in a.columns:
                             a_hit = a.loc[a["m61_match_key"].fillna("").astype(str).eq(dkey)].copy()
@@ -2727,11 +3131,43 @@ if "df_recon" in st.session_state:
         )
 
     with col_dl2:
-        csv_data = (
-            df_export_ready.drop(columns=["Target Advance Rate (M61)"], errors="ignore")
-            .to_csv(index=False)
-            .encode("utf-8")
-        )
+        df_csv_export = df_export_ready.drop(
+            columns=["Target Advance Rate (M61)"], errors="ignore"
+        ).copy()
+        if "recon_status" in df_csv_export.columns and "Overall Recon Status" not in df_csv_export.columns:
+            df_csv_export = df_csv_export.rename(columns={"recon_status": "Overall Recon Status"})
+
+        csv_status_cols = [
+            "File Source",
+            "Effective Date Status",
+            "Pledge Date Status",
+            "Advance Rate Status",
+            "Spread Status",
+            "Undrawn Capacity Status",
+            "Index Floor Status",
+            "Index Name Status",
+            "Recourse % Status",
+            "Overall Recon Status",
+        ]
+        for col in csv_status_cols:
+            if col not in df_csv_export.columns:
+                df_csv_export[col] = ""
+
+        # Keep existing column order, but ensure status columns appear in the canonical sequence.
+        base_cols = [c for c in df_csv_export.columns if c not in csv_status_cols]
+        df_csv_export = df_csv_export.loc[:, base_cols + csv_status_cols]
+
+        for c in df_csv_export.columns:
+            cl = str(c).lower()
+            if "date" in cl:
+                df_csv_export[c] = df_csv_export[c].map(
+                    lambda v: "" if pd.isna(v) else fmt_date(v)
+                )
+            elif any(tok in cl for tok in ("rate", "spread", "recourse", "index floor", " floor")):
+                df_csv_export[c] = df_csv_export[c].map(
+                    lambda v: "" if pd.isna(v) else pct(v)
+                )
+        csv_data = df_csv_export.to_csv(index=False).encode("utf-8")
 
         st.download_button(
             label="⬇️ Download CSV",

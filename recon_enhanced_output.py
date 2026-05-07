@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -719,6 +720,759 @@ def _file_source_label_from_sides(*, in_a: bool, in_b: bool) -> str:
     return FILE_SOURCE_M61_ONLY
 
 
+# Temporary: targeted debug for visibility surfacing (TBK / AOCI note / Block 21 San Mateo).
+_RELATED_M61_DEBUG_MARKERS = (
+    "LN_Fin_AOCI_22-2203",
+    "TBK",
+    "block 21",
+    "san mateo",
+)
+
+
+def _acore_row_matches_related_debug_trace(row: pd.Series) -> bool:
+    parts = [
+        str(row.get("Deal Name", "") or ""),
+        str(row.get("Note Name", "") or ""),
+        str(row.get("Facility", "") or ""),
+        str(row.get("Deal ID (ACP)", "") or ""),
+    ]
+    blob = " | ".join(parts).lower()
+    return any(m.lower() in blob for m in _RELATED_M61_DEBUG_MARKERS)
+
+
+def _related_m61_lookup_keys_from_acore_output_row(row: pd.Series) -> list[str]:
+    """Build normalized deal-id keys aligned with ``df_a['m61_match_key']`` (liability note suffix)."""
+    keys: list[str] = []
+
+    def _add_raw(token: object) -> None:
+        if token is None or (isinstance(token, float) and pd.isna(token)):
+            return
+        k = normalise_deal_id_key(str(token).strip())
+        if k and k not in keys:
+            keys.append(k)
+
+    _add_raw(row.get("Deal ID Match Key (ACP)"))
+    _add_raw(row.get("M61 Extracted Deal ID"))
+    nn = row.get("Note Name")
+    _add_raw(extract_deal_id_token(nn))
+    _add_raw(extract_liability_note_suffix(nn))
+    _add_raw(extract_deal_id_token(row.get("Deal ID (ACP)")))
+    # Parsed deal id from Note Name (same rules as M61 LN_Fin_* notes).
+    try:
+        pn = parse_liability_note(nn).get("deal_id") or ""
+    except (TypeError, ValueError):
+        pn = ""
+    _add_raw(pn)
+    return keys
+
+
+def _pick_deal_level_advance_rate(pick: pd.Series):
+    """Deal-level advance chain from an unprefixed M61 liability row (same as ``_m61_deal_level_advance_rate``)."""
+    for col in ("DealLevelAdvanceRate", "Deal Level Advance Rate", "Advance Rate", "Advance"):
+        if col not in pick.index:
+            continue
+        v = pick.get(col)
+        if not _is_blank_for_compare(v):
+            return v
+    return pd.NA
+
+
+def _pick_first_recourse_value(pick: pd.Series):
+    for src in ("Recourse %", "Recourse", "RecoursePct"):
+        if src not in pick.index:
+            continue
+        v = pick.get(src)
+        if _is_blank_for_compare(v):
+            continue
+        return v
+    return pd.NA
+
+
+def _pick_undrawn_capacity(pick: pd.Series):
+    for col in ("Undrawn Capacity", "Current Undrawn Capacity"):
+        if col not in pick.index:
+            continue
+        v = pick.get(col)
+        if not _is_blank_for_compare(v):
+            return v
+    return pd.NA
+
+
+def _m61_spread_raw_from_liab_pick(pick: pd.Series):
+    """Same source as matched rows: ``in_liability_Spread`` / unprefixed ``Spread`` on the liability row (no coercion)."""
+    if "Spread" not in pick.index:
+        return pd.NA
+    return pick.get("Spread")
+
+
+def _m61_index_floor_raw_from_liab_pick(pick: pd.Series):
+    """Same semantics as ``_merged_liab_col(..., 'IndexFloor')`` plus M61 ``Floor`` when IndexFloor is absent."""
+    for col in ("IndexFloor", "Floor"):
+        if col not in pick.index:
+            continue
+        v = pick.get(col)
+        if not _is_blank_for_compare(v):
+            return v
+    return pd.NA
+
+
+def _related_m61_liability_type_rank_for_source(*, acore_source, m61_liability_type) -> tuple[int, str]:
+    """Display-only compatibility rank for related M61 candidate selection.
+
+    For ACORE Sale rows:
+    - 0: explicit Sale/Sold liability types
+    - 1: other financing-like liability types (Repo/Non/CLO/Subline/Whole Loan/Sub Debt)
+    - 2: Fund/Equity
+    - 3: other/blank
+    For non-Sale ACORE sources: all candidates rank equally (0).
+    """
+    src = normalise_text(acore_source)
+    lt = normalise_text(m61_liability_type)
+    is_sale_source = "sale" in src
+    if not is_sale_source:
+        return 0, "acore_source_not_sale"
+
+    if "sale" in lt or "sold" in lt:
+        return 0, "m61_liability_type_sale"
+    financing_tokens = ("repo", "non", "clo", "subline", "whole loan", "wholeloan", "sub debt", "subdebt")
+    if any(tok in lt for tok in financing_tokens):
+        return 1, "m61_liability_type_financing_non_sale"
+    if "fund" in lt or "equity" in lt or "eq" == lt:
+        return 2, "m61_liability_type_fund_or_equity"
+    if not lt:
+        return 3, "m61_liability_type_blank"
+    return 3, "m61_liability_type_other"
+
+
+def _compute_m61_advance_rate_and_source_for_display(
+    *,
+    primary_file_type: str,
+    target_advance_rate,
+    deal_level_advance_rate,
+    use_deal_level_adv: bool,
+) -> tuple[object, object, object]:
+    """Mirror ``reconcile`` Advance Rate (M61) selection for the ``Advance Rate`` compare field.
+
+    Same branches as the main loop: ``SALE_DEALLEVEL_PRIMARY_TYPES`` → normalized deal-level vs target;
+    ``FIN_INPT_PRIMARY_TYPES`` (non–sale-deallevel funds) → target only; else legacy deal-level vs target.
+    """
+    compare_val = pd.NA
+    adv_m61 = pd.NA
+    adv_src: object = pd.NA
+
+    if primary_file_type in SALE_DEALLEVEL_PRIMARY_TYPES:
+        if use_deal_level_adv:
+            compare_val = deal_level_advance_rate
+            adv_m61 = _normalize_aoc_ii_m61_adv_value(compare_val)
+            adv_src = "Deal Level Advance Rate"
+        else:
+            compare_val = target_advance_rate
+            adv_m61 = _normalize_aoc_ii_m61_adv_value(compare_val)
+            adv_src = "Target Advance Rate"
+    elif primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        compare_val = target_advance_rate
+        adv_m61 = compare_val
+        adv_src = "Target Advance Rate"
+    else:
+        if use_deal_level_adv:
+            compare_val = deal_level_advance_rate
+            adv_m61 = compare_val
+            adv_src = "Deal Level Advance Rate"
+        else:
+            compare_val = target_advance_rate
+            adv_m61 = compare_val
+            adv_src = "Target Advance Rate"
+
+    return adv_m61, adv_src, compare_val
+
+
+def _related_m61_display_updates_from_pick(
+    pick: pd.Series,
+    *,
+    primary_file_type: str,
+    out_columns: pd.Index,
+    acore_row: pd.Series | None = None,
+) -> tuple[dict[str, object], list[str], dict[str, object]]:
+    """Map a related ``df_a`` row into M61-side **comparison/display** columns (numeric/date only where appropriate)."""
+    skip_reasons: list[str] = []
+    upd: dict[str, object] = {}
+
+    tgt = pick.get("Target Advance Rate") if "Target Advance Rate" in pick.index else pd.NA
+    cur_adv = pick.get("Current Advance Rate") if "Current Advance Rate" in pick.index else pd.NA
+    dlr = _pick_deal_level_advance_rate(pick)
+
+    if "Target Advance Rate (M61)" in out_columns:
+        upd["Target Advance Rate (M61)"] = tgt
+    if "Current Advance Rate (M61 Raw)" in out_columns:
+        upd["Current Advance Rate (M61 Raw)"] = cur_adv
+    if "Deal Level Advance Rate (M61 Raw)" in out_columns:
+        upd["Deal Level Advance Rate (M61 Raw)"] = dlr
+    if "Raw Target Advance Rate from M61" in out_columns:
+        upd["Raw Target Advance Rate from M61"] = tgt
+    if "Raw Current Advance Rate from M61" in out_columns:
+        upd["Raw Current Advance Rate from M61"] = cur_adv
+    if "Raw Deal Level Advance Rate from M61" in out_columns:
+        upd["Raw Deal Level Advance Rate from M61"] = dlr
+
+    fund_name = pick.get("Fund Name")
+    liab_type = pick.get("Liability Type")
+    use_deal_level_adv = _is_sale_type_fund_or_deal(fund_name=fund_name, liability_type=liab_type)
+
+    adv_m61, adv_src, compare_val = _compute_m61_advance_rate_and_source_for_display(
+        primary_file_type=primary_file_type,
+        target_advance_rate=tgt,
+        deal_level_advance_rate=dlr,
+        use_deal_level_adv=use_deal_level_adv,
+    )
+
+    if primary_file_type in SALE_DEALLEVEL_PRIMARY_TYPES:
+        if use_deal_level_adv:
+            if _is_blank_for_compare(compare_val):
+                skip_reasons.append("advance_rate: deal-level chain blank")
+        else:
+            if _is_blank_for_compare(compare_val):
+                skip_reasons.append("advance_rate: Target Advance Rate blank")
+    elif primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        if _is_blank_for_compare(compare_val):
+            skip_reasons.append("advance_rate: Target Advance Rate blank (Fin Inpt)")
+    else:
+        if use_deal_level_adv:
+            if _is_blank_for_compare(compare_val):
+                skip_reasons.append("advance_rate: deal-level chain blank")
+        else:
+            if _is_blank_for_compare(compare_val):
+                skip_reasons.append("advance_rate: Target Advance Rate blank")
+
+    if _is_blank_for_compare(adv_m61) and not any(
+        x.startswith("advance_rate:") for x in skip_reasons
+    ):
+        skip_reasons.append("advance_rate: resolved Advance Rate (M61) is blank")
+
+    if "Advance Rate (M61)" in out_columns:
+        upd["Advance Rate (M61)"] = adv_m61
+    if "Advance Rate Source (M61)" in out_columns:
+        upd["Advance Rate Source (M61)"] = adv_src if not _is_blank_for_compare(adv_m61) else pd.NA
+    if "Final Advance Rate (M61)" in out_columns:
+        upd["Final Advance Rate (M61)"] = adv_m61
+
+    raw_dlr_col = (
+        pick.get("DealLevelAdvanceRate") if "DealLevelAdvanceRate" in pick.index else pd.NA
+    )
+    ar_meta = {
+        "source_acore": acore_row.get("Source") if acore_row is not None else pd.NA,
+        "m61_target_advance": tgt,
+        "m61_raw_deallevel_advance_rate": raw_dlr_col,
+        "m61_deal_level_chain": dlr,
+        "use_deal_level_adv": use_deal_level_adv,
+        "selected_source": adv_src,
+        "advance_rate_m61": adv_m61,
+    }
+
+    sp_raw = _m61_spread_raw_from_liab_pick(pick)
+    if "Spread (M61)" in out_columns:
+        # Matched rows use raw ``spread_m61`` (see ``record["Spread (M61)"]``); do not coerce here.
+        upd["Spread (M61)"] = pd.NA if _is_blank_for_compare(sp_raw) else sp_raw
+    if _is_blank_for_compare(sp_raw):
+        skip_reasons.append("spread: Spread blank or missing on M61 row")
+
+    ix_floor_raw = _m61_index_floor_raw_from_liab_pick(pick)
+    ix_norm = _normalize_index_floor_value(ix_floor_raw)
+    if "Index Floor (M61)" in out_columns:
+        upd["Index Floor (M61)"] = ix_norm
+    try:
+        ix_na = ix_norm is pd.NA or pd.isna(ix_norm)
+    except (TypeError, ValueError):
+        ix_na = ix_norm is pd.NA
+    if _is_blank_for_compare(ix_floor_raw):
+        skip_reasons.append("index_floor: IndexFloor/Floor blank on M61 row")
+    elif ix_na:
+        skip_reasons.append("index_floor: normalized empty/zero-like")
+
+    ix_nm_out: object = pd.NA
+    if "IndexName" in pick.index:
+        ix_nm_raw = pick.get("IndexName")
+        if ix_nm_raw is None or (isinstance(ix_nm_raw, float) and pd.isna(ix_nm_raw)):
+            ix_nm_out = pd.NA
+            skip_reasons.append("index_name: IndexName blank")
+        else:
+            s = str(ix_nm_raw).strip()
+            if not s:
+                ix_nm_out = pd.NA
+                skip_reasons.append("index_name: whitespace-only")
+            else:
+                ix_nm_out = s
+        if "Index Name (M61)" in out_columns:
+            upd["Index Name (M61)"] = ix_nm_out
+    else:
+        skip_reasons.append("index_name: IndexName column absent on M61 row")
+
+    rc = _pick_first_recourse_value(pick)
+    rc_num = pd.NA
+    if not _is_blank_for_compare(rc):
+        rcc = _coerce_numeric_value(rc)
+        if rcc is None:
+            skip_reasons.append("recourse: not coercible to number (left blank)")
+        else:
+            rc_num = rcc
+    else:
+        skip_reasons.append("recourse: no Recourse % / Recourse / RecoursePct populated")
+    if "Recourse % (M61)" in out_columns:
+        upd["Recourse % (M61)"] = rc_num
+
+    uc = _pick_undrawn_capacity(pick)
+    uc_num = pd.NA
+    if not _is_blank_for_compare(uc):
+        ucc = _coerce_numeric_value(uc)
+        if ucc is None:
+            skip_reasons.append("undrawn: not coercible to number (left blank)")
+        else:
+            uc_num = ucc
+    else:
+        skip_reasons.append("undrawn: Undrawn Capacity / Current Undrawn Capacity blank")
+    if "Undrawn Capacity (M61)" in out_columns:
+        upd["Undrawn Capacity (M61)"] = uc_num
+
+    return upd, skip_reasons, ar_meta
+
+
+def _surface_related_m61_for_acore_only_rows(
+    df_out: pd.DataFrame,
+    df_a: pd.DataFrame,
+    *,
+    paired_row_ids_m61: set[int],
+    primary_file_type: str = "ACORE",
+) -> pd.DataFrame:
+    """Populate M61-facing columns on **ACORE-only** rows from a related ``df_a`` line.
+
+    Candidate pool: all M61 rows sharing the same deal / line keys (matched or unmatched).
+    **Ranking:** (1) liability-type compatibility with ACORE Source, (2) same Pledge Date as the ACORE row
+    (closest pledge-date distance first), (3) earliest M61 Effective Date, (4) unmatched rows preferred
+    over already-paired rows as a final tiebreaker.
+    Values copied from the chosen M61 row only (``Effective Date``, ``Pledge Date``, etc. are not taken from ACORE).
+
+    Does **not** modify pairing, ``recon_status``, ``File Source``, or any ``* Status`` column.
+
+    **Important:** Do not write related M61 text into ``Liability Note (M61)`` — that column feeds
+    ``filter_recon_to_selected_fund`` (note fund_code guard).
+    """
+    n_before = len(df_out) if df_out is not None else 0
+    _debug_rows(f"Related M61 enhancement: row count BEFORE={n_before}")
+
+    if df_out is None or df_out.empty or df_a is None or df_a.empty:
+        _debug_rows(
+            f"Related M61 enhancement: row count AFTER={n_before} removed_or_merged=none "
+            "(skipped: empty df_out or df_a)"
+        )
+        return df_out
+    need = {"m61_match_key", "facility_norm", "effective_date_key", "Effective Date", "_row_id_a"}
+    if not need.issubset(df_a.columns):
+        _debug_rows(
+            "TEMP DEBUG: related M61 surfacing skipped — df_a missing required columns "
+            f"(have={set(df_a.columns)!r})"
+        )
+        _debug_rows(
+            f"Related M61 enhancement: row count AFTER={n_before} removed_or_merged=none "
+            "(skipped: df_a columns)"
+        )
+        return df_out
+    if "File Source" not in df_out.columns:
+        _debug_rows(
+            f"Related M61 enhancement: row count AFTER={n_before} removed_or_merged=none "
+            "(skipped: no File Source)"
+        )
+        return df_out
+
+    ac_mask = df_out["File Source"].eq(FILE_SOURCE_ACORE_ONLY)
+    if not ac_mask.any():
+        _debug_rows(
+            f"Related M61 enhancement: row count AFTER={n_before} removed_or_merged=none "
+            "(skipped: no ACORE-only rows)"
+        )
+        return df_out
+
+    out = df_out.copy()
+
+    n_done = 0
+    for idx in out.index[ac_mask]:
+        row = out.loc[idx]
+        if _acore_row_matches_related_debug_trace(row):
+            _debug_rows(
+                "TEMP DEBUG: related M61 surfacing RECOMPUTE row "
+                f"deal={row.get('Deal Name')!r} eff_acp={row.get('Effective Date (ACP)')!r} "
+                f"existing_eff_m61={row.get('Effective Date (M61)')!r}"
+            )
+
+        keys = _related_m61_lookup_keys_from_acore_output_row(row)
+        dn = normalise_text(row.get("Deal Name") or "")
+        fn_pri = normalise_facility(row.get("Facility"))
+
+        _trace = _acore_row_matches_related_debug_trace(row)
+        if _trace:
+            _debug_rows(
+                "TEMP DEBUG: related M61 surfacing TRACE — ACORE keys="
+                f"{keys!r} deal={row.get('Deal Name')!r} facility={row.get('Facility')!r} "
+                f"note={str(row.get('Note Name') or '')[:120]!r} eff_acp={row.get('Effective Date (ACP)')!r}"
+            )
+
+        def _pool_from_df(prefer_unmatched: bool) -> pd.DataFrame:
+            base = df_a
+            mask = pd.Series(False, index=base.index)
+            for k in keys:
+                if not k:
+                    continue
+                mask |= base["m61_match_key"].astype(str).str.strip().eq(k)
+            cand = base.loc[mask].copy()
+            if cand.empty and dn and "deal_norm" in base.columns:
+                if fn_pri and "facility_norm" in base.columns:
+                    cand = base.loc[
+                        base["deal_norm"].astype(str).eq(dn)
+                        & base["facility_norm"].astype(str).eq(fn_pri)
+                    ].copy()
+                else:
+                    cand = base.loc[base["deal_norm"].astype(str).eq(dn)].copy()
+            if cand.empty:
+                return cand
+            if prefer_unmatched and paired_row_ids_m61:
+                um = cand.loc[~cand["_row_id_a"].astype(int).isin(paired_row_ids_m61)]
+                if not um.empty:
+                    return um
+            return cand
+
+        # Always build the pool from ALL candidates (matched or not); ranking handles the preference.
+        # Using prefer_unmatched=True would silently drop the correct M61 row when it is already
+        # paired with a different ACORE row, causing a lower-quality (wrong-date) row to be selected.
+        pool = _pool_from_df(prefer_unmatched=False)
+        pick_reason = "all_candidates_ranked"
+        if pool.empty and keys:
+            if _trace:
+                sample = (
+                    df_a.loc[:, ["m61_match_key", "Deal Name", "Liability Note", "effective_date_key"]]
+                    .head(25)
+                    .to_dict("records")
+                )
+                _debug_rows(
+                    "TEMP DEBUG: related M61 surfacing — NO pool after key/deal fallbacks; "
+                    f"keys_tried={keys!r} sample_m61_keys={sample!r}"
+                )
+            continue
+
+        if pool.empty:
+            continue
+
+        narrowed = pool.copy()
+        if fn_pri and "facility_norm" in narrowed.columns:
+            sub = narrowed.loc[narrowed["facility_norm"].astype(str).eq(fn_pri)]
+            if not sub.empty:
+                narrowed = sub
+        nn_pri = normalise_text(row.get("Note Name") or "")
+        if nn_pri and "strict_note_norm" in narrowed.columns:
+            sub = narrowed.loc[narrowed["strict_note_norm"].astype(str).eq(nn_pri)]
+            if not sub.empty:
+                narrowed = sub
+        if narrowed.empty:
+            narrowed = pool.copy()
+
+        # Candidate ranking (display-only):
+        # 1) same deal/liability key (pool/narrowed above)
+        # 2) liability-type compatibility with ACORE Source (Sale source: Sale > Financing > Fund/Equity)
+        # 3) same/closest pledge date
+        # 4) earliest M61 effective date (NOT closeness to ACORE date — that would pick wrong rows)
+        # 5) unmatched M61 rows preferred over already-paired rows as tiebreaker
+        # Uses actual M61 ``Effective Date`` / ``Pledge Date`` columns — never ACORE dates for keys on ``df_a``.
+        acore_source = row.get("Source")
+        narrowed = narrowed.copy()
+        _lt_rank_reason = narrowed.apply(
+            lambda rr: _related_m61_liability_type_rank_for_source(
+                acore_source=acore_source,
+                m61_liability_type=rr.get("Liability Type"),
+            ),
+            axis=1,
+        )
+        narrowed["__lt_rank"] = _lt_rank_reason.map(lambda t: int(t[0]))
+        narrowed["__lt_reason"] = _lt_rank_reason.map(lambda t: str(t[1]))
+        # For ACORE Sale rows, only fallback to Fund/Equity when no Sale/Financing candidate exists.
+        src_norm = normalise_text(acore_source)
+        if "sale" in src_norm and (narrowed["__lt_rank"] <= 1).any():
+            narrowed = narrowed.loc[narrowed["__lt_rank"] <= 1].copy()
+
+        pri_ed = row.get("Effective Date (ACP)")
+        if pri_ed is None or (isinstance(pri_ed, float) and pd.isna(pri_ed)):
+            pri_ed = row.get("Effective Date")
+        pri_ts = pd.to_datetime(pri_ed, errors="coerce")
+        pri_pl = row.get("Pledge Date (ACP)")
+        if pri_pl is None or (isinstance(pri_pl, float) and pd.isna(pri_pl)):
+            pri_pl = row.get("Pledge Date")
+        pri_pl_ts = pd.to_datetime(pri_pl, errors="coerce")
+
+        work = narrowed.assign(
+            __ed_ts=pd.to_datetime(narrowed["Effective Date"], errors="coerce")
+        )
+        if "Pledge Date" in narrowed.columns:
+            work["__pl_ts"] = pd.to_datetime(narrowed["Pledge Date"], errors="coerce")
+        else:
+            work["__pl_ts"] = pd.NaT
+
+        if pd.notna(pri_pl_ts):
+            work["__pl_dist"] = (work["__pl_ts"] - pri_pl_ts).abs().dt.total_seconds()
+        else:
+            work["__pl_dist"] = pd.NA
+
+        if pd.notna(pri_ts):
+            work["__ed_dist"] = (work["__ed_ts"] - pri_ts).abs().dt.total_seconds()
+        else:
+            work["__ed_dist"] = pd.NA
+
+        # __is_paired = 0 for unmatched M61 rows, 1 for already-paired rows.
+        # Sorting ascending puts unmatched rows last in priority (preferred as tiebreaker).
+        work["__is_paired"] = work["_row_id_a"].astype(int).isin(paired_row_ids_m61).astype(int)
+        # Sort: (1) liability-type rank, (2) pledge-date proximity, (3) earliest M61 effective date,
+        # (4) unmatched-before-paired tiebreaker.
+        # __ed_dist (distance from ACORE effective date) is intentionally NOT used: for ACORE-only rows
+        # that date proximity is circular — the correct M61 row often has a DIFFERENT effective date,
+        # and favouring the row closest to ACORE's date selects the wrong candidate.
+        work = work.sort_values(
+            ["__lt_rank", "__pl_dist", "effective_date_key", "__is_paired"],
+            ascending=[True, True, True, True],
+            na_position="last",
+        )
+
+        pick = work.iloc[0]
+        rid_pick = int(pick["_row_id_a"])
+        _sel_reason = (
+            f"pick_reason={pick_reason}; lt_reason={pick.get('__lt_reason')!r}; "
+            f"lt_rank={pick.get('__lt_rank')!r}; pledge_dist={pick.get('__pl_dist')!r}; "
+            f"eff_date_key={pick.get('effective_date_key')!r}; is_paired={pick.get('__is_paired')!r}"
+        )
+        cand_debug = []
+        for _, rr in work.head(30).iterrows():
+            cand_debug.append(
+                {
+                    "row_id_a": int(rr.get("_row_id_a")) if not pd.isna(rr.get("_row_id_a")) else None,
+                    "liability_note": rr.get("Liability Note"),
+                    "liability_type": rr.get("Liability Type"),
+                    "effective_date": rr.get("Effective Date"),
+                    "pledge_date": rr.get("Pledge Date"),
+                    "spread": _m61_spread_raw_from_liab_pick(rr),
+                    "index_floor": _m61_index_floor_raw_from_liab_pick(rr),
+                    "lt_reason": rr.get("__lt_reason"),
+                    "lt_rank": rr.get("__lt_rank"),
+                    "pledge_dist": rr.get("__pl_dist"),
+                    "is_paired": bool(rr.get("__is_paired", 0)),
+                }
+            )
+        _debug_rows(
+            "Related M61 candidates: "
+            f"deal={row.get('Deal Name')!r} source_acore={acore_source!r} "
+            f"eff_acore={row.get('Effective Date (ACP)')!r} pledge_acore={row.get('Pledge Date (ACP)')!r} "
+            f"candidate_count={len(work)} candidates={cand_debug!r} selected_reason={_sel_reason}"
+        )
+
+        display_updates, skip_reasons, ar_meta = _related_m61_display_updates_from_pick(
+            pick,
+            primary_file_type=primary_file_type,
+            out_columns=out.columns,
+            acore_row=row,
+        )
+        _upd: dict[str, object] = {
+            "Effective Date (M61)": pick.get("Effective Date"),
+            "Liability Name (M61)": pick.get("Liability Name"),
+            # Do not set Liability Note (M61): fund scoping reads it via parse_liability_note().
+            "Liability Type (M61 Raw)": pick.get("Liability Type"),
+        }
+        _upd.update(display_updates)
+        # Hard display-only guard: for related M61 attach, all M61-side values come from THIS selected pick row.
+        # Never take ACORE dates/keys/fallback dates for these columns.
+        _upd["Effective Date (M61)"] = pick.get("Effective Date")
+        if "Pledge Date" in pick.index:
+            _upd["Pledge Date (M61)"] = pick.get("Pledge Date")
+        _upd["Liability Type (M61 Raw)"] = pick.get("Liability Type")
+        _upd["Spread (M61)"] = (
+            pd.NA if _is_blank_for_compare(_m61_spread_raw_from_liab_pick(pick)) else _m61_spread_raw_from_liab_pick(pick)
+        )
+        _upd["Index Floor (M61)"] = _normalize_index_floor_value(_m61_index_floor_raw_from_liab_pick(pick))
+        if "IndexName" in pick.index:
+            _ixn = pick.get("IndexName")
+            _upd["Index Name (M61)"] = (
+                pd.NA
+                if (_ixn is None or (isinstance(_ixn, float) and pd.isna(_ixn)) or not str(_ixn).strip())
+                else str(_ixn).strip()
+            )
+        _rc_pick = _pick_first_recourse_value(pick)
+        _rc_num = _coerce_numeric_value(_rc_pick)
+        _upd["Recourse % (M61)"] = pd.NA if _rc_num is None else _rc_num
+        _uc_pick = _pick_undrawn_capacity(pick)
+        _uc_num = _coerce_numeric_value(_uc_pick)
+        _upd["Undrawn Capacity (M61)"] = pd.NA if _uc_num is None else _uc_num
+        if "M61 Extracted Deal ID" in out.columns:
+            _v = pick.get("liability_note_suffix_key")
+            if _v is None or (isinstance(_v, float) and pd.isna(_v)):
+                _v = pick.get("m61_extracted_deal_id")
+            _upd["M61 Extracted Deal ID"] = _v
+        if "Pledge Date (M61)" in out.columns and "Pledge Date" in pick.index:
+            _upd["Pledge Date (M61)"] = pick.get("Pledge Date")
+
+        for k, v in _upd.items():
+            if k in out.columns:
+                out.at[idx, k] = v
+
+        _is_target = (
+            str(row.get("Deal Name") or "").strip().lower() == "block 21 san mateo"
+            and str(row.get("Facility") or "").strip().lower() == "tbk bank"
+            and str(row.get("Source") or "").strip().lower() == "sale"
+            and str(pd.to_datetime(row.get("Effective Date (ACP)"), errors="coerce").strftime("%Y-%m-%d"))
+            == "2022-08-22"
+        )
+        if _is_target:
+            _debug_rows(
+                "UNDRAWN TRACE 3 (after related attach): "
+                f"selected_pick_raw_undrawn={pick.get('Undrawn Capacity')!r} "
+                f"selected_pick_raw_current_undrawn={pick.get('Current Undrawn Capacity')!r} "
+                f"stored_undrawn_m61={out.at[idx, 'Undrawn Capacity (M61)'] if 'Undrawn Capacity (M61)' in out.columns else pd.NA!r}"
+            )
+
+        # For related-M61 context rows (still File Source = ACORE Only), evaluate field statuses
+        # against displayed M61-side values instead of defaulting to "MISSING FROM M61".
+        _r = out.loc[idx]
+        if "Effective Date Status" in out.columns:
+            out.at[idx, "Effective Date Status"] = compare_effective_date_status(
+                _r.get("Effective Date (M61)"),
+                _r.get("Effective Date (ACP)"),
+            )
+        if "Pledge Date Status" in out.columns:
+            out.at[idx, "Pledge Date Status"] = compare_pledge_date_status(
+                val_liability=_r.get("Pledge Date (M61)"),
+                val_acp=_r.get("Pledge Date (ACP)"),
+            )
+        if "Advance Rate Status" in out.columns:
+            _adv_m61 = _r.get("Advance Rate (M61)")
+            _adv_acp = _r.get("Advance Rate (ACP)")
+            _na = _coerce_rate_fraction(_adv_m61)
+            _nb = _coerce_rate_fraction(_adv_acp)
+            if _na is not None and _nb is not None:
+                out.at[idx, "Advance Rate Status"] = (
+                    FIELD_STATUS_MATCH if abs(_na - _nb) <= RATE_STATUS_TOLERANCE else FIELD_STATUS_MISMATCH
+                )
+            else:
+                out.at[idx, "Advance Rate Status"] = compare_liability_primary_status(
+                    _adv_m61, _adv_acp, "numeric"
+                )
+        if "Spread Status" in out.columns:
+            _sp_m61 = _r.get("Spread (M61)")
+            _sp_acp = _r.get("Spread (ACP)")
+            _l_ok = _has_compare_value(_sp_m61)
+            _p_ok = _has_compare_value(_sp_acp)
+            if not _l_ok and not _p_ok:
+                _sp_status = FIELD_STATUS_MISSING_BOTH
+            elif not _p_ok and _l_ok:
+                _sp_status = FIELD_STATUS_MISSING_ACORE
+            elif _p_ok and not _l_ok:
+                _sp_status = FIELD_STATUS_MISSING_M61
+            else:
+                _qa = _spread_percent_quantized_m61_compare(_sp_m61)
+                _qb = _spread_percent_quantized_m61_compare(_sp_acp)
+                if _qa is not None and _qb is not None:
+                    _sp_status = FIELD_STATUS_MATCH if _qa == _qb else FIELD_STATUS_MISMATCH
+                else:
+                    _sp_status = compare_liability_primary_status(_sp_m61, _sp_acp, "numeric")
+            out.at[idx, "Spread Status"] = _sp_status
+        if "Undrawn Capacity Status" in out.columns:
+            out.at[idx, "Undrawn Capacity Status"] = compare_liability_primary_status(
+                _r.get("Undrawn Capacity (M61)"),
+                _r.get("Undrawn Capacity (ACP)"),
+                "numeric",
+            )
+        if "Index Floor Status" in out.columns:
+            out.at[idx, "Index Floor Status"] = compare_optional(
+                _r.get("Index Floor (M61)"),
+                _r.get("Index Floor (ACP)"),
+                "text",
+            )
+        if "Index Name Status" in out.columns:
+            out.at[idx, "Index Name Status"] = compare_optional(
+                _r.get("Index Name (M61)"),
+                _r.get("Index Name (ACP)"),
+                "text",
+            )
+        if "Recourse % Status" in out.columns:
+            out.at[idx, "Recourse % Status"] = compare_optional(
+                _r.get("Recourse % (M61)"),
+                _r.get("Recourse % (ACP)"),
+                "numeric",
+            )
+
+        _final_liab_type = (
+            out.at[idx, "Liability Type (M61 Raw)"]
+            if "Liability Type (M61 Raw)" in out.columns
+            else pd.NA
+        )
+        _final_note_cat = out.at[idx, "M61 Note Category"] if "M61 Note Category" in out.columns else pd.NA
+        _debug_rows(
+            "Related M61 liability-type mapping: "
+            f"raw_selected_m61_liability_type={pick.get('Liability Type')!r} "
+            f"raw_selected_m61_liability_note={pick.get('Liability Note')!r} "
+            f"raw_selected_m61_effective_date={pick.get('Effective Date')!r} "
+            f"raw_selected_m61_pledge_date={pick.get('Pledge Date')!r} "
+            f"final_output_liability_type_m61={_final_liab_type!r} "
+            f"final_output_m61_note_category={_final_note_cat!r} "
+            f"final_output_eff_date_m61={out.at[idx, 'Effective Date (M61)'] if 'Effective Date (M61)' in out.columns else pd.NA!r} "
+            f"final_output_pledge_date_m61={out.at[idx, 'Pledge Date (M61)'] if 'Pledge Date (M61)' in out.columns else pd.NA!r} "
+            f"final_output_spread_m61={out.at[idx, 'Spread (M61)'] if 'Spread (M61)' in out.columns else pd.NA!r} "
+            f"final_output_index_floor_m61={out.at[idx, 'Index Floor (M61)'] if 'Index Floor (M61)' in out.columns else pd.NA!r}"
+        )
+
+        n_done += 1
+        _debug_rows(
+            "Related M61 advance-rate display: "
+            f"Source_Type_ACORE={ar_meta['source_acore']!r} "
+            f"M61_TargetAdvanceRate={ar_meta['m61_target_advance']!r} "
+            f"M61_DealLevelAdvanceRate_raw={ar_meta['m61_raw_deallevel_advance_rate']!r} "
+            f"M61_DealLevelAdvanceRate_chain={ar_meta['m61_deal_level_chain']!r} "
+            f"use_deal_level={ar_meta['use_deal_level_adv']!r} "
+            f"selected_source={ar_meta['selected_source']!r} "
+            f"Advance_Rate_M61={ar_meta['advance_rate_m61']!r}"
+        )
+        if primary_file_type == "AOC I" and _trace:
+            tgt_r = pick.get("Target Advance Rate") if "Target Advance Rate" in pick.index else pd.NA
+            cur_r = pick.get("Current Advance Rate") if "Current Advance Rate" in pick.index else pd.NA
+            dlr_r = _pick_deal_level_advance_rate(pick)
+            raw_sp = _m61_spread_raw_from_liab_pick(pick)
+            raw_ixf = _m61_index_floor_raw_from_liab_pick(pick)
+            _debug_rows(
+                "Related M61 AOC I display trace: related_m61_row_found=yes "
+                f"m61_row_id={rid_pick} pick_reason={pick_reason} "
+                f"deal={row.get('Deal Name')!r} eff_acp={row.get('Effective Date (ACP)')!r} "
+                f"raw_m61 TargetAdv={tgt_r!r} CurrAdv={cur_r!r} DealLevelAdv={dlr_r!r} "
+                f"raw_m61 Spread={raw_sp!r} IndexFloor={raw_ixf!r} "
+                f"written Advance Rate (M61)={_upd.get('Advance Rate (M61)')!r} "
+                f"Spread (M61)={_upd.get('Spread (M61)')!r} Index Floor (M61)={_upd.get('Index Floor (M61)')!r} "
+                f"skip_or_blank_reasons={skip_reasons if skip_reasons else 'none'}"
+            )
+        elif _trace or "LN_Fin_AOCI" in str(pick.get("Liability Note", "")):
+            _debug_rows(
+                "TEMP DEBUG: related M61 ATTACHED — "
+                f"acp_row_idx={idx} pick_reason={pick_reason} m61_row_id={rid_pick} "
+                f"m61_match_key={pick.get('m61_match_key')!r} m61_eff={pick.get('Effective Date')!r} "
+                f"m61_ln={str(pick.get('Liability Note') or '')[:100]!r}"
+            )
+
+    if n_done:
+        _debug_rows(
+            f"TEMP DEBUG: related M61 display surfacing applied to {n_done} ACORE-only row(s)"
+        )
+    n_after = len(out)
+    removed_or_merged: list[str] = []
+    if n_after != n_before:
+        removed_or_merged.append(f"ROW_COUNT_CHANGED:{n_before}->{n_after}")
+        _debug_rows(
+            "Related M61 enhancement: unexpected row count change (should be display-only)"
+        )
+    _debug_rows(
+        f"Related M61 enhancement: row count AFTER={n_after} "
+        f"removed_or_merged={removed_or_merged if removed_or_merged else 'none'}"
+    )
+    return out
+
+
 def _ensure_file_source_populated(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure ``File Source`` is never NA/blank before returning from ``reconcile()``."""
     if df is None or df.empty or "File Source" not in df.columns:
@@ -769,8 +1523,78 @@ COMPARE_FIELDS = [
 ]
 
 RECON_STATUS_FIELDS = frozenset({"Advance Rate", "Spread", "Effective Date"})
+ROW_LEVEL_STATUS_LABELS = (
+    ("Advance Rate Status", "Advance Rate"),
+    ("Spread Status", "Spread"),
+    ("Effective Date Status", "Effective Date"),
+    ("Undrawn Capacity Status", "Undrawn Capacity"),
+    ("Index Floor Status", "Index Floor"),
+    ("Index Name Status", "Index Name"),
+    ("Recourse % Status", "Recourse %"),
+    ("Pledge Date Status", "Pledge Date"),
+)
 
 LIABILITY_ADVANCE_RATE_COLUMNS = ("Current Advance Rate", "Advance Rate", "Advance")
+
+
+def _status_issue_kind(v: object) -> str:
+    s = "" if v is None else str(v).strip().upper()
+    if not s:
+        return ""
+    # "MISSING FROM BOTH" is noise — absent on both sides, not a real discrepancy.
+    # Must be checked before the general "MISSING" branch.
+    if "MISSING FROM BOTH" in s:
+        return "missing_both"
+    if "MISSING" in s:
+        return "missing"
+    if "MISMATCH" in s or "DIFFERENCE" in s or "NO MATCH" in s:
+        return "mismatch"
+    if "MATCH" in s:
+        return "match"
+    return ""
+
+
+def _derive_business_recon_status(
+    record: dict[str, object],
+    *,
+    in_a: bool,
+    in_b: bool,
+    primary_file_type: str,
+) -> str:
+    """Business-facing row status label (summary only; does not change matching/pairing)."""
+    if in_b and not in_a:
+        return "MISSING IN M61"
+    if in_a and not in_b:
+        return f"MISSING IN {scope_label_for_primary_type(primary_file_type)}"
+    if not in_a and not in_b:
+        return "MISSING"
+
+    mismatch_fields: list[str] = []
+    missing_fields: list[str] = []
+    for status_col, field_label in ROW_LEVEL_STATUS_LABELS:
+        if status_col not in record:
+            continue
+        kind = _status_issue_kind(record.get(status_col))
+        if kind == "mismatch":
+            mismatch_fields.append(field_label)
+        elif kind == "missing":
+            # Only one-sided missing values are meaningful issues.
+            # "missing_both" is intentionally ignored — not flagged to the user.
+            missing_fields.append(field_label)
+
+    if not mismatch_fields and not missing_fields:
+        return "MATCH"
+    if missing_fields and not mismatch_fields:
+        return "MATCH WITH MISSING FIELDS: " + ", ".join(missing_fields)
+    if mismatch_fields and not missing_fields:
+        return "MATCH WITH DIFFERENCES: " + ", ".join(mismatch_fields)
+    # Both mismatches and one-sided missing fields present — call out both.
+    return (
+        "MATCH WITH DIFFERENCES: "
+        + ", ".join(mismatch_fields)
+        + "; MISSING FIELDS: "
+        + ", ".join(missing_fields)
+    )
 
 LIABILITY_VALUE_LABELS = {
     "Current Advance Rate": "Advance Rate (M61)",
@@ -792,6 +1616,8 @@ LIABILITY_VALUE_LABELS = {
 # Extra Liability_Relationship columns to load (NA if absent).
 LIABILITY_SOURCE_EXTRA_COLS = [
     "IndexFloor",
+    # Some M61 exports use ``Floor`` for the index floor (same role as ``IndexFloor`` on matched rows).
+    "Floor",
     "IndexName",
     "Recourse %",
     "Recourse",
@@ -844,14 +1670,14 @@ RECON_ORDERED_COLS = [
     "Recourse % (ACP)",
     "Recourse % (M61)",
     "Advance Rate (ACP) Debug",
+    "Effective Date Status",
+    "Pledge Date Status",
     "Advance Rate Status",
     "Spread Status",
-    "Effective Date Status",
     "Undrawn Capacity Status",
     "Index Floor Status",
     "Index Name Status",
     "Recourse % Status",
-    "Pledge Date Status",
     "recon_status",
 ]
 
@@ -1119,6 +1945,15 @@ def _norm_colname_key(name) -> str:
     return s
 
 
+def _normalize_missing_placeholders(series: pd.Series) -> pd.Series:
+    """Treat common source placeholders for missing values as NA (display/compare should not see them as 0)."""
+    s = series.copy()
+    s = s.where(~s.isna(), pd.NA)
+    s_str = s.astype(str).str.strip()
+    missing_tokens = {"", "-", "—", "–", "−", "nan", "none", "<na>", "nat", "null"}
+    return s.where(~s_str.str.lower().isin(missing_tokens), pd.NA)
+
+
 def _canonicalize_m61_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize M61 export column headers to expected canonical names."""
     out = df.copy()
@@ -1141,6 +1976,8 @@ def _canonicalize_m61_columns(df: pd.DataFrame) -> pd.DataFrame:
         "current balance": "Current Balance",
         "undrawn capacity": "Undrawn Capacity",
         "spread": "Spread",
+        "index floor": "IndexFloor",
+        "indexfloor": "IndexFloor",
         "target": "target",
         "in_liability": "in_liability",
     }
@@ -1547,6 +2384,51 @@ def load_file_a(
     if "DealLevelAdvanceRate" in df.columns and "DealLevelAdvanceRate" not in keep:
         keep = list(dict.fromkeys(list(keep) + ["DealLevelAdvanceRate"]))
     df = df[keep].copy()
+
+    # Preserve missing-vs-zero semantics for M61 numeric fields (e.g., '-' must stay missing, not 0).
+    _m61_numeric_like_cols = [
+        "Undrawn Capacity",
+        "Current Balance",
+        "Current Advance Rate",
+        "Target Advance Rate",
+        "DealLevelAdvanceRate",
+        "Deal Level Advance Rate",
+        "Advance Rate",
+        "Advance",
+        "Spread",
+        "target",
+        "IndexFloor",
+        "Floor",
+        "Recourse %",
+        "Recourse",
+        "RecoursePct",
+    ]
+    _raw_undrawn_preview = (
+        df["Undrawn Capacity"].head(25).tolist() if "Undrawn Capacity" in df.columns else []
+    )
+    for _c in _m61_numeric_like_cols:
+        if _c in df.columns:
+            df[_c] = _normalize_missing_placeholders(df[_c])
+    _stored_undrawn_preview = (
+        df["Undrawn Capacity"].head(25).tolist() if "Undrawn Capacity" in df.columns else []
+    )
+    _debug_rows(
+        "M61 Undrawn debug: "
+        f"raw_before_coercion_head25={_raw_undrawn_preview!r} "
+        f"stored_after_parsing_head25={_stored_undrawn_preview!r}"
+    )
+    if "Undrawn Capacity" in df.columns:
+        # Final hard guard: coerce true numerics, preserve missing placeholders as NA (never 0).
+        _uc_raw_before = df["Undrawn Capacity"].head(25).tolist()
+        _uc_coerced = df["Undrawn Capacity"].map(_coerce_numeric_value)
+        df["Undrawn Capacity"] = pd.Series(
+            [pd.NA if v is None else v for v in _uc_coerced], index=df.index, dtype="object"
+        )
+        _uc_after = df["Undrawn Capacity"].head(25).tolist()
+        _debug_rows(
+            "M61 Undrawn debug (post hard guard): "
+            f"raw_before={_uc_raw_before!r} stored_after={_uc_after!r}"
+        )
 
     for col in [
         "Deal Name",
@@ -2042,8 +2924,13 @@ def _coerce_numeric_value(v) -> float | None:
     s = str(v).strip()
     if not s or s.lower() in ("nan", "none", "<na>", "nat"):
         return None
+    # Missing placeholders from source files (must remain missing, never coerced to 0).
+    if s in ("-", "—", "–", "−"):
+        return None
     pct = "%" in s
     s_num = s.replace("%", "").replace(",", "").strip()
+    if not s_num or s_num in ("-", "—", "–", "−"):
+        return None
     try:
         out = float(s_num)
     except ValueError:
@@ -2062,6 +2949,26 @@ def _coerce_rate_fraction(v) -> float | None:
         return None
     # Heuristic: values beyond +/-1 are percent-points, convert to fraction.
     return (n / 100.0) if abs(n) > 1.0 else n
+
+
+_SPREAD_STATUS_PCT_QUANT = Decimal("0.01")
+
+
+def _spread_percent_quantized_m61_compare(v) -> Decimal | None:
+    """Spread as a percentage number quantized to 2 decimal places (M61 / display precision).
+
+    Normalizes via ``_coerce_rate_fraction`` (percent strings, percent-points, fractions),
+    then rounds half-up so e.g. ``4.875%`` vs ``4.88%`` compares equal.
+    """
+    frac = _coerce_rate_fraction(v)
+    if frac is None:
+        return None
+    try:
+        return (Decimal(str(frac)) * Decimal("100")).quantize(
+            _SPREAD_STATUS_PCT_QUANT, rounding=ROUND_HALF_UP
+        )
+    except InvalidOperation:
+        return None
 
 
 def _normalize_aoc_ii_m61_adv_value(v):
@@ -3286,6 +4193,18 @@ def reconcile(
             }
         )
 
+    paired_row_ids_m61: set[int] = set()
+    for _pr in pair_rows:
+        if _pr.get("_merge") != "both":
+            continue
+        _ra = _pr.get("_row_id_a")
+        try:
+            if _ra is None or pd.isna(_ra):
+                continue
+            paired_row_ids_m61.add(int(_ra))
+        except (TypeError, ValueError):
+            continue
+
     map_df = pd.DataFrame(pair_rows)
     # Keep merge key dtypes aligned even when unmatched side uses pd.NA.
     if "_row_id_b" in map_df.columns:
@@ -3528,7 +4447,27 @@ def reconcile(
             elif not in_a:
                 status = FIELD_STATUS_MISSING_M61
             else:
-                if b_field in ("Advance Rate", "Spread"):
+                if b_field == "Spread":
+                    l_ok = _has_compare_value(val_a)
+                    p_ok = _has_compare_value(val_b)
+                    if not l_ok and not p_ok:
+                        status = FIELD_STATUS_MISSING_BOTH
+                    elif not p_ok and l_ok:
+                        status = FIELD_STATUS_MISSING_ACORE
+                    elif p_ok and not l_ok:
+                        status = FIELD_STATUS_MISSING_M61
+                    else:
+                        q_a = _spread_percent_quantized_m61_compare(val_a)
+                        q_b = _spread_percent_quantized_m61_compare(val_b)
+                        if q_a is not None and q_b is not None:
+                            status = (
+                                FIELD_STATUS_MATCH
+                                if q_a == q_b
+                                else FIELD_STATUS_MISMATCH
+                            )
+                        else:
+                            status = compare_liability_primary_status(val_a, val_b, ctype)
+                elif b_field == "Advance Rate":
                     n_a = _coerce_rate_fraction(val_a)
                     n_b = _coerce_rate_fraction(val_b)
                     if n_a is not None and n_b is not None:
@@ -3585,8 +4524,9 @@ def reconcile(
         record["Effective Date (ACP)"] = record.get("Effective Date") if in_b else pd.NA
         record["Advance Rate (ACP)"] = record.get("Advance Rate") if in_b else pd.NA
         record["Spread (ACP)"] = spread_primary
-        if "Spread (M61)" not in record:
-            record["Spread (M61)"] = spread_m61
+        record["Spread (M61)"] = (
+            pd.NA if only_target_from_invis else spread_m61
+        )
         record["Undrawn Capacity (ACP)"] = record.get("Current Undrawn Capacity") if in_b else pd.NA
         record["Undrawn Capacity (M61)"] = record.get("Current Undrawn Capacity (M61)")
 
@@ -3634,20 +4574,12 @@ def reconcile(
             "numeric",
         )
 
-        src_status = "" if pd.isna(row.get(f"{label_a}_Status")) else str(row.get(f"{label_a}_Status")).strip().lower()
-
-        if "red" in src_status:
-            recon_status = "MISSING"
-        elif not in_a or not in_b:
-            recon_status = "MISSING"
-        elif "MISSING" in key_field_statuses:
-            recon_status = "MISSING"
-        elif "MISMATCH" in key_field_statuses:
-            recon_status = "MISMATCH"
-        else:
-            recon_status = "MATCH"
-
-        record["recon_status"] = recon_status
+        record["recon_status"] = _derive_business_recon_status(
+            record,
+            in_a=in_a,
+            in_b=in_b,
+            primary_file_type=primary_file_type,
+        )
         # Set last so nothing in the row payload overwrites; drives UI "File Source" column.
         record["File Source"] = _file_source_label_from_sides(in_a=in_a, in_b=in_b)
         rows.append(record)
@@ -3655,7 +4587,60 @@ def reconcile(
     _out_cols = list(RECON_ORDERED_COLS)
     if match_diagnostics:
         _out_cols = _out_cols + list(MATCH_DIAGNOSTIC_COLUMNS)
+
+    def _target_22203_snapshot(df: pd.DataFrame) -> dict[str, object]:
+        if df is None or df.empty:
+            return {"count": 0, "rows": []}
+        m = pd.Series(True, index=df.index)
+        if "Deal Name" in df.columns:
+            m &= df["Deal Name"].fillna("").astype(str).str.strip().str.lower().eq("block 21 san mateo")
+        if "Facility" in df.columns:
+            m &= df["Facility"].fillna("").astype(str).str.strip().str.lower().eq("tbk bank")
+        if "Deal ID Match Key (ACP)" in df.columns:
+            did = df["Deal ID Match Key (ACP)"].fillna("").astype(str).str.strip()
+            if did.ne("").any():
+                m &= did.eq("222203")
+        elif "Deal ID (ACP)" in df.columns:
+            did2 = df["Deal ID (ACP)"].map(lambda v: normalise_deal_id_key(v))
+            if did2.fillna("").ne("").any():
+                m &= did2.eq("222203")
+        if "Effective Date (ACP)" in df.columns:
+            m &= pd.to_datetime(df["Effective Date (ACP)"], errors="coerce").dt.strftime("%Y-%m-%d").eq("2022-08-22")
+        if "Pledge Date (ACP)" in df.columns:
+            m &= pd.to_datetime(df["Pledge Date (ACP)"], errors="coerce").dt.strftime("%Y-%m-%d").eq("2023-08-31")
+        if "Source" in df.columns:
+            m &= df["Source"].fillna("").astype(str).str.lower().str.contains(r"\bsale\b", regex=True, na=False)
+        cols = [
+            c
+            for c in (
+                "Deal ID (ACP)",
+                "Deal ID Match Key (ACP)",
+                "Deal Name",
+                "Source",
+                "File Source",
+                "Effective Date (ACP)",
+                "Effective Date (M61)",
+                "Pledge Date (ACP)",
+                "Pledge Date (M61)",
+                "Undrawn Capacity (M61)",
+                "Advance Rate (M61)",
+                "Spread (M61)",
+                "Index Floor (M61)",
+            )
+            if c in df.columns
+        ]
+        hit = df.loc[m, cols].copy() if cols else df.loc[m].copy()
+        return {"count": int(len(hit)), "rows": hit.astype(str).to_dict("records")}
+
     df_out = pd.DataFrame(rows).reindex(columns=_out_cols).reset_index(drop=True)
+    _target_stage1 = _target_22203_snapshot(df_out)
+    df_out = _surface_related_m61_for_acore_only_rows(
+        df_out,
+        a,
+        paired_row_ids_m61=paired_row_ids_m61,
+        primary_file_type=primary_file_type,
+    )
+    _target_stage2 = _target_22203_snapshot(df_out)
     # Hard guard for Fin Inpt runs that remain Target-only (ACORE / ACP III).
     # SALE_DEALLEVEL_PRIMARY_TYPES pick Target vs Deal Level per row upstream.
     if (
@@ -3753,6 +4738,12 @@ def reconcile(
             )
 
     df_adv = pd.DataFrame(adv_rows).reset_index(drop=True)
+    _target_stage_final = _target_22203_snapshot(df_out)
+    _debug_rows(
+        "UNDRAWN TRACE 4 (final reconciliation df before UI): "
+        f"records={_target_stage_final.get('rows', [])!r}"
+    )
+
     LAST_RECON_DIAGNOSTICS = {
         "primary_file_type": primary_file_type,
         "raw_primary_rows_loaded": int(len(df_pri_raw)),
@@ -3801,6 +4792,12 @@ def reconcile(
             if "Liability Type (M61 Raw)" in df_out.columns
             else {}
         ),
+        "target_22203_stage1_count": int(_target_stage1.get("count", 0)),
+        "target_22203_stage1_rows": _target_stage1.get("rows", []),
+        "target_22203_stage2_count": int(_target_stage2.get("count", 0)),
+        "target_22203_stage2_rows": _target_stage2.get("rows", []),
+        "target_22203_stage_final_count": int(_target_stage_final.get("count", 0)),
+        "target_22203_stage_final_rows": _target_stage_final.get("rows", []),
     }
     LAST_RECON_CONTEXT = {
         "primary_file_type": primary_file_type,
@@ -3865,7 +4862,7 @@ COL_DEFS = [
     ("Deal ID (ACP)", 14, False, False, "ACP"),
     ("Liability Note Suffix (M61)", 20, False, False, "LIB"),
     ("Source", 9, False, False, "ID"),
-    ("File Source", 15, False, False, "ID"),
+    ("File Source", 24, False, False, "ID"),
     ("Effective Date (ACP)", 14, False, True, "ACP"),
     ("Effective Date (M61)", 16, False, True, "LIB"),
     ("Pledge Date (ACP)", 14, False, True, "ACP"),
@@ -3882,15 +4879,15 @@ COL_DEFS = [
     ("Index Name (M61)", 22, False, False, "LIB"),
     ("Recourse % (ACP)", 12, True, False, "ACP"),
     ("Recourse % (M61)", 12, True, False, "LIB"),
-    ("Advance Rate Status", 15, False, False, "STATUS"),
-    ("Spread Status", 13, False, False, "STATUS"),
-    ("Effective Date Status", 17, False, False, "STATUS"),
-    ("Undrawn Capacity Status", 18, False, False, "STATUS"),
-    ("Index Floor Status", 15, False, False, "STATUS"),
-    ("Index Name Status", 15, False, False, "STATUS"),
-    ("Recourse % Status", 15, False, False, "STATUS"),
-    ("Pledge Date Status", 16, False, False, "STATUS"),
-    ("Recon Status", 13, False, False, "STATUS"),
+    ("Effective Date Status", 24, False, False, "STATUS"),
+    ("Pledge Date Status", 24, False, False, "STATUS"),
+    ("Advance Rate Status", 24, False, False, "STATUS"),
+    ("Spread Status", 22, False, False, "STATUS"),
+    ("Undrawn Capacity Status", 28, False, False, "STATUS"),
+    ("Index Floor Status", 22, False, False, "STATUS"),
+    ("Index Name Status", 22, False, False, "STATUS"),
+    ("Recourse % Status", 22, False, False, "STATUS"),
+    ("Overall Recon Status", 80, False, False, "STATUS"),
 ]
 
 RECON_COL_MAP = list(RECON_ORDERED_COLS)
@@ -3913,8 +4910,40 @@ def _status_cell(cell, val):
     else:
         cell.fill = _fill(LIGHT_GRAY)
         cell.font = _body_font(color="888888")
-    cell.alignment = _center()
+    cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
     cell.border = BORDER
+
+
+EXCEL_WIDE_READABILITY_COLUMNS = frozenset(
+    {
+        "File Source",
+        "Effective Date Status",
+        "Pledge Date Status",
+        "Advance Rate Status",
+        "Spread Status",
+        "Undrawn Capacity Status",
+        "Index Floor Status",
+        "Index Name Status",
+        "Recourse % Status",
+        "Overall Recon Status",
+    }
+)
+
+
+def _autofit_recon_columns_for_readability(ws, *, data_start_row: int, data_end_row: int) -> None:
+    """Widen key columns based on content length while preserving readable minimums."""
+    for col_idx, (hdr, base_w, _pct, _dt, _grp) in enumerate(COL_DEFS, start=1):
+        if hdr not in EXCEL_WIDE_READABILITY_COLUMNS:
+            continue
+        max_len = len(str(_excel_header_for_primary(hdr, "")))
+        for rr in range(data_start_row, data_end_row + 1):
+            v = ws.cell(row=rr, column=col_idx).value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        # Keep widths in a practical range: wide enough to read, not so wide sheet becomes unusable.
+        computed = min(90, max(base_w, int(max_len * 0.9) + 2))
+        ws.column_dimensions[get_column_letter(col_idx)].width = computed
 
 
 def _fmt_date(v):
@@ -3961,12 +4990,12 @@ def _fmt_status(v):
 
 def _row_bg(recon_status):
     rs = str(recon_status).upper()
+    if "MATCH WITH DIFFERENCES" in rs or "MISMATCH" in rs or "DIFFERENCE" in rs:
+        return MISMATCH_BG
+    if "MATCH WITH MISSING FIELDS" in rs or "MISSING" in rs:
+        return MISSING_BG
     if "MATCH" in rs and "MIS" not in rs:
         return MATCH_BG
-    if "MISMATCH" in rs:
-        return MISMATCH_BG
-    if "MISSING" in rs:
-        return MISSING_BG
     return WHITE
 
 
@@ -4098,15 +5127,15 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
             _fmt_index_name_cell(row.get("Index Name (M61)")),
             _fmt_num(row.get("Recourse % (ACP)")),
             _fmt_num(row.get("Recourse % (M61)")),
+            _fmt_status(row.get("Effective Date Status")),
+            _fmt_status(row.get("Pledge Date Status")),
             _fmt_status(row.get("Advance Rate Status")),
             _fmt_status(row.get("Spread Status")),
-            _fmt_status(row.get("Effective Date Status")),
             _fmt_status(row.get("Undrawn Capacity Status")),
             _fmt_status(row.get("Index Floor Status")),
             _fmt_status(row.get("Index Name Status")),
             _fmt_status(row.get("Recourse % Status")),
-            _fmt_status(row.get("Pledge Date Status")),
-            _fmt_status(row.get("recon_status")),
+            _fmt_status(row.get("recon_status")),  # written under "Overall Recon Status" header
         ]
 
         for col_idx, (val, (hdr, _w, pct, dt, grp)) in enumerate(zip(vals, COL_DEFS), 1):
@@ -4131,9 +5160,12 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
                     cell.alignment = _center()
                 else:
                     cell.alignment = _left()
+                if hdr in EXCEL_WIDE_READABILITY_COLUMNS:
+                    cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
         ws.row_dimensions[data_row_idx].height = EXCEL_RECON_DATA_ROW_HEIGHT
 
+    _autofit_recon_columns_for_readability(ws, data_start_row=5, data_end_row=4 + len(df_recon))
     ws.freeze_panes = "A5"
 
     ws_leg = wb.create_sheet("Legend")
