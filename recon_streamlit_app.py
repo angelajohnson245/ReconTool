@@ -1221,6 +1221,49 @@ def _acore_source_type_family(raw) -> str:
     return s
 
 
+# Text columns where a lone ``NA`` from Fin Inpt is treated like explicit ``N/A`` for display.
+_DISPLAY_PRESERVE_NA_TEXT_COLS = frozenset({"Facility", "Note Name", "Source", "Financial Line"})
+
+
+def _display_missing_dash(v, col: str | None = None):
+    """Display-only missing-value normalizer: missing -> '-', keep real zeros.
+
+    Literal ``N/A`` is never treated as missing. ``Facility`` (and related text fields) may use
+    ``NA`` as an explicit placeholder — show as ``N/A`` rather than dash.
+    """
+    if v is None:
+        return "-"
+    try:
+        if pd.isna(v):
+            return "-"
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    if not s:
+        return "-"
+    su = s.upper()
+    if su == "N/A":
+        return "N/A"
+    if col in _DISPLAY_PRESERVE_NA_TEXT_COLS and su == "NA":
+        return "N/A"
+    # String sentinels from ``astype(str)`` on missing floats — still missing for display.
+    if su in ("NAN", "<NA>", "NAT", "NONE"):
+        return "-"
+    if s in ("—", "–", "−"):
+        return "-"
+    return v
+
+
+def _normalize_display_missing_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply business-facing display normalization to all table/export cells."""
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    out = df.copy()
+    for c in out.columns:
+        out[c] = out[c].map(lambda x, _c=c: _display_missing_dash(x, col=_c))
+    return out
+
+
 def derive_liability_type_for_filter(row: pd.Series) -> str:
     """Best-effort liability type for UI filtering from available row fields."""
     # Prefer explicit M61 type when present in schema.
@@ -2377,7 +2420,10 @@ if "df_recon" in st.session_state:
                 if not s:
                     return True
                 su = s.upper()
-                if su in ("N/A", "NAN", "NONE", "—", "-", "<NA>"):
+                # Literal ``N/A`` is substantive for Facility / source text — not "blank".
+                if su == "N/A":
+                    return False
+                if su in ("NAN", "NONE", "—", "-", "<NA>"):
                     return True
                 return False
 
@@ -2631,10 +2677,11 @@ if "df_recon" in st.session_state:
                 and (c.endswith(" Status") or c in ("Overall Recon Status", "File Source"))
             }
 
-            if df_table_view.empty:
-                styled = df_table_view.style
+            df_table_view_display = _normalize_display_missing_df(df_table_view)
+            if df_table_view_display.empty:
+                styled = df_table_view_display.style
             else:
-                styled = df_table_view.style
+                styled = df_table_view_display.style
                 if status_cols_visible:
                     styled = styled.map(color_status, subset=status_cols_visible)
                     # Uniform cell box for all status columns (padding, wrap, center — Spread baseline).
@@ -2781,7 +2828,7 @@ if "df_recon" in st.session_state:
                   <div style='display:grid; grid-template-columns:repeat(2, minmax(280px, 1fr)); gap:12px;'>
                     <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
                       <div style='font-size:0.65rem; color:#888; text-transform:uppercase; letter-spacing:.06em'>Facility</div>
-                      <div style='font-size:0.92rem; font-weight:600; color:#1a3a6c'>{row.get("Facility", "—")}</div>
+                      <div style='font-size:0.92rem; font-weight:600; color:#1a3a6c'>{_display_missing_dash(row.get("Facility"), "Facility")}</div>
                     </div>
                     <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
                       <div style='font-size:0.65rem; color:#888; text-transform:uppercase; letter-spacing:.06em'>Financial Line</div>
@@ -3126,6 +3173,7 @@ if "df_recon" in st.session_state:
         _sp_acp_blank = df_export_ready["Spread (ACP)"].isna()
         if _sp_acp_blank.any():
             df_export_ready.loc[_sp_acp_blank, "Spread (ACP)"] = df_export_ready.loc[_sp_acp_blank, "Spread"]
+    df_export_ready = _normalize_display_missing_df(df_export_ready)
 
     col_dl1, col_dl2 = st.columns(2)
 
@@ -3172,12 +3220,13 @@ if "df_recon" in st.session_state:
             cl = str(c).lower()
             if "date" in cl:
                 df_csv_export[c] = df_csv_export[c].map(
-                    lambda v: "" if pd.isna(v) else fmt_date(v)
+                    lambda v: "-" if pd.isna(v) else fmt_date(v)
                 )
             elif any(tok in cl for tok in ("rate", "spread", "recourse", "index floor", " floor")):
                 df_csv_export[c] = df_csv_export[c].map(
-                    lambda v: "" if pd.isna(v) else pct(v)
+                    lambda v: "-" if pd.isna(v) else pct(v)
                 )
+        df_csv_export = _normalize_display_missing_df(df_csv_export)
         csv_data = df_csv_export.to_csv(index=False).encode("utf-8")
 
         st.download_button(

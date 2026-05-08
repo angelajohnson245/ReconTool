@@ -269,7 +269,7 @@ def _debug_trace_uncommons_m61_load(
         note = str(r.get("Liability Note", "") or "").strip()
         lt_raw = r.get("Liability Type")
         lt_bucket = _liability_type_bucket(lt_raw)
-        in_type_bucket = lt_bucket in M61_FINANCING_TYPE_BUCKETS
+        in_type_bucket = lt_bucket in M61_IN_SCOPE_LIABILITY_BUCKETS
         fin_tok = bool(_fin_note_scope_mask(pd.Series([note]), primary_file_type).iloc[0])
         legacy_type_or_note = in_type_bucket or fin_tok
         scope_note = ""
@@ -278,7 +278,7 @@ def _debug_trace_uncommons_m61_load(
         parsed = parse_liability_note(note)
         _debug_rows(
             f"TRACE UnCommons M61 [{stage}]: FOUND idx={idx} Deal={r.get('Deal Name')!r} "
-            f"Liability Type={lt_raw!r} -> bucket={lt_bucket!r} in_financing_buckets={in_type_bucket} "
+            f"Liability Type={lt_raw!r} -> bucket={lt_bucket!r} in_load_scope_buckets={in_type_bucket} "
             f"fin_note_token_match={fin_tok} legacy_type_OR_note={legacy_type_or_note}{scope_note}"
         )
         _debug_rows(f"TRACE UnCommons M61 [{stage}]: parse_liability_note -> {parsed!r}")
@@ -672,8 +672,14 @@ def default_recon_output_path(
 # --------------------------------------------------
 # 2. CONSTANTS
 # --------------------------------------------------
-M61_FINANCING_TYPES = ["Repo", "Non", "Subline"]
-M61_FINANCING_TYPE_BUCKETS = frozenset({"repo", "non", "sale", "clo", "subline"})
+# Human-readable financing types (not wired into load_file_a; see bucket frozensets below).
+M61_FINANCING_TYPES = ["Repo", "Non", "Sale", "CLO", "TBD", "Sub Debt"]
+# Normalized Liability Type buckets that are **financing** for M61 load semantics (not Subline).
+# Subline uses a separate set so tooling/filters do not treat Subline as “financing category.”
+M61_FINANCING_TYPE_BUCKETS = frozenset({"repo", "non", "sale", "clo"})
+M61_SUBLINE_LIABILITY_BUCKETS = frozenset({"subline"})
+# Rows survive load_file_a expanded filter if bucket is in this union OR note-token match OR fund+deal fallback.
+M61_IN_SCOPE_LIABILITY_BUCKETS = M61_FINANCING_TYPE_BUCKETS | M61_SUBLINE_LIABILITY_BUCKETS
 
 TARGET_FUNDS = {
     "acore credit partners iii",
@@ -834,6 +840,8 @@ def _related_m61_liability_type_rank_for_source(*, acore_source, m61_liability_t
 
     if "sale" in lt or "sold" in lt:
         return 0, "m61_liability_type_sale"
+    # Includes Subline: for Sale-sourced ACORE rows, Subline M61 lines are still "financing-like"
+    # compatibility candidates — unrelated to M61 Note Category / UI Financing filter bucket.
     financing_tokens = ("repo", "non", "clo", "subline", "whole loan", "wholeloan", "sub debt", "subdebt")
     if any(tok in lt for tok in financing_tokens):
         return 1, "m61_liability_type_financing_non_sale"
@@ -2125,7 +2133,14 @@ def _drop_hidden_fin_inpt_rows(df_raw: pd.DataFrame, path: str, cfg: dict, prima
 
 def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
     cfg = get_primary_config(primary_file_type)
-    df_raw = pd.read_excel(path, sheet_name=cfg["sheet_name"], header=cfg["header_row"])
+    # Preserve literal ``N/A`` in text cells (e.g. Facility on Whole Loan rows). Default
+    # pandas parsing treats ``N/A`` as missing; ``keep_default_na=False`` keeps it as a string.
+    df_raw = pd.read_excel(
+        path,
+        sheet_name=cfg["sheet_name"],
+        header=cfg["header_row"],
+        keep_default_na=False,
+    )
     df_raw = _sanitize_fin_inpt_raw_df(df_raw, cfg)
     df_raw = _drop_hidden_fin_inpt_rows(df_raw, path, cfg, primary_file_type)
 
@@ -2292,11 +2307,11 @@ def load_file_a(
     ].str.contains(AOC_M61_FUND_NAME_I_RE, regex=True, na=False)
     fund_mask = in_target_set | aoc_style
     df["Liability Type Bucket"] = df["Liability Type"].apply(_liability_type_bucket)
-    liab_type_mask = df["Liability Type Bucket"].isin(M61_FINANCING_TYPE_BUCKETS)
+    liab_type_mask = df["Liability Type Bucket"].isin(M61_IN_SCOPE_LIABILITY_BUCKETS)
     liab_note_up = df["Liability Note"].fillna("").astype(str).str.upper()
     fin_note_scope_mask = _fin_note_scope_mask(liab_note_up, primary_file_type)
     # Rows are dropped only when ALL of the following are false:
-    # (1) Liability Type bucket in financing set (repo/non/sale/clo/subline), OR
+    # (1) Liability Type bucket in M61_IN_SCOPE_LIABILITY_BUCKETS (financing ∪ Subline), OR
     # (2) Liability Note contains primary-specific financing tokens (e.g. LN_FIN_AOCII), OR
     # (3) Fallback: Fund Name matches this run's primary fund scope (same regex as reconcile
     #     _m61_in_scope) AND Deal Name is non-blank — avoids silently dropping real fund rows
@@ -2377,7 +2392,8 @@ def load_file_a(
     _debug_rows(
         "M61 after expanded in-scope filter: "
         f"rows={len(df)} "
-        f"(kept liability buckets={sorted(M61_FINANCING_TYPE_BUCKETS)} OR note tokens={_fin_toks!r} "
+        f"(kept liability buckets financing={sorted(M61_FINANCING_TYPE_BUCKETS)} "
+        f"subline={sorted(M61_SUBLINE_LIABILITY_BUCKETS)} OR note tokens={_fin_toks!r} "
         f"OR primary-fund+nonblank-deal fallback pattern={fpattern!r})"
     )
     # Keep DealLevelAdvanceRate when the export provides it (otherwise ensure_columns would add NA).
@@ -2833,17 +2849,47 @@ def categorize_m61_note_category(
         return "Other"
     p = parse_liability_note(liability_note_raw)
     by_note = (p.get("note_category") or "").strip()
-    if pft == "ACP II" and by_note == "Eq/Fund":
-        # ACP II override: LN-Eq liabilities map to Fund/Equity source family but
-        # are categorized as "Other" (not Financing / Equity-Fund).
-        return "Other"
+    by_type = categorize_m61_note_type(liability_type_raw)
+    if pft == "ACP II":
+        # ACP II display/filter rule order (business):
+        # 1) WL-CPACE -> Other
+        # 2) M61 Subline / LN_Sub and ACORE source is NOT Sub Debt -> Subline
+        # 3) Sub Debt -> Financing
+        # 4) LN_Eq / Fund (incl. Whole Loan) -> Other
+        # 5) Else -> Financing
+        s_compact = re.sub(r"[^a-z0-9]+", "", s)
+        # Sub Debt: phrase match only. Do not use ``"subdebt" in s_compact`` — that false-positives
+        # e.g. "Subline" + "Debt" -> compact "sublinedebt" contains "subdebt".
+        sub_debt_src = bool(re.search(r"\bsub[\s-]*debt\b", s))
+        if "wlcpace" in s_compact:
+            return "Other"
+        lt_norm = normalise_text(liability_type_raw)
+        m61_is_subline = (
+            by_note == "Sub"
+            or by_type == "Subline"
+            or (_M61_LT_SUBLINE in lt_norm)
+        )
+        if not sub_debt_src and m61_is_subline:
+            return "Subline"
+        if sub_debt_src:
+            return "Financing"
+        if (
+            by_note == "Eq/Fund"
+            or re.search(r"\bfund\b", lt_norm)
+            or re.search(r"\bfund\b", s)
+            or re.search(r"\bequity\b", s)
+            or "whole loan" in s
+            or "wholeloan" in s_compact
+        ):
+            return "Other"
+        return "Financing"
+
     if by_note == "Fin":
         return "Financing"
     if by_note == "Sub":
         return "Subline"
     if by_note == "Eq/Fund":
         return "Equity/Fund"
-    by_type = categorize_m61_note_type(liability_type_raw)
     if by_type != "Other":
         return by_type
     if not s:
@@ -5101,43 +5147,44 @@ def _autofit_recon_columns_for_readability(ws, *, data_start_row: int, data_end_
 
 def _fmt_date(v):
     if pd.isna(v) or str(v) in ("NaT", "nan", ""):
-        return None
+        return "-"
     try:
         return pd.to_datetime(v).date()
     except Exception:
-        return None
+        return "-"
 
 
 def _fmt_num(v):
-    return _coerce_numeric_value(v)
+    n = _coerce_numeric_value(v)
+    return "-" if n is None else n
 
 
 def _fmt_str_cell(v):
     if pd.isna(v) or str(v).strip().lower() in ("", "nan", "<na>", "nat"):
-        return ""
+        return "-"
     return str(v).strip()
 
 
 def _fmt_index_floor_cell(v):
     if pd.isna(v) or str(v).strip().lower() in ("", "nan", "<na>"):
-        return None
+        return "-"
     try:
         return float(v)
     except (TypeError, ValueError):
         s = str(v).strip()
-        return s if s else None
+        return s if s else "-"
 
 
 def _fmt_index_name_cell(v):
     if pd.isna(v) or str(v).strip().lower() in ("", "nan", "<na>"):
-        return None
+        return "-"
     s = str(v).strip()
-    return s if s else None
+    return s if s else "-"
 
 
 def _fmt_status(v):
     if pd.isna(v) or str(v) in ("nan", "NaN", ""):
-        return "N/A"
+        return "-"
     return str(v)
 
 
