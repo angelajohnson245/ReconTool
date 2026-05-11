@@ -266,7 +266,7 @@ def _debug_trace_uncommons_m61_load(
         return
     hit = df.loc[m]
     for idx, r in hit.iterrows():
-        note = str(r.get("Liability Note", "") or "").strip()
+        note = safe_str_strip(r.get("Liability Note", ""))
         lt_raw = r.get("Liability Type")
         lt_bucket = _liability_type_bucket(lt_raw)
         in_type_bucket = lt_bucket in M61_IN_SCOPE_LIABILITY_BUCKETS
@@ -351,7 +351,7 @@ def _debug_trace_uncommons_m61_match_state(
         return
     for idx, r in a.loc[m].iterrows():
         rid = int(r["_row_id_a"]) if "_row_id_a" in r.index and pd.notna(r["_row_id_a"]) else -1
-        note = str(r.get("Liability Note", "") or "")
+        note = safe_str_strip(r.get("Liability Note", ""))
         pc = parse_liability_note(note)
         nc = pc.get("note_category", "")
         in_fin = nc == "Fin"
@@ -737,10 +737,10 @@ _RELATED_M61_DEBUG_MARKERS = (
 
 def _acore_row_matches_related_debug_trace(row: pd.Series) -> bool:
     parts = [
-        str(row.get("Deal Name", "") or ""),
-        str(row.get("Note Name", "") or ""),
-        str(row.get("Facility", "") or ""),
-        str(row.get("Deal ID (ACP)", "") or ""),
+        safe_str_strip(row.get("Deal Name", "")),
+        safe_str_strip(row.get("Note Name", "")),
+        safe_str_strip(row.get("Facility", "")),
+        safe_str_strip(row.get("Deal ID (ACP)", "")),
     ]
     blob = " | ".join(parts).lower()
     return any(m.lower() in blob for m in _RELATED_M61_DEBUG_MARKERS)
@@ -1111,7 +1111,7 @@ def _surface_related_m61_for_acore_only_rows(
             )
 
         keys = _related_m61_lookup_keys_from_acore_output_row(row)
-        dn = normalise_text(row.get("Deal Name") or "")
+        dn = normalise_text(row.get("Deal Name"))
         fn_pri = normalise_facility(row.get("Facility"))
 
         _trace = _acore_row_matches_related_debug_trace(row)
@@ -1119,7 +1119,7 @@ def _surface_related_m61_for_acore_only_rows(
             _debug_rows(
                 "TEMP DEBUG: related M61 surfacing TRACE — ACORE keys="
                 f"{keys!r} deal={row.get('Deal Name')!r} facility={row.get('Facility')!r} "
-                f"note={str(row.get('Note Name') or '')[:120]!r} eff_acp={row.get('Effective Date (ACP)')!r}"
+                f"note={safe_str_strip(row.get('Note Name'))[:120]!r} eff_acp={row.get('Effective Date (ACP)')!r}"
             )
 
         def _pool_from_df(prefer_unmatched: bool) -> pd.DataFrame:
@@ -1172,7 +1172,7 @@ def _surface_related_m61_for_acore_only_rows(
             sub = narrowed.loc[narrowed["facility_norm"].astype(str).eq(fn_pri)]
             if not sub.empty:
                 narrowed = sub
-        nn_pri = normalise_text(row.get("Note Name") or "")
+        nn_pri = normalise_text(row.get("Note Name"))
         if nn_pri and "strict_note_norm" in narrowed.columns:
             sub = narrowed.loc[narrowed["strict_note_norm"].astype(str).eq(nn_pri)]
             if not sub.empty:
@@ -1324,9 +1324,9 @@ def _surface_related_m61_for_acore_only_rows(
                 out.at[idx, k] = v
 
         _is_target = (
-            str(row.get("Deal Name") or "").strip().lower() == "block 21 san mateo"
-            and str(row.get("Facility") or "").strip().lower() == "tbk bank"
-            and str(row.get("Source") or "").strip().lower() == "sale"
+            safe_str_strip(row.get("Deal Name")).lower() == "block 21 san mateo"
+            and safe_str_strip(row.get("Facility")).lower() == "tbk bank"
+            and safe_str_strip(row.get("Source")).lower() == "sale"
             and str(pd.to_datetime(row.get("Effective Date (ACP)"), errors="coerce").strftime("%Y-%m-%d"))
             == "2022-08-22"
         )
@@ -1460,7 +1460,7 @@ def _surface_related_m61_for_acore_only_rows(
                 "TEMP DEBUG: related M61 ATTACHED — "
                 f"acp_row_idx={idx} pick_reason={pick_reason} m61_row_id={rid_pick} "
                 f"m61_match_key={pick.get('m61_match_key')!r} m61_eff={pick.get('Effective Date')!r} "
-                f"m61_ln={str(pick.get('Liability Note') or '')[:100]!r}"
+                f"m61_ln={safe_str_strip(pick.get('Liability Note'))[:100]!r}"
             )
 
     if n_done:
@@ -1866,9 +1866,12 @@ PRIMARY_FILE_CONFIG: dict[str, dict] = {
         "primary_group_header": "ACP II — PRIMARY DATA",
     },
     "ACP I": {
-        "sheet_name": "10) Fin Inpt",
+        # ACP I Liquidity & Earnings model uses this tab name (not "10) Fin Inpt" like other funds).
+        "sheet_name": "Financing Inputs",
         "header_row": 6,
         "sanitize_fin_inpt_headers": True,
+        # "Financing Inputs" column names differ from other funds; ``note_name`` is optional (sheet may omit).
+        "primary_required_in_sheet": ("deal_name", "facility", "effective_date"),
         "column_map": {
             "deal_name": "Deal Name",
             "note_name": "Note Name",
@@ -1881,7 +1884,7 @@ PRIMARY_FILE_CONFIG: dict[str, dict] = {
             "effective_date": "Effective Date",
             "undrawn_capacity": "Current Undrawn Capacity",
             "maturity_date": "Maturity Date",
-            "floor": "Floor",
+            "floor": "Index Floor",
             "recourse_pct": "Recourse %",
         },
         "display_name": "ACP I",
@@ -1926,6 +1929,11 @@ PRIMARY_FILE_CONFIG: dict[str, dict] = {
 STREAMLIT_PRIMARY_FILE_TYPES = ("ACP I", "ACP II", "ACORE", "AOC I", "AOC II")
 
 PRIMARY_REQUIRED_IN_SHEET = ("deal_name", "note_name", "facility", "effective_date")
+
+
+def _primary_required_keys(cfg: dict) -> tuple[str, ...]:
+    """Per-template required Fin Inpt columns (internal keys). Defaults apply to all but ACP I."""
+    return tuple(cfg.get("primary_required_in_sheet", PRIMARY_REQUIRED_IN_SHEET))
 
 
 def get_primary_config(primary_file_type: str) -> dict:
@@ -2069,7 +2077,7 @@ def _missing_primary_columns(df: pd.DataFrame, cfg: dict) -> list[str]:
     missing = []
     cmap = cfg["column_map"]
     cols = set(df.columns.astype(str))
-    for key in PRIMARY_REQUIRED_IN_SHEET:
+    for key in _primary_required_keys(cfg):
         src = cmap.get(key)
         if not src:
             missing.append(f"{key}: no mapping configured")
@@ -2131,16 +2139,60 @@ def _drop_hidden_fin_inpt_rows(df_raw: pd.DataFrame, path: str, cfg: dict, prima
         return df_raw
 
 
+def _detect_acp_i_header_row(path: str, sheet_name: str, default: int = 6) -> int:
+    """Scan the first 15 rows of an ACP I sheet to locate the header row dynamically.
+
+    Looks for a row whose cells contain all three anchor column names
+    ("deal name", "facility", "effective date").  Returns the 0-based row index
+    suitable for ``pd.read_excel(header=…)``.  Falls back to ``default`` when
+    detection fails so existing behaviour is preserved.
+    """
+    _anchors = {"deal name", "facility", "effective date"}
+    try:
+        df_probe = pd.read_excel(
+            path, sheet_name=sheet_name, header=None, nrows=15, keep_default_na=False
+        )
+        for i, row in df_probe.iterrows():
+            row_vals = {
+                # Collapse all whitespace (including embedded \n from merged/wrapped cells)
+                # before matching so "Effective\nDate" matches the anchor "effective date".
+                re.sub(r"\s+", " ", str(v)).strip().lower()
+                for v in row
+                if v is not None and not (isinstance(v, float) and pd.isna(v)) and str(v).strip()
+            }
+            if _anchors.issubset(row_vals):
+                return int(i)
+    except Exception:
+        pass
+    return default
+
+
 def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
     cfg = get_primary_config(primary_file_type)
+    # For ACP I the "Financing Inputs" header row may differ across model versions;
+    # dynamically detect it.  All other fund types use the configured value directly.
+    if primary_file_type == "ACP I":
+        header_row = _detect_acp_i_header_row(
+            path, cfg["sheet_name"], default=cfg["header_row"]
+        )
+    else:
+        header_row = cfg["header_row"]
     # Preserve literal ``N/A`` in text cells (e.g. Facility on Whole Loan rows). Default
     # pandas parsing treats ``N/A`` as missing; ``keep_default_na=False`` keeps it as a string.
     df_raw = pd.read_excel(
         path,
         sheet_name=cfg["sheet_name"],
-        header=cfg["header_row"],
+        header=header_row,
         keep_default_na=False,
     )
+    # ACP I "Financing Inputs" uses wrapped/merged header cells that pandas reads
+    # with embedded newlines (e.g. "Effective\nDate", "Index\nFloor").  Collapse
+    # all internal whitespace so column names match the column_map expectations.
+    if primary_file_type == "ACP I":
+        df_raw.columns = [
+            re.sub(r"\s+", " ", str(c)).strip() for c in df_raw.columns
+        ]
+
     df_raw = _sanitize_fin_inpt_raw_df(df_raw, cfg)
     df_raw = _drop_hidden_fin_inpt_rows(df_raw, path, cfg, primary_file_type)
 
@@ -2149,17 +2201,27 @@ def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
     if "Undrawn Capacity" in df_raw.columns and "Current Undrawn Capacity" not in df_raw.columns:
         df_raw["Current Undrawn Capacity"] = df_raw["Undrawn Capacity"]
 
+    cmap = cfg["column_map"]
+    # ACP I "Financing Inputs" omits several optional Fin Inpt columns (e.g. Note Name). Pre-fill
+    # mapped headers so validation only enforces ``primary_required_in_sheet`` for that template.
+    if primary_file_type == "ACP I":
+        _pre_src = list(dict.fromkeys(cmap[k] for k in PRIMARY_INTERNAL_FIELDS if cmap.get(k)))
+        df_raw = ensure_columns(df_raw, _pre_src)
+
     miss = _missing_primary_columns(df_raw, cfg)
     if miss:
         raise PrimaryFileSchemaError(primary_file_type, miss)
 
-    cmap = cfg["column_map"]
     all_src = list(dict.fromkeys(cmap[k] for k in PRIMARY_INTERNAL_FIELDS))
     df_raw = ensure_columns(df_raw, all_src)
 
     use_cols = [cmap[k] for k in PRIMARY_INTERNAL_FIELDS]
     renamer = {cmap[k]: INTERNAL_FIELD_TO_OUTPUT_COL[k] for k in PRIMARY_INTERNAL_FIELDS}
     df = df_raw.loc[:, use_cols].rename(columns=renamer)
+    # ACP I "Financing Inputs" exposes ``Index`` (not wired through PRIMARY_INTERNAL_FIELDS).
+    if primary_file_type == "ACP I" and "Index" in df_raw.columns:
+        df = df.copy()
+        df["Index Name"] = df_raw["Index"].to_numpy()
     deal_id_col = None
     if "Deal ID" in df_raw.columns:
         deal_id_col = "Deal ID"
@@ -2175,10 +2237,32 @@ def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
 
     df = ensure_columns(df, ACP_SHEET_COLS)
     keep_cols = list(ACP_SHEET_COLS) + (["Deal ID"] if "Deal ID" in df.columns else [])
+    if primary_file_type == "ACP I" and "Index Name" in df.columns:
+        keep_cols.append("Index Name")
     df = df[keep_cols].copy().dropna(subset=["Deal Name"])
 
-    for col in ["Deal Name", "Note Name", "Source", "Facility", "Pledge"]:
-        df[col] = df[col].astype(str).str.strip()
+    _str_cols = ["Deal Name", "Note Name", "Source", "Facility", "Pledge"]
+    if primary_file_type == "ACP I":
+        # ACP I columns may carry pd.NA for optional fields (e.g. Note Name).
+        # astype(str) would silently convert those to the string "nan"; use an
+        # NA-aware apply instead so downstream matching sees empty strings.
+        def _safe_str(v) -> str:
+            if v is None:
+                return ""
+            try:
+                if pd.isna(v):
+                    return ""
+            except (TypeError, ValueError):
+                pass
+            return str(v).strip()
+
+        for col in _str_cols:
+            df[col] = df[col].apply(_safe_str)
+        if "Index Name" in df.columns:
+            df["Index Name"] = df["Index Name"].apply(_safe_str)
+    else:
+        for col in _str_cols:
+            df[col] = df[col].astype(str).str.strip()
     if "Deal ID" in df.columns:
         df["Deal ID"] = df["Deal ID"].apply(
             lambda v: pd.NA if pd.isna(v) or not str(v).strip() else str(v).strip()
@@ -2494,6 +2578,21 @@ def normalise_text(value):
     if pd.isna(value):
         return ""
     return str(value).strip().lower()
+
+
+def safe_str_strip(value, default: str = "") -> str:
+    """Stringify and strip; treat None / NA as ``default`` (avoids ``pd.NA or ''`` TypeError)."""
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except TypeError:
+        pass
+    try:
+        return str(value).strip()
+    except Exception:
+        return default
 
 
 def _alnum_compact_upper(s: str) -> str:
@@ -3369,7 +3468,7 @@ def _fin_m61_key_from_row(row: pd.Series, scope_label: str) -> str:
             return ""
         if not fc and not bool(row.get("_m61_in_scope")):
             return ""
-        eff = str(row.get("effective_date_key") or "")
+        eff = safe_str_strip(row.get("effective_date_key"))
         return f"{did}|{eff}|sub"
     if nc != "Fin":
         return ""
@@ -3381,7 +3480,7 @@ def _fin_m61_key_from_row(row: pd.Series, scope_label: str) -> str:
         return ""
     if not fc and not bool(row.get("_m61_in_scope")):
         return ""
-    eff = str(row.get("effective_date_key") or "")
+    eff = safe_str_strip(row.get("effective_date_key"))
     sx = _normalize_ln_suffix_token(p.get("source_suffix") or "")
     # Liability Note may omit bank/repo while **Liability Name** carries ``ACPIII-MS-Repo`` / ``…-TBD-TBD``.
     if not sx:
@@ -4074,7 +4173,7 @@ def reconcile(
                 return None
             if len(cand) == 1:
                 return int(cand.iloc[0]["_row_id_b"])
-            eff_m = str(ar.get("effective_date_key") or "")
+            eff_m = safe_str_strip(ar.get("effective_date_key"))
             sub_eff = cand[cand["effective_date_key"].astype(str) == eff_m]
             tok = _m61_fac_tok_for_relaxed(ar)
 

@@ -31,6 +31,7 @@ from recon_enhanced_output import (
     normalise_text,
     normalize_recon_fund_for_output,
     reconcile,
+    safe_str_strip,
     scope_label_for_primary_type,
 )
  
@@ -700,7 +701,7 @@ def filter_display_dataframe_by_effective_dates(
 
 def _recon_status_bucket(v: object) -> str:
     """Map business-facing recon status text to MATCH / MISSING / MISMATCH buckets."""
-    s = "" if v is None else str(v).strip().upper()
+    s = safe_str_strip(v).upper()
     if not s:
         return ""
     # One-sided row — entire record absent from one source.
@@ -729,13 +730,13 @@ def _mismatch_detail_html(row: pd.Series) -> str:
     if _recon_status_bucket(row.get("recon_status", "")) != "MISMATCH":
         return ""
     parts: list[str] = []
-    ed = str(row.get("Effective Date Status", "") or "").upper()
+    ed = safe_str_strip(row.get("Effective Date Status", "")).upper()
     if "NO MATCH" in ed or ("MISMATCH" in ed and "MISSING" not in ed):
         parts.append("effective date differs between ACORE and M61")
-    ar = str(row.get("Advance Rate Status", "") or "").upper()
+    ar = safe_str_strip(row.get("Advance Rate Status", "")).upper()
     if "MISMATCH" in ar:
         parts.append("advance rate differs")
-    sp = str(row.get("Spread Status", "") or "").upper()
+    sp = safe_str_strip(row.get("Spread Status", "")).upper()
     if "MISMATCH" in sp:
         parts.append("spread differs")
     if not parts:
@@ -2209,7 +2210,7 @@ if "df_recon" in st.session_state:
                 def _m61_missing_by_status(status_col: str) -> bool:
                     if status_col not in row.index:
                         return False
-                    s = str(row.get(status_col, "") or "").strip().upper()
+                    s = safe_str_strip(row.get(status_col, "")).upper()
                     return ("MISSING FROM M61" in s) or ("MISSING FROM BOTH" in s)
 
                 rec = {
@@ -2220,22 +2221,22 @@ if "df_recon" in st.session_state:
                     "Source Type (ACORE)": row.get("Source", ""),
                     "Liability Type (M61)": (
                         (
-                            str(row.get("Liability Type (M61 Raw)") or "").strip()
+                            safe_str_strip(row.get("Liability Type (M61 Raw)"))
                             if pd.notna(row.get("Liability Type (M61 Raw)"))
                             else ""
                         )
                         or (
-                            str(row.get("Liability Type (M61)") or "").strip()
+                            safe_str_strip(row.get("Liability Type (M61)"))
                             if pd.notna(row.get("Liability Type (M61)"))
                             else ""
                         )
                         or (
-                            str(row.get("Liability Type") or "").strip()
+                            safe_str_strip(row.get("Liability Type"))
                             if pd.notna(row.get("Liability Type"))
                             else ""
                         )
                     ),
-                    "M61 Note Category": str(row.get("M61 Note Category") or "Other"),
+                    "M61 Note Category": (safe_str_strip(row.get("M61 Note Category")) or "Other"),
                     f"Eff Date ({col_tag})": fmt_date(ed_acp),
                     "Eff Date (M61)": fmt_date(row.get("Effective Date (M61)")),
                     f"Pledge Date ({col_tag})": fmt_date(
@@ -2287,9 +2288,9 @@ if "df_recon" in st.session_state:
                     ),
                 }
                 _is_target_ui = (
-                    str(row.get("Deal Name") or "").strip().lower() == "block 21 san mateo"
-                    and str(row.get("Facility") or "").strip().lower() == "tbk bank"
-                    and str(row.get("Source") or "").strip().lower() == "sale"
+                    safe_str_strip(row.get("Deal Name")).lower() == "block 21 san mateo"
+                    and safe_str_strip(row.get("Facility")).lower() == "tbk bank"
+                    and safe_str_strip(row.get("Source")).lower() == "sale"
                     and _date_key_ui(row.get("Effective Date (ACP)")) == "2022-08-22"
                 )
                 if _is_target_ui:
@@ -2913,12 +2914,12 @@ if "df_recon" in st.session_state:
                     df_b_ctx = ctx.get("df_primary_matchable", pd.DataFrame())
                     df_a_ctx = ctx.get("df_m61_matchable", pd.DataFrame())
 
-                    did = str(row.get("Deal ID Match Key (ACP)") or "").strip()
-                    mid = str(row.get("M61 Extracted Deal ID") or "").strip()
+                    did = safe_str_strip(row.get("Deal ID Match Key (ACP)"))
+                    mid = safe_str_strip(row.get("M61 Extracted Deal ID"))
                     dkey = did or mid
                     eff_acp_key = _date_key_ui(row.get("Effective Date (ACP)"))
                     eff_m61_key = _date_key_ui(row.get("Effective Date (M61)"))
-                    note = str(row.get("Liability Note (M61)") or "").strip()
+                    note = safe_str_strip(row.get("Liability Note (M61)"))
 
                     st.caption(
                         "Underlying source rows: "
@@ -2967,13 +2968,13 @@ if "df_recon" in st.session_state:
                     def _row_group_key(rr: pd.Series, side: str) -> str:
                         dk = ""
                         if side == "acore" and "acp_match_key" in rr.index:
-                            dk = str(rr.get("acp_match_key") or "").strip()
+                            dk = safe_str_strip(rr.get("acp_match_key"))
                         if side == "m61" and "m61_match_key" in rr.index:
-                            dk = str(rr.get("m61_match_key") or "").strip()
-                        ek = str(rr.get("effective_date_key") or "").strip()
+                            dk = safe_str_strip(rr.get("m61_match_key"))
+                        ek = safe_str_strip(rr.get("effective_date_key"))
                         if not ek:
                             ek = _date_key_ui(rr.get("Effective Date"))
-                        nk = str(rr.get("Liability Note") or "").strip()
+                        nk = safe_str_strip(rr.get("Liability Note"))
                         if dk or ek:
                             return f"{dk}|{ek}"
                         if nk:
@@ -3074,10 +3075,12 @@ if "df_recon" in st.session_state:
                             # Visual-only drilldown aid: ACORE vs M61 effective date, plus rate/spread mismatch hints
                             # when dates align (does not affect reconciliation/matching).
                             _acore_eff_key = _date_key_ui(ed_acp)
-                            _ar_mismatch = "MISMATCH" in str(
-                                row.get("Advance Rate Status", "") or ""
+                            _ar_mismatch = "MISMATCH" in safe_str_strip(
+                                row.get("Advance Rate Status", "")
                             ).upper()
-                            _sp_mismatch = "MISMATCH" in str(row.get("Spread Status", "") or "").upper()
+                            _sp_mismatch = "MISMATCH" in safe_str_strip(
+                                row.get("Spread Status", "")
+                            ).upper()
 
                             def _match_explain_for_m61_date(m61_k: str) -> str:
                                 if _acore_eff_key and m61_k and m61_k == _acore_eff_key:
@@ -3111,7 +3114,7 @@ if "df_recon" in st.session_state:
                             )
                             # Display-only mirror of reconciliation basis:
                             # follow the already-computed source on the current reconciliation row.
-                            _adv_src = str(row.get("Advance Rate Source (M61)") or "").strip().lower()
+                            _adv_src = safe_str_strip(row.get("Advance Rate Source (M61)")).lower()
                             _use_deal_level = _adv_src == "deal level advance rate"
                             _tgt_adv = (
                                 a_hit["Target Advance Rate"]
