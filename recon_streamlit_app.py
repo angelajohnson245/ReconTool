@@ -3,6 +3,7 @@ Financing Line Reconciliation Tool — Streamlit UI
 Run with: streamlit run recon_streamlit_app.py
 """
 import calendar
+import html
 import io
 import os
 import re
@@ -23,6 +24,7 @@ from recon_enhanced_output import (
     PrimaryFileSchemaError,
     build_output_filename,
     build_workbook,
+    canonical_primary_file_type,
     categorize_m61_note_type,
     filter_recon_to_selected_fund,
     get_primary_config,
@@ -347,7 +349,7 @@ def primary_scope_label_for_missing_banner(
     if uploaded_filename:
         name = uploaded_filename.upper()
         if re.search(r"\bACP\s+III\b", name):
-            return PRIMARY_TYPE_FUND_CONFIG["ACORE"]["scope_label"]
+            return PRIMARY_TYPE_FUND_CONFIG["ACP III"]["scope_label"]
         if re.search(r"\bACP\s+II\b", name):
             return PRIMARY_TYPE_FUND_CONFIG["ACP II"]["scope_label"]
         if re.search(r"\bACP\s+I\b(?!\s*I)", name):
@@ -423,7 +425,7 @@ def infer_primary_type_from_filename(uploaded_filename: str | None) -> str | Non
     name = uploaded_filename.upper()
     # Check ACP III before ACP II and use full-term matching to avoid substring overlap.
     if re.search(r"\bACP\s+III\b", name):
-        return "ACORE"
+        return "ACP III"
     if re.search(r"\bACP\s+II\b", name):
         return "ACP II"
     if re.search(r"\bACP\s+I\b(?!\s*I)", name):
@@ -432,8 +434,6 @@ def infer_primary_type_from_filename(uploaded_filename: str | None) -> str | Non
         return "AOC II"
     if re.search(r"\bAOC\s+I\b(?!\s*I)", name):
         return "AOC I"
-    if "ACORE" in name:
-        return "ACORE"
     return None
 
 
@@ -960,7 +960,9 @@ with st.sidebar:
         scope_toggle_needed = False
     elif "df_recon" in st.session_state:
         _scope_df = st.session_state.get("df_recon", pd.DataFrame())
-        _scope_primary = st.session_state.get("primary_file_type", primary_file_type)
+        _scope_primary = canonical_primary_file_type(
+            st.session_state.get("primary_file_type", primary_file_type)
+        )
         if isinstance(_scope_df, pd.DataFrame) and not _scope_df.empty:
             _fund = filter_recon_to_selected_fund(_scope_df, _scope_primary)
             _has_other_funds = not _scope_df.sort_index().equals(_fund.sort_index())
@@ -1081,11 +1083,16 @@ with st.sidebar:
                 )
  
     st.markdown("---")
+    _m61_export_line = (
+        f"M61 Export: {html.escape(file_a_upload.name, quote=True)}"
+        if file_a_upload
+        else "M61 Export: —"
+    )
     st.markdown(
         f"""
     <div style='font-size:0.7rem; color:#5a7890; line-height:1.6'>
-    <strong style='color:#8fb8d8'>Primary Source</strong><br>{_pc["model_descriptor"]}<br><br>
-    <strong style='color:#8fb8d8'>Comparison Source</strong><br>M61 Relationship Export<br><br>
+    <strong style='color:#8fb8d8'>Primary Source</strong><br>{html.escape(str(_pc["model_descriptor"]), quote=True)}<br><br>
+    <strong style='color:#8fb8d8'>Comparison Source</strong><br>{_m61_export_line}<br><br>
     
     </div>
     """,
@@ -1103,7 +1110,7 @@ st.markdown(
 <div class="recon-header">
   <div>
     <h1>📊 Financing Line Reconciliation</h1>
-    <p>Primary: <strong>{selected_ui_label}</strong> · Comparison: M61 export</p>
+    <p>Primary: <strong>{html.escape(str(selected_ui_label), quote=True)}</strong> · {_m61_export_line}</p>
   </div>
   <div class="badge">Run: {datetime.now().strftime("%b %d, %Y  %H:%M")}</div>
 </div>
@@ -1487,7 +1494,10 @@ if has_required_uploads and (manual_run_requested or auto_run_requested):
 if "df_recon" in st.session_state:
     df_recon = st.session_state["df_recon"]
     df_excluded_by_type = st.session_state.get("df_excluded_by_liability_type", pd.DataFrame())
-    run_primary = st.session_state.get("primary_file_type", primary_file_type)
+    _run_primary_raw = st.session_state.get("primary_file_type", primary_file_type)
+    run_primary = canonical_primary_file_type(_run_primary_raw)
+    if _run_primary_raw != run_primary:
+        st.session_state["primary_file_type"] = run_primary
     run_primary_upload_name = st.session_state.get("primary_upload_name")
     run_excel_name = st.session_state.get(
         "last_run_excel_name",
@@ -1728,7 +1738,7 @@ if "df_recon" in st.session_state:
     # For selected primary types: when Note Category is not All, drop M61-only rows (same as prior default
     # with the removed "Show M61-only exceptions" checkbox always off).
     _td_after_m61_hide = None  # TEMP DEBUG default
-    if run_primary in ("ACORE", "AOC II", "AOC I"):
+    if run_primary in ("ACP III", "AOC II", "AOC I"):
         # When Note Category = All, show full universe (including M61-only rows).
         hide_m61_only = _note_pick != "All"
         if hide_m61_only and "File Source" in df_view.columns:
@@ -1742,7 +1752,7 @@ if "df_recon" in st.session_state:
 
     _displayed_rows_final = len(df_view)
     _note_cat_m61_only_hidden_hint = (
-        run_primary in ("ACORE", "AOC II", "AOC I")
+        run_primary in ("ACP III", "AOC II", "AOC I")
         and _after_note_filter > 0
         and _after_status_filter > 0
         and _displayed_rows_final == 0

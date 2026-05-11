@@ -41,15 +41,20 @@ DEFAULT_FILE_B_PATH = os.path.join(
 # - export_label: file naming label
 # - scope_label: short label shown in scoped UI messages
 # - fund_token: case-insensitive token to scope rows by Fund column
+# ACP III fund scoping: ``PRIMARY_FILE_CONFIG`` uses the key ``ACP III``; keep ``ACORE`` as an
+# alias to the same dict so legacy callers / session state still resolve fund tokens consistently.
+_ACP_III_FUND_PROFILE: dict[str, str] = {
+    "export_label": "ACORE - ACP III",
+    "scope_label": "ACP III",
+    "fund_token": "credit partners iii",
+    "fund_regex": r"\bcredit partners iii\b",
+    # M61-style Fund column when Liability export has no Fund Name for this row.
+    "recon_fund_display": "ACORE Credit Partners III",
+}
+
 PRIMARY_TYPE_FUND_CONFIG = {
-    "ACORE": {
-        "export_label": "ACORE - ACP III",
-        "scope_label": "ACP III",
-        "fund_token": "credit partners iii",
-        "fund_regex": r"\bcredit partners iii\b",
-        # M61-style Fund column when Liability export has no Fund Name for this row.
-        "recon_fund_display": "ACORE Credit Partners III",
-    },
+    "ACORE": _ACP_III_FUND_PROFILE,
+    "ACP III": _ACP_III_FUND_PROFILE,
     "ACP II": {
         "export_label": "ACORE - ACP II",
         "scope_label": "ACP II",
@@ -137,10 +142,12 @@ def _fund_cfg(primary_file_type: str) -> dict:
 
 
 # Primary workbooks that share Fin Inpt + liability-note-driven financing match rules.
-FIN_INPT_PRIMARY_TYPES = frozenset({"ACORE", "ACP II", "ACP I", "AOC II", "AOC I"})
-# Funds where Sale rows should compare against M61 DealLevelAdvanceRate.
-# ACP III/ACORE intentionally excluded for now (keeps Target Advance Rate behavior).
-SALE_DEALLEVEL_PRIMARY_TYPES = frozenset({"ACP II", "ACP I", "AOC II", "AOC I"})
+FIN_INPT_PRIMARY_TYPES = frozenset({"ACORE", "ACP III", "ACP II", "ACP I", "AOC II", "AOC I"})
+# Fin-Inpt funds where chosen Advance Rate (M61) values are passed through ``_normalize_aoc_ii_m61_adv_value``.
+# Row-level Sale / Sub Debt vs Target selection uses ``_deal_type_uses_m61_deal_level_advance`` (ACORE
+# ``Source`` + M61 ``Liability Type`` only) for all ``FIN_INPT_PRIMARY_TYPES``; this set only gates the
+# normalization helper.
+SALE_DEALLEVEL_PRIMARY_TYPES = frozenset({"ACP II", "ACP I", "ACP III", "AOC II", "AOC I"})
 
 # Optional columns when reconcile(..., match_diagnostics=True). Does not affect matching.
 MATCH_DIAGNOSTIC_COLUMNS = (
@@ -565,7 +572,7 @@ def detect_fund_label(uploaded_filename: str | None, primary_file_type: str) -> 
     if uploaded_filename:
         name = uploaded_filename.upper()
         if re.search(r"\bACP\s+III\b", name):
-            return PRIMARY_TYPE_FUND_CONFIG["ACORE"]["export_label"]
+            return PRIMARY_TYPE_FUND_CONFIG["ACP III"]["export_label"]
         if re.search(r"\bACP\s+II\b", name):
             return PRIMARY_TYPE_FUND_CONFIG["ACP II"]["export_label"]
         if re.search(r"\bACP\s+I\b(?!\s*I)", name):
@@ -861,8 +868,10 @@ def _compute_m61_advance_rate_and_source_for_display(
 ) -> tuple[object, object, object]:
     """Mirror ``reconcile`` Advance Rate (M61) selection for the ``Advance Rate`` compare field.
 
-    Same branches as the main loop: ``SALE_DEALLEVEL_PRIMARY_TYPES`` → normalized deal-level vs target;
-    ``FIN_INPT_PRIMARY_TYPES`` (non–sale-deallevel funds) → target only; else legacy deal-level vs target.
+    Same branches as the main loop: Fin Inpt primaries use deal-level vs target from
+    ``_deal_type_uses_m61_deal_level_advance`` (ACORE ``Source`` + M61 ``Liability Type`` only);
+    ``SALE_DEALLEVEL_PRIMARY_TYPES`` additionally run ``_normalize_aoc_ii_m61_adv_value`` on the
+    chosen value. Non–Fin-Inpt flows keep the legacy sale/deal-level fallback.
     """
     compare_val = pd.NA
     adv_m61 = pd.NA
@@ -878,9 +887,14 @@ def _compute_m61_advance_rate_and_source_for_display(
             adv_m61 = _normalize_aoc_ii_m61_adv_value(compare_val)
             adv_src = "Target Advance Rate"
     elif primary_file_type in FIN_INPT_PRIMARY_TYPES:
-        compare_val = target_advance_rate
-        adv_m61 = compare_val
-        adv_src = "Target Advance Rate"
+        if use_deal_level_adv:
+            compare_val = deal_level_advance_rate
+            adv_m61 = compare_val
+            adv_src = "Deal Level Advance Rate"
+        else:
+            compare_val = target_advance_rate
+            adv_m61 = compare_val
+            adv_src = "Target Advance Rate"
     else:
         if use_deal_level_adv:
             compare_val = deal_level_advance_rate
@@ -922,9 +936,12 @@ def _related_m61_display_updates_from_pick(
     if "Raw Deal Level Advance Rate from M61" in out_columns:
         upd["Raw Deal Level Advance Rate from M61"] = dlr
 
-    fund_name = pick.get("Fund Name")
     liab_type = pick.get("Liability Type")
-    use_deal_level_adv = _is_sale_type_fund_or_deal(fund_name=fund_name, liability_type=liab_type)
+    acore_src = acore_row.get("Source") if acore_row is not None else pd.NA
+    use_deal_level_adv = _deal_type_uses_m61_deal_level_advance(
+        liability_type=liab_type,
+        acore_source=acore_src,
+    )
 
     adv_m61, adv_src, compare_val = _compute_m61_advance_rate_and_source_for_display(
         primary_file_type=primary_file_type,
@@ -933,16 +950,13 @@ def _related_m61_display_updates_from_pick(
         use_deal_level_adv=use_deal_level_adv,
     )
 
-    if primary_file_type in SALE_DEALLEVEL_PRIMARY_TYPES:
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES:
         if use_deal_level_adv:
             if _is_blank_for_compare(compare_val):
                 skip_reasons.append("advance_rate: deal-level chain blank")
         else:
             if _is_blank_for_compare(compare_val):
                 skip_reasons.append("advance_rate: Target Advance Rate blank")
-    elif primary_file_type in FIN_INPT_PRIMARY_TYPES:
-        if _is_blank_for_compare(compare_val):
-            skip_reasons.append("advance_rate: Target Advance Rate blank (Fin Inpt)")
     else:
         if use_deal_level_adv:
             if _is_blank_for_compare(compare_val):
@@ -1774,7 +1788,7 @@ class PrimaryFileSchemaError(ValueError):
 
 
 PRIMARY_FILE_CONFIG: dict[str, dict] = {
-    "ACORE": {
+    "ACP III": {
         "sheet_name": "10) Fin Inpt",
         "header_row": 6,
         "column_map": {
@@ -1792,9 +1806,9 @@ PRIMARY_FILE_CONFIG: dict[str, dict] = {
             "floor": "Floor",
             "recourse_pct": "Recourse %",
         },
-        "display_name": "ACORE",
+        "display_name": "ACP III",
         "ui_display_label": "ACORE - ACP III",
-        "model_descriptor": "ACORE Liquidity & Earnings Model",
+        "model_descriptor": "ACP III Liquidity & Earnings Model",
         "source_indicator_primary_only": "ACORE",
         "missing_in_primary_label": "ACORE",
         "excel_primary_column_suffix": "ACORE",
@@ -1926,9 +1940,17 @@ PRIMARY_FILE_CONFIG: dict[str, dict] = {
     },
 }
 
-STREAMLIT_PRIMARY_FILE_TYPES = ("ACP I", "ACP II", "ACORE", "AOC I", "AOC II")
+STREAMLIT_PRIMARY_FILE_TYPES = ("ACP I", "ACP II", "ACP III", "AOC I", "AOC II")
 
 PRIMARY_REQUIRED_IN_SHEET = ("deal_name", "note_name", "facility", "effective_date")
+
+# Older UI / sessions used ``ACORE`` for the ACP III workbook template; map to the real config key.
+_LEGACY_PRIMARY_FILE_TYPE_TO_CANONICAL = {"ACORE": "ACP III"}
+
+
+def canonical_primary_file_type(primary_file_type: str) -> str:
+    s = str(primary_file_type or "").strip()
+    return _LEGACY_PRIMARY_FILE_TYPE_TO_CANONICAL.get(s, s)
 
 
 def _primary_required_keys(cfg: dict) -> tuple[str, ...]:
@@ -1937,12 +1959,13 @@ def _primary_required_keys(cfg: dict) -> tuple[str, ...]:
 
 
 def get_primary_config(primary_file_type: str) -> dict:
-    if primary_file_type not in PRIMARY_FILE_CONFIG:
+    pt = canonical_primary_file_type(primary_file_type)
+    if pt not in PRIMARY_FILE_CONFIG:
         known = ", ".join(sorted(PRIMARY_FILE_CONFIG))
         raise ValueError(
             f"Unknown primary file type {primary_file_type!r}. Expected one of: {known}"
         )
-    return PRIMARY_FILE_CONFIG[primary_file_type]
+    return PRIMARY_FILE_CONFIG[pt]
 
 
 def ensure_columns(df: pd.DataFrame, columns) -> pd.DataFrame:
@@ -2277,7 +2300,7 @@ def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
 def _fin_note_tokens_for_primary(primary_file_type: str) -> tuple[str, ...]:
     """Liability-note substrings that flag financing lines for the selected fund (M61 load filter OR)."""
     p = str(primary_file_type or "").strip().upper()
-    if p == "ACORE":
+    if p in ("ACORE", "ACP III"):
         return (
             "LN_FIN_ACPIII",
             "LN_FIN_ACP_III",
@@ -2571,7 +2594,7 @@ def load_file_a(
 
 
 def load_file_b(path: str) -> pd.DataFrame:
-    return load_primary_file(path, "ACORE")
+    return load_primary_file(path, "ACP III")
 
 
 def normalise_text(value):
@@ -3056,13 +3079,27 @@ def _is_whole_loan_or_cpace_source(value) -> bool:
     return ("whole loan" in s) or ("wholeloan" in s) or ("wl-cpace" in s) or ("wlcpace" in s)
 
 
-def _is_sale_type_fund_or_deal(*, fund_name, liability_type) -> bool:
-    """Business override: sale-type funds compare against deal-level advance rate."""
-    fn = normalise_text(fund_name)
+def _deal_type_uses_m61_deal_level_advance(
+    *,
+    liability_type,
+    acore_source=None,
+) -> bool:
+    """True when Advance Rate should use M61 deal-level (vs target) for this row.
+
+    Only row-level **ACORE ``Source``** and **M61 ``Liability Type``** are consulted (after
+    ``normalise_text``): ``\\b(sale|sold)\\b`` and ``\\bsub[\\s-]*debt\\b`` — same Sub Debt phrase
+    family as ``categorize_m61_note_category``. M61 **Fund Name** is intentionally excluded from this
+    decision (fund labels are not treated as row-specific deal type).
+    """
+    src = normalise_text(acore_source)
     lt = normalise_text(liability_type)
-    # Use whole-word sale markers only (avoid false positives like "wholesale").
     sale_re = re.compile(r"\b(sale|sold)\b", re.IGNORECASE)
-    return bool(sale_re.search(fn or "")) or bool(sale_re.search(lt or ""))
+    if sale_re.search(src) or sale_re.search(lt):
+        return True
+    sub_re = re.compile(r"\bsub[\s-]*debt\b", re.IGNORECASE)
+    if sub_re.search(src) or sub_re.search(lt):
+        return True
+    return False
 
 
 def _m61_deal_level_advance_rate(row: pd.Series, label_a: str):
@@ -4677,41 +4714,35 @@ def reconcile(
                     key_field_statuses.append("MISSING")
                 continue
 
-            # Advance Rate comparison basis:
-            # - ACP II / ACP I / AOC II / AOC I: Sale-type liabilities → Deal Level advance; else Target.
-            # - ACORE (ACP III): keep Target-only behavior.
-            # - Other flows retain legacy sale-type fallback to deal-level advance.
+            # Advance Rate comparison basis (Fin Inpt primaries):
+            # Sale/Sold/Sub Debt from row-level ACORE ``Source`` or M61 ``Liability Type`` → deal-level
+            # chain; otherwise Target Advance Rate. Non–Fin-Inpt flows use the same Source/Type rule
+            # without AOC-II-style normalization.
             if b_field == "Advance Rate":
-                if primary_file_type in SALE_DEALLEVEL_PRIMARY_TYPES:
-                    fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
-                    liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
-                    use_deal_level_adv = _is_sale_type_fund_or_deal(
-                        fund_name=fund_name,
-                        liability_type=liab_type,
-                    )
+                liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
+                acore_src = row.get("Source") if in_b else pd.NA
+                use_deal_level_adv = _deal_type_uses_m61_deal_level_advance(
+                    liability_type=liab_type,
+                    acore_source=acore_src,
+                )
+                if primary_file_type in FIN_INPT_PRIMARY_TYPES:
                     if use_deal_level_adv:
                         compare_val = _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
-                        record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
+                        if primary_file_type in SALE_DEALLEVEL_PRIMARY_TYPES:
+                            record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
+                        else:
+                            record["Advance Rate (M61)"] = compare_val
                         record["Advance Rate Source (M61)"] = "Deal Level Advance Rate"
                     else:
                         compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
-                        record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
+                        if primary_file_type in SALE_DEALLEVEL_PRIMARY_TYPES:
+                            record["Advance Rate (M61)"] = _normalize_aoc_ii_m61_adv_value(compare_val)
+                        else:
+                            record["Advance Rate (M61)"] = compare_val
                         record["Advance Rate Source (M61)"] = "Target Advance Rate"
                     val_a = record["Advance Rate (M61)"]
                     record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
-                elif primary_file_type in FIN_INPT_PRIMARY_TYPES:
-                    compare_val = row.get(f"{label_a}_Target Advance Rate") if in_a else pd.NA
-                    record["Advance Rate (M61)"] = compare_val
-                    record["Advance Rate Source (M61)"] = "Target Advance Rate"
-                    val_a = compare_val
-                    record["Final Advance Rate (M61)"] = record.get("Advance Rate (M61)")
                 else:
-                    fund_name = row.get(f"{label_a}_Fund Name") if in_a else ""
-                    liab_type = row.get(f"{label_a}_Liability Type") if in_a else ""
-                    use_deal_level_adv = _is_sale_type_fund_or_deal(
-                        fund_name=fund_name,
-                        liability_type=liab_type,
-                    )
                     if use_deal_level_adv:
                         compare_val = _m61_deal_level_advance_rate(row, label_a) if in_a else pd.NA
                         record["Advance Rate (M61)"] = compare_val
@@ -4939,18 +4970,6 @@ def reconcile(
         primary_file_type=primary_file_type,
     )
     _target_stage2 = _target_22203_snapshot(df_out)
-    # Hard guard for Fin Inpt runs that remain Target-only (ACORE / ACP III).
-    # SALE_DEALLEVEL_PRIMARY_TYPES pick Target vs Deal Level per row upstream.
-    if (
-        primary_file_type in FIN_INPT_PRIMARY_TYPES
-        and primary_file_type not in SALE_DEALLEVEL_PRIMARY_TYPES
-        and "Advance Rate (M61)" in df_out.columns
-        and "Target Advance Rate (M61)" in df_out.columns
-    ):
-        df_out["Advance Rate (M61)"] = df_out["Target Advance Rate (M61)"]
-        if "Advance Rate Source (M61)" in df_out.columns:
-            has_target = df_out["Target Advance Rate (M61)"].notna()
-            df_out.loc[has_target, "Advance Rate Source (M61)"] = "Target Advance Rate"
 
     df_out = _ensure_file_source_populated(df_out)
 
@@ -5312,7 +5331,7 @@ def primary_workbook_context(primary_file_type: str = "ACORE") -> dict:
         "group_primary_header": cfg["primary_group_header"],
         "legend_match_detail": f"All key fields align between {dn} and M61",
         "legend_primary_only_label": cfg["primary_only_legend_label"],
-        "legend_primary_only_detail": f"Record found only in {dn} model; not yet in M61",
+        "legend_primary_only_detail": f"Record found only in {dn} model; not in M61",
         "excel_primary_column_suffix": cfg["excel_primary_column_suffix"],
     }
 
@@ -5509,7 +5528,7 @@ def run(
     file_a_path=DEFAULT_FILE_A_PATH,
     file_b_path=DEFAULT_FILE_B_PATH,
     out_path: str | None = None,
-    primary_file_type: str = "ACORE",
+    primary_file_type: str = "ACP II",
     mapping_path: str | None = None,
 ):
     if out_path is None:
@@ -5552,7 +5571,7 @@ def main():
     parser.add_argument("--file-b", dest="file_b", default=DEFAULT_FILE_B_PATH, help="Path to primary business file")
     parser.add_argument(
         "--primary-type",
-        default="ACORE",
+        default="ACP II",
         choices=tuple(sorted(PRIMARY_FILE_CONFIG.keys())),
         help="Primary workbook template (column mapping)",
     )
