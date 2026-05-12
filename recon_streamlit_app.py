@@ -752,6 +752,152 @@ def _mismatch_detail_html(row: pd.Series) -> str:
     )
 
 
+def explain_reconciliation_row(row: pd.Series) -> str:
+    """Plain-English, assistant-style row explanation for business users (no API / LLM)."""
+
+    STATUS_COLS: tuple[tuple[str, str], ...] = (
+        ("Advance Rate Status", "Advance Rate"),
+        ("Spread Status", "Spread"),
+        ("Effective Date Status", "Effective Date"),
+        ("Pledge Date Status", "Pledge Date"),
+        ("Undrawn Capacity Status", "Undrawn Capacity"),
+        ("Index Floor Status", "Index Floor"),
+        ("Index Name Status", "Index Name"),
+        ("Recourse % Status", "Recourse %"),
+    )
+
+    def _kind(val: object) -> str:
+        u = safe_str_strip(val).upper()
+        if not u or u in ("N/A", "NAN", "NONE", "-", "—"):
+            return "blank"
+        if "MISSING FROM BOTH" in u or ("MISSING" in u and "BOTH" in u):
+            return "both_missing"
+        if "MISSING" in u or "INCOMPLETE" in u:
+            return "missing"
+        if any(k in u for k in ("MISMATCH", "NO MATCH", "DIFFERENCE", "DIFFERENT")):
+            return "mismatch"
+        if u == "MATCH" or (u.startswith("MATCH") and "DIFF" not in u):
+            return "missing" if "MISSING" in u else "match"
+        return "other"
+
+    overall = safe_str_strip(row.get("recon_status", ""))
+    file_src = safe_str_strip(row.get("File Source", ""))
+    deal = safe_str_strip(row.get("Deal Name", ""))
+    facility = safe_str_strip(row.get("Facility", ""))
+    bucket = _recon_status_bucket(row.get("recon_status", ""))
+    o = overall.upper()
+
+    mismatch_fields: list[str] = []
+    missing_fields: list[str] = []
+    both_missing_fields: list[str] = []
+
+    for col, label in STATUS_COLS:
+        if col not in row.index:
+            continue
+        k = _kind(row.get(col))
+        if k == "mismatch":
+            mismatch_fields.append(label)
+        elif k == "missing":
+            missing_fields.append(label)
+        elif k == "both_missing":
+            both_missing_fields.append(label)
+
+    lines: list[str] = []
+
+    # ── Opening: plain-English overall status ──────────────────────────────
+    if file_src == FILE_SOURCE_ACORE_ONLY or "MISSING IN M61" in o or "MISSING FROM M61" in o:
+        lines.append("**This row exists in ACORE but has no matching entry in M61.**")
+        lines.append(
+            f"The deal **{deal}** — facility **{facility}** — was found in your ACORE "
+            "model but could not be paired with any line in the M61 export."
+        )
+    elif file_src == FILE_SOURCE_M61_ONLY or "MISSING IN ACORE" in o or "MISSING FROM ACORE" in o:
+        lines.append("**This row exists in M61 but has no matching entry in ACORE.**")
+        lines.append(
+            f"The line **{facility}** was found in M61 but does not appear in your "
+            f"ACORE model for deal **{deal}**."
+        )
+    elif bucket == "MATCH" and not mismatch_fields and not missing_fields:
+        lines.append("**This row is a clean match.**")
+        lines.append(
+            f"The deal **{deal}** — facility **{facility}** — exists in both ACORE and "
+            "M61, and all compared values line up. No action needed."
+        )
+    elif mismatch_fields and missing_fields:
+        lines.append("**This row has both value differences and missing data.**")
+        lines.append(
+            f"The deal **{deal}** — facility **{facility}** — was found in both ACORE "
+            "and M61, but some fields don't agree and others are blank on one side."
+        )
+    elif mismatch_fields:
+        lines.append("**This row has a value difference.**")
+        lines.append(
+            f"The deal **{deal}** — facility **{facility}** — exists in both ACORE and "
+            "M61, but the values below don't match."
+        )
+    elif missing_fields:
+        lines.append("**This row is partially matched.**")
+        lines.append(
+            f"The deal **{deal}** — facility **{facility}** — exists in both ACORE and "
+            "M61, and there are no value differences for the fields that were compared."
+        )
+    else:
+        lines.append(f"**Overall status: {overall or 'unknown'}.**")
+        lines.append(
+            f"Deal **{deal}** — facility **{facility}**."
+        )
+
+    # ── Value differences ──────────────────────────────────────────────────
+    if mismatch_fields:
+        lines.append(
+            "These fields have different values between ACORE and M61:\n"
+            + "".join(f"\n- {f}" for f in mismatch_fields)
+        )
+
+    # ── One-sided missing data ─────────────────────────────────────────────
+    if missing_fields:
+        lines.append(
+            "However, these fields need review because one side is missing data:\n"
+            + "".join(f"\n- {f}" for f in missing_fields)
+        )
+
+    # ── Next step ─────────────────────────────────────────────────────────
+    if file_src == FILE_SOURCE_ACORE_ONLY or "MISSING IN M61" in o or "MISSING FROM M61" in o:
+        next_step = (
+            "Check the M61 export to see whether this line should be there. "
+            "Confirm the fund scope, note category, and effective date are not "
+            "filtering it out."
+        )
+    elif file_src == FILE_SOURCE_M61_ONLY or "MISSING IN ACORE" in o or "MISSING FROM ACORE" in o:
+        next_step = (
+            "Check your ACORE model to confirm whether this line should appear. "
+            "Make sure the deal, facility name, and effective date are included "
+            "in your export."
+        )
+    elif bucket == "MATCH" and not mismatch_fields and not missing_fields:
+        next_step = "No follow-up required."
+    elif mismatch_fields:
+        field_list = ", ".join(mismatch_fields)
+        next_step = (
+            f"Open both source files and compare the values for: {field_list}. "
+            "Use the Deal Drilldown tab to see them side by side."
+        )
+    elif missing_fields:
+        next_step = (
+            "Check the ACORE and M61 source files for those fields to confirm "
+            "whether they are intentionally blank or need to be updated."
+        )
+    else:
+        next_step = (
+            "Review the overall status and re-run reconciliation after "
+            "refreshing your uploads if anything looks unexpected."
+        )
+
+    lines.append(f"**Next step:**\n{next_step}")
+
+    return "\n\n".join(lines)
+
+
 # --------------------------------------------------
 # SIDEBAR
 # --------------------------------------------------
@@ -1143,20 +1289,37 @@ def pill(status):
     return f'<span class="pill pill-na">{status}</span>'
  
  
-def pct(v):
+def pct(v, *, ndigits: int = 2, missing: str = "—"):
     if v is None:
-        return "—"
+        return missing
+    try:
+        if isinstance(v, str) and str(v).strip() in ("-", "—", ""):
+            return missing
+    except Exception:
+        pass
     try:
         s = str(v).strip()
+        if s in ("-", "—"):
+            return missing
         if s.endswith("%"):
             fv = float(s.replace("%", "").replace(",", "").strip()) / 100.0
         else:
             fv = float(v)
         if pd.isna(fv):
-            return "—"
-        return f"{fv:.2%}"
+            return missing
+        return f"{fv:.{ndigits}%}"
     except Exception:
-        return "—"
+        return missing
+
+
+def pct_spread(v):
+    """Spread-only: percent with 3 decimal places; missing → ``-`` (aligned with display/export dashes)."""
+    return pct(v, ndigits=3, missing="-")
+
+
+def _is_spread_value_column(name: object) -> bool:
+    cl = str(name).lower()
+    return "spread" in cl and "status" not in cl
 
 
 def fmt_fraction_as_pct(v, *, ndigits: int = 3):
@@ -2257,9 +2420,9 @@ if "df_recon" in st.session_state:
                     "Adv Rate (M61)": (
                         "—" if _m61_missing_by_status("Advance Rate Status") else pct(row.get("Advance Rate (M61)"))
                     ),
-                    f"Spread ({col_tag})": pct(sp_acp),
+                    f"Spread ({col_tag})": pct_spread(sp_acp),
                     "Spread (M61)": (
-                        "—" if _m61_missing_by_status("Spread Status") else pct(row.get("Spread (M61)"))
+                        "-" if _m61_missing_by_status("Spread Status") else pct_spread(row.get("Spread (M61)"))
                     ),
                     f"Undrawn ({col_tag})": fmt_num_plain(und_acp),
                     "Undrawn (M61)": (
@@ -2693,6 +2856,20 @@ if "df_recon" in st.session_state:
                 styled = df_table_view_display.style
             else:
                 styled = df_table_view_display.style
+                _spread_cols = [c for c in df_table_view_display.columns if _is_spread_value_column(c)]
+                if _spread_cols:
+
+                    def _fmt_spread_styler(v):
+                        if isinstance(v, str) and str(v).strip() in ("-", "—", ""):
+                            return "-"
+                        try:
+                            if pd.isna(v):
+                                return "-"
+                        except (TypeError, ValueError):
+                            pass
+                        return pct_spread(v)
+
+                    styled = styled.format(_fmt_spread_styler, subset=_spread_cols)
                 if status_cols_visible:
                     styled = styled.map(color_status, subset=status_cols_visible)
                     # Uniform cell box for all status columns (padding, wrap, center — Spread baseline).
@@ -2748,6 +2925,9 @@ if "df_recon" in st.session_state:
                     _sel_deal = str(df_table_view.iloc[_sel_pos].get("Deal Name", "")).strip()
                     if _sel_deal:
                         st.session_state["drilldown_deal_pick"] = _sel_deal
+                    _explain_src = df_view.loc[df_table_view.index[_sel_pos]]
+                    with st.expander("Explain this row", expanded=True):
+                        st.markdown(explain_reconciliation_row(_explain_src))
 
             if len(df_table_view) == 0:
                 df_export_ui = df_view.iloc[0:0].copy()
@@ -2863,11 +3043,11 @@ if "df_recon" in st.session_state:
                     </div>
                     <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
                       <div style='font-size:0.65rem; color:#888; text-transform:uppercase; letter-spacing:.06em'>Spread ({col_tag})</div>
-                      <div style='font-size:0.92rem; font-weight:600; color:#1a3a6c'>{pct(sp_acp)}</div>
+                      <div style='font-size:0.92rem; font-weight:600; color:#1a3a6c'>{pct_spread(sp_acp)}</div>
                     </div>
                     <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
                       <div style='font-size:0.65rem; color:#888; text-transform:uppercase; letter-spacing:.06em'>Spread (M61)</div>
-                      <div style='font-size:0.92rem; font-weight:600; color:#1a3a6c'>{pct(row.get("Spread (M61)"))}</div>
+                      <div style='font-size:0.92rem; font-weight:600; color:#1a3a6c'>{pct_spread(row.get("Spread (M61)"))}</div>
                     </div>
                     <div style='background:#f8fafd; border-radius:6px; padding:12px 14px;'>
                       <div style='font-size:0.65rem; color:#888; text-transform:uppercase; letter-spacing:.06em'>Undrawn ({col_tag})</div>
@@ -3041,7 +3221,7 @@ if "df_recon" in st.session_state:
                             b_disp[dc] = b_disp[dc].map(fmt_date)
                         for pc in ("Advance Rate", "Spread", "Floor", "Recourse", "Recourse %"):
                             if pc in b_disp.columns:
-                                b_disp[pc] = b_disp[pc].map(pct)
+                                b_disp[pc] = b_disp[pc].map(pct_spread if pc == "Spread" else pct)
                         st.dataframe(
                             b_disp.style.set_properties(
                                 subset=["Linked Match"],
@@ -3167,7 +3347,7 @@ if "df_recon" in st.session_state:
                                 "Recourse %",
                             ):
                                 if pc in a_disp.columns:
-                                    a_disp[pc] = a_disp[pc].map(pct)
+                                    a_disp[pc] = a_disp[pc].map(pct_spread if pc == "Spread" else pct)
                             st.dataframe(
                                 a_disp.style.set_properties(
                                     subset=["Linked Match"],
@@ -3235,7 +3415,11 @@ if "df_recon" in st.session_state:
                 df_csv_export[c] = df_csv_export[c].map(
                     lambda v: "-" if pd.isna(v) else fmt_date(v)
                 )
-            elif any(tok in cl for tok in ("rate", "spread", "recourse", "index floor", " floor")):
+            elif _is_spread_value_column(c):
+                df_csv_export[c] = df_csv_export[c].map(
+                    lambda v: "-" if pd.isna(v) else pct_spread(v)
+                )
+            elif any(tok in cl for tok in ("rate", "recourse", "index floor", " floor")):
                 df_csv_export[c] = df_csv_export[c].map(
                     lambda v: "-" if pd.isna(v) else pct(v)
                 )

@@ -5470,7 +5470,7 @@ def build_workbook(df_recon, primary_file_type: str = "ACORE"):
                     cell.number_format = "m/d/yy"
                     cell.alignment = _center()
                 elif pct and isinstance(val, float):
-                    cell.number_format = "0.00%"
+                    cell.number_format = "0.000%" if "Spread" in hdr else "0.00%"
                     cell.alignment = _center()
                 elif isinstance(val, str):
                     cell.alignment = _left()
