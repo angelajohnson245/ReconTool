@@ -725,6 +725,75 @@ def _recon_status_bucket(v: object) -> str:
     return ""
 
 
+def _card_contextual_insight(
+    card: str,
+    n_total: int,
+    n_match: int,
+    n_needs_review: int,
+    n_missing_m61: int,
+    df_needs_review: "pd.DataFrame",
+) -> str:
+    """Return a short plain-English insight paragraph for a clicked dashboard card."""
+    if card == "Total ACORE Records":
+        if n_total == 0:
+            return "No ACORE records are loaded yet. Upload an ACORE file to begin."
+        pct_match = round(n_match / n_total * 100) if n_total else 0
+        pct_review = round(n_needs_review / n_total * 100) if n_total else 0
+        return (
+            f"You have **{n_total}** ACORE records in the current view. "
+            f"Of these, **{n_match}** ({pct_match}%) are clean matches and "
+            f"**{n_needs_review}** ({pct_review}%) need review. "
+            f"Use the table below to drill into specific deals."
+        )
+
+    if card == "Matches":
+        if n_match == 0:
+            return (
+                "No clean matches found in the current view. "
+                "Try adjusting your filters, or check whether the advance rates "
+                "and effective dates align between ACORE and M61."
+            )
+        pct = round(n_match / n_total * 100) if n_total else 0
+        return (
+            f"**{n_match}** record(s) — {pct}% of the view — reconcile perfectly: "
+            f"advance rate, effective date, and all tracked fields agree between ACORE and M61. "
+            f"No action needed for these rows."
+        )
+
+    if card == "Needs Review":
+        if n_needs_review == 0:
+            return "Everything in the current view either matches or is missing from one system — no partial mismatches to review right now."
+        # Identify the most common mismatch field if data is available
+        top_issue = ""
+        if not df_needs_review.empty:
+            mismatch_cols = [c for c in df_needs_review.columns if c.endswith(" Status")]
+            hits: dict[str, int] = {}
+            for col in mismatch_cols:
+                count = int(df_needs_review[col].astype(str).str.upper().str.contains("MISMATCH|DIFFERENCE|NO MATCH", na=False).sum())
+                if count:
+                    label = col.replace(" Status", "")
+                    hits[label] = count
+            if hits:
+                top_label, top_count = max(hits.items(), key=lambda x: x[1])
+                top_issue = f" The most common discrepancy is **{top_label}** ({top_count} row(s))."
+        return (
+            f"**{n_needs_review}** record(s) have at least one field that doesn't agree between ACORE and M61.{top_issue} "
+            f"Filter the table to 'Needs Review' rows and use **Explain This Row** to see a plain-English summary of each issue."
+        )
+
+    if card == "Missing in M61":
+        if n_missing_m61 == 0:
+            return "All ACORE records in the current view have a matching entry in M61 — nothing is missing."
+        return (
+            f"**{n_missing_m61}** ACORE record(s) have no corresponding row in M61. "
+            f"This usually means the loan hasn't been booked in M61 yet, the deal name or facility "
+            f"label differs between systems, or the effective date doesn't align. "
+            f"Filter to 'Missing in M61' in the table and confirm with your operations team."
+        )
+
+    return ""
+
+
 def _mismatch_detail_html(row: pd.Series) -> str:
     """Short drilldown hint for negative testing: why recon_status is MISMATCH (from status columns)."""
     if _recon_status_bucket(row.get("recon_status", "")) != "MISMATCH":
@@ -753,20 +822,19 @@ def _mismatch_detail_html(row: pd.Series) -> str:
 
 
 def explain_reconciliation_row(row: pd.Series) -> str:
-    """Plain-English, assistant-style row explanation for business users (no API / LLM)."""
-
-    STATUS_COLS: tuple[tuple[str, str], ...] = (
-        ("Advance Rate Status", "Advance Rate"),
-        ("Spread Status", "Spread"),
+    """Short business-friendly explanation for the selected grid row (rules-based text only)."""
+    status_cols: tuple[tuple[str, str], ...] = (
         ("Effective Date Status", "Effective Date"),
         ("Pledge Date Status", "Pledge Date"),
+        ("Advance Rate Status", "Advance Rate"),
+        ("Spread Status", "Spread"),
         ("Undrawn Capacity Status", "Undrawn Capacity"),
         ("Index Floor Status", "Index Floor"),
         ("Index Name Status", "Index Name"),
         ("Recourse % Status", "Recourse %"),
     )
 
-    def _kind(val: object) -> str:
+    def _field_kind(val: object) -> str:
         u = safe_str_strip(val).upper()
         if not u or u in ("N/A", "NAN", "NONE", "-", "—"):
             return "blank"
@@ -780,122 +848,129 @@ def explain_reconciliation_row(row: pd.Series) -> str:
             return "missing" if "MISSING" in u else "match"
         return "other"
 
+    deal = safe_str_strip(row.get("Deal Name", "")) or "this deal"
+    facility = safe_str_strip(row.get("Facility", "")) or "this facility"
     overall = safe_str_strip(row.get("recon_status", ""))
     file_src = safe_str_strip(row.get("File Source", ""))
-    deal = safe_str_strip(row.get("Deal Name", ""))
-    facility = safe_str_strip(row.get("Facility", ""))
     bucket = _recon_status_bucket(row.get("recon_status", ""))
     o = overall.upper()
 
-    mismatch_fields: list[str] = []
-    missing_fields: list[str] = []
-    both_missing_fields: list[str] = []
+    mismatch_labels: list[str] = []
+    missing_labels: list[str] = []
+    both_missing_labels: list[str] = []
 
-    for col, label in STATUS_COLS:
+    for col, friendly in status_cols:
         if col not in row.index:
             continue
-        k = _kind(row.get(col))
+        k = _field_kind(row.get(col))
         if k == "mismatch":
-            mismatch_fields.append(label)
+            mismatch_labels.append(friendly)
         elif k == "missing":
-            missing_fields.append(label)
+            missing_labels.append(friendly)
         elif k == "both_missing":
-            both_missing_fields.append(label)
+            both_missing_labels.append(friendly)
 
-    lines: list[str] = []
+    parts: list[str] = []
 
-    # ── Opening: plain-English overall status ──────────────────────────────
+    if bucket == "MATCH" and not mismatch_labels and not missing_labels:
+        parts.append(
+            "This row is a clean match between ACORE and M61 for the fields we compare. "
+            f"The deal {deal} — facility {facility} — lines up on both sides with no open issues "
+            "in the tracked columns."
+        )
+        parts.append(
+            "Next step: No follow-up is required unless you are checking something for audit purposes."
+        )
+        return "\n\n".join(parts)
+
     if file_src == FILE_SOURCE_ACORE_ONLY or "MISSING IN M61" in o or "MISSING FROM M61" in o:
-        lines.append("**This row exists in ACORE but has no matching entry in M61.**")
-        lines.append(
-            f"The deal **{deal}** — facility **{facility}** — was found in your ACORE "
-            "model but could not be paired with any line in the M61 export."
+        parts.append(
+            "This line is on the ACORE side but does not have a matching row in M61, so there is "
+            "nothing to compare yet."
         )
-    elif file_src == FILE_SOURCE_M61_ONLY or "MISSING IN ACORE" in o or "MISSING FROM ACORE" in o:
-        lines.append("**This row exists in M61 but has no matching entry in ACORE.**")
-        lines.append(
-            f"The line **{facility}** was found in M61 but does not appear in your "
-            f"ACORE model for deal **{deal}**."
+        parts.append(
+            f"The deal {deal} — facility {facility} — should be checked against your M61 export "
+            "and your usual filters (fund, note category, effective date) to see whether the "
+            "liability simply has not been booked in M61 or is named differently."
         )
-    elif bucket == "MATCH" and not mismatch_fields and not missing_fields:
-        lines.append("**This row is a clean match.**")
-        lines.append(
-            f"The deal **{deal}** — facility **{facility}** — exists in both ACORE and "
-            "M61, and all compared values line up. No action needed."
+        parts.append(
+            "Next step: Confirm with your M61 data owner whether this obligation should appear, "
+            "then refresh the export if needed."
         )
-    elif mismatch_fields and missing_fields:
-        lines.append("**This row has both value differences and missing data.**")
-        lines.append(
-            f"The deal **{deal}** — facility **{facility}** — was found in both ACORE "
-            "and M61, but some fields don't agree and others are blank on one side."
+        return "\n\n".join(parts)
+
+    if file_src == FILE_SOURCE_M61_ONLY or "MISSING IN ACORE" in o or "MISSING FROM ACORE" in o:
+        parts.append(
+            "This line appears in M61 but not in your ACORE model for this pairing, so the "
+            "primary-side values are not available here."
         )
-    elif mismatch_fields:
-        lines.append("**This row has a value difference.**")
-        lines.append(
-            f"The deal **{deal}** — facility **{facility}** — exists in both ACORE and "
-            "M61, but the values below don't match."
+        parts.append(
+            f"The deal {deal} — facility {facility} — may be missing from the model you uploaded, "
+            "or the deal or facility label may not match what ACORE expects."
         )
-    elif missing_fields:
-        lines.append("**This row is partially matched.**")
-        lines.append(
-            f"The deal **{deal}** — facility **{facility}** — exists in both ACORE and "
-            "M61, and there are no value differences for the fields that were compared."
+        parts.append(
+            "Next step: Check the ACORE workbook export for this deal and line, then re-run "
+            "reconciliation after any corrections."
+        )
+        return "\n\n".join(parts)
+
+    if mismatch_labels and missing_labels:
+        parts.append("This row has both value differences and missing data.")
+    elif mismatch_labels:
+        parts.append("This row has value differences between ACORE and M61.")
+    elif missing_labels:
+        parts.append(
+            "This row matches where we have values, but some fields are missing on one side."
         )
     else:
-        lines.append(f"**Overall status: {overall or 'unknown'}.**")
-        lines.append(
-            f"Deal **{deal}** — facility **{facility}**."
+        parts.append(
+            f"For this row the reconciliation status reads: {overall or 'see the status columns in the table'}."
         )
 
-    # ── Value differences ──────────────────────────────────────────────────
-    if mismatch_fields:
-        lines.append(
+    if mismatch_labels or missing_labels:
+        parts.append(
+            f"The deal {deal} — facility {facility} — was found in both ACORE and M61, "
+            + (
+                "but some fields do not agree and others are blank on one side."
+                if (mismatch_labels and missing_labels)
+                else (
+                    "but some fields do not agree between the two files."
+                    if mismatch_labels
+                    else "and the items below are worth a quick look because one side has no value."
+                )
+            )
+        )
+
+    if mismatch_labels:
+        parts.append(
             "These fields have different values between ACORE and M61:\n"
-            + "".join(f"\n- {f}" for f in mismatch_fields)
+            + "\n".join(f"- {name}" for name in mismatch_labels)
         )
 
-    # ── One-sided missing data ─────────────────────────────────────────────
-    if missing_fields:
-        lines.append(
+    if missing_labels:
+        parts.append(
             "However, these fields need review because one side is missing data:\n"
-            + "".join(f"\n- {f}" for f in missing_fields)
+            + "\n".join(f"- {name}" for name in missing_labels)
         )
 
-    # ── Next step ─────────────────────────────────────────────────────────
-    if file_src == FILE_SOURCE_ACORE_ONLY or "MISSING IN M61" in o or "MISSING FROM M61" in o:
-        next_step = (
-            "Check the M61 export to see whether this line should be there. "
-            "Confirm the fund scope, note category, and effective date are not "
-            "filtering it out."
+    if both_missing_labels:
+        parts.append(
+            "These fields are empty on both sides for this row, which is often normal if neither "
+            "system tracks them:\n"
+            + "\n".join(f"- {name}" for name in both_missing_labels)
         )
-    elif file_src == FILE_SOURCE_M61_ONLY or "MISSING IN ACORE" in o or "MISSING FROM ACORE" in o:
-        next_step = (
-            "Check your ACORE model to confirm whether this line should appear. "
-            "Make sure the deal, facility name, and effective date are included "
-            "in your export."
-        )
-    elif bucket == "MATCH" and not mismatch_fields and not missing_fields:
-        next_step = "No follow-up required."
-    elif mismatch_fields:
-        field_list = ", ".join(mismatch_fields)
-        next_step = (
-            f"Open both source files and compare the values for: {field_list}. "
-            "Use the Deal Drilldown tab to see them side by side."
-        )
-    elif missing_fields:
-        next_step = (
-            "Check the ACORE and M61 source files for those fields to confirm "
-            "whether they are intentionally blank or need to be updated."
+
+    if mismatch_labels or missing_labels:
+        parts.append(
+            "Next step: Open the Deal Drilldown tab to compare the source values side by side."
         )
     else:
-        next_step = (
-            "Review the overall status and re-run reconciliation after "
-            "refreshing your uploads if anything looks unexpected."
+        parts.append(
+            "Next step: Use the Deal Drilldown tab or the status columns in the table to see how "
+            "the two files line up for this deal."
         )
 
-    lines.append(f"**Next step:**\n{next_step}")
-
-    return "\n\n".join(lines)
+    return "\n\n".join(parts)
 
 
 # --------------------------------------------------
@@ -1523,6 +1598,71 @@ def _scope_mode_display(scope_mode: str, debug_full: bool) -> str:
     return scope_mode
 
 
+_UPLOAD_EXTS_ALLOWED = frozenset({".xlsx", ".xlsm", ".xls", ".xlsb"})
+
+
+def _bytes_from_streamlit_upload(uploaded_file) -> bytes:
+    """Read all bytes from a Streamlit ``UploadedFile`` / file-like object.
+
+    Never uses ``uploaded_file.name`` as a path — cloud hosts have no client file on disk.
+    """
+    if uploaded_file is None:
+        return b""
+    try:
+        return uploaded_file.getvalue()
+    except Exception:
+        pass
+    try:
+        return uploaded_file.getbuffer().tobytes()
+    except Exception:
+        pass
+    pos = 0
+    try:
+        pos = uploaded_file.tell()
+    except Exception:
+        pass
+    try:
+        uploaded_file.seek(0)
+        raw = uploaded_file.read()
+        try:
+            uploaded_file.seek(pos)
+        except Exception:
+            pass
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            return bytes(raw)
+        return bytes(raw or b"")
+    except Exception as exc:
+        raise TypeError(f"Could not read bytes from upload: {exc!r}") from exc
+
+
+def _temp_workbook_path_inside_dir(
+    tmpdir: str,
+    *,
+    stem: str,
+    client_filename: str | None,
+    default_ext: str,
+) -> str:
+    """Build ``tmpdir/{stem}{ext}`` using only a *safe* extension parsed from ``client_filename``."""
+    ext = default_ext if str(default_ext).startswith(".") else f".{default_ext}"
+    if client_filename:
+        cand = os.path.splitext(client_filename)[1].strip().lower()
+        if cand in _UPLOAD_EXTS_ALLOWED:
+            ext = cand
+    return os.path.join(tmpdir, f"{stem}{ext}")
+
+
+def _write_upload_to_disk(path: str, uploaded_file) -> None:
+    """Write upload bytes to ``path`` (real temp file) and flush for cloud filesystems."""
+    data = _bytes_from_streamlit_upload(uploaded_file)
+    with open(path, "wb") as out:
+        out.write(data)
+        out.flush()
+        try:
+            os.fsync(out.fileno())
+        except OSError:
+            pass
+
+
 def _current_upload_signature(
     file_a_upload, file_b_upload, mapping_upload, primary_file_type: str
 ):
@@ -1570,18 +1710,31 @@ def run_reconciliation_for_selection(
     mapping_upload=None,
 ):
     with st.spinner("Running reconciliation…"):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path_a = os.path.join(tmpdir, "liability.xlsx")
-            path_b = os.path.join(tmpdir, "primary_model.xlsm")
+        tmp_parent = tempfile.gettempdir()
+        with tempfile.TemporaryDirectory(prefix="recon_upload_", dir=tmp_parent) as tmpdir:
+            path_a = _temp_workbook_path_inside_dir(
+                tmpdir,
+                stem="recon_m61",
+                client_filename=getattr(file_a_upload, "name", None),
+                default_ext=".xlsx",
+            )
+            path_b = _temp_workbook_path_inside_dir(
+                tmpdir,
+                stem="recon_primary",
+                client_filename=getattr(file_b_upload, "name", None),
+                default_ext=".xlsm",
+            )
             path_map = None
-            with open(path_a, "wb") as f:
-                f.write(file_a_upload.getbuffer())
-            with open(path_b, "wb") as f:
-                f.write(file_b_upload.getbuffer())
+            _write_upload_to_disk(path_a, file_a_upload)
+            _write_upload_to_disk(path_b, file_b_upload)
             if primary_file_type in ("AOC II", "AOC I") and mapping_upload:
-                path_map = os.path.join(tmpdir, "liability_to_cre_mapping.xlsx")
-                with open(path_map, "wb") as f:
-                    f.write(mapping_upload.getbuffer())
+                path_map = _temp_workbook_path_inside_dir(
+                    tmpdir,
+                    stem="recon_mapping",
+                    client_filename=getattr(mapping_upload, "name", None),
+                    default_ext=".xlsx",
+                )
+                _write_upload_to_disk(path_map, mapping_upload)
             df_recon, _, df_excluded_type, recon_diag = reconcile(
                 path_a,
                 path_b,
@@ -2101,11 +2254,13 @@ if "df_recon" in st.session_state:
         n_match_dash = int((~_m_missing_m61 & _m_clean_match).sum())
         n_needs_review_dash = int((~_m_missing_m61 & ~_m_clean_match).sum())
         match_rate_acore = (n_match_dash / n_total_acore * 100) if n_total_acore else 0.0
+        _df_needs_review_rows = df_dash_acore.loc[~_m_missing_m61 & ~_m_clean_match].copy()
     else:
         n_missing_m61_dash = 0
         n_match_dash = 0
         n_needs_review_dash = 0
         match_rate_acore = 0.0
+        _df_needs_review_rows = pd.DataFrame()
 
     match_subtitle = f"{match_rate_acore:.0f}% of ACORE records fully match"
     needs_subtitle = "Mismatches, incomplete fields, or other review (paired rows)"
@@ -2118,35 +2273,74 @@ if "df_recon" in st.session_state:
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="metric-card mc-total">
           <div class="label">Total ACORE Records</div>
           <div class="value">{n_total_acore}</div>
           <div class="sub">Rows tied to ACORE (excl. M61-only)</div>
-        </div>""", unsafe_allow_html=True)
+        </div>""",
+            unsafe_allow_html=True,
+        )
     with c2:
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="metric-card mc-match">
           <div class="label">✓ Matches</div>
           <div class="value">{n_match_dash}</div>
           <div class="sub">{match_subtitle}</div>
-        </div>""", unsafe_allow_html=True)
+        </div>""",
+            unsafe_allow_html=True,
+        )
     with c3:
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="metric-card mc-needs">
           <div class="label">⚠ Needs Review</div>
           <div class="value">{n_needs_review_dash}</div>
           <div class="sub">{needs_subtitle}</div>
-        </div>""", unsafe_allow_html=True)
+        </div>""",
+            unsafe_allow_html=True,
+        )
     with c4:
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div class="metric-card mc-missing">
           <div class="label">○ Missing in M61</div>
           <div class="value">{n_missing_m61_dash}</div>
           <div class="sub">{miss_m61_subtitle}</div>
-        </div>""", unsafe_allow_html=True)
+        </div>""",
+            unsafe_allow_html=True,
+        )
 
     st.caption("Metrics based on ACORE (primary file)")
+
+    st.session_state.pop("selected_metric", None)
+
+    _card_explain_options = [
+        "Total ACORE Records",
+        "Matches",
+        "Needs Review",
+        "Missing in M61",
+    ]
+    _selected_explain = st.radio(
+        "What would you like explained?",
+        options=_card_explain_options,
+        index=None,
+        horizontal=True,
+        key="dashboard_metric_explain_radio",
+    )
+    if _selected_explain:
+        _insight = _card_contextual_insight(
+            _selected_explain,
+            n_total_acore,
+            n_match_dash,
+            n_needs_review_dash,
+            n_missing_m61_dash,
+            _df_needs_review_rows,
+        )
+        if _insight:
+            st.markdown(_insight)
 
     # Debug expanders intentionally hidden in normal UI.
 
@@ -2925,9 +3119,9 @@ if "df_recon" in st.session_state:
                     _sel_deal = str(df_table_view.iloc[_sel_pos].get("Deal Name", "")).strip()
                     if _sel_deal:
                         st.session_state["drilldown_deal_pick"] = _sel_deal
-                    _explain_src = df_view.loc[df_table_view.index[_sel_pos]]
+                    _explain_row = df_view.loc[df_table_view.index[_sel_pos]]
                     with st.expander("Explain this row", expanded=True):
-                        st.markdown(explain_reconciliation_row(_explain_src))
+                        st.markdown(explain_reconciliation_row(_explain_row))
 
             if len(df_table_view) == 0:
                 df_export_ui = df_view.iloc[0:0].copy()
