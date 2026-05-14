@@ -7,6 +7,7 @@ import html
 import io
 import os
 import re
+import sys
 import tempfile
 import unicodedata
 from datetime import date, datetime
@@ -25,6 +26,7 @@ from recon_enhanced_output import (
     build_output_filename,
     build_workbook,
     canonical_primary_file_type,
+    categorize_m61_note_category,
     categorize_m61_note_type,
     filter_recon_to_selected_fund,
     get_primary_config,
@@ -32,6 +34,7 @@ from recon_enhanced_output import (
     normalise_facility,
     normalise_text,
     normalize_recon_fund_for_output,
+    load_primary_file,
     reconcile,
     safe_str_strip,
     scope_label_for_primary_type,
@@ -437,6 +440,30 @@ def infer_primary_type_from_filename(uploaded_filename: str | None) -> str | Non
     return None
 
 
+def primary_filename_incompatible_acp_ii_vs_iii(
+    uploaded_filename: str | None, primary_file_type: str
+) -> tuple[bool, str]:
+    """ACP II vs ACP III workbooks use different Fin Inpt layouts — block run if filename disagrees with sidebar."""
+    inf = infer_primary_type_from_filename(uploaded_filename)
+    if not inf:
+        return False, ""
+    sel = canonical_primary_file_type(primary_file_type)
+    if inf == "ACP II" and sel == "ACP III":
+        return (
+            True,
+            "**Primary type mismatch:** The uploaded file name looks like **ACP II**, but the sidebar is set to "
+            "**ACP III** (different Fin Inpt sheet/columns). Choose **ACP II** in the sidebar or upload an "
+            "**ACP III** Liquidity & Earnings model, then run again.",
+        )
+    if inf == "ACP III" and sel == "ACP II":
+        return (
+            True,
+            "**Primary type mismatch:** The uploaded file name looks like **ACP III**, but the sidebar is set to "
+            "**ACP II**. Choose **ACP III** in the sidebar or upload an **ACP II** workbook, then run again.",
+        )
+    return False, ""
+
+
 def looks_like_m61_liability_relationship(filename: str | None) -> bool:
     """M61 comparison file validator (Liability_Relationship exports only)."""
     if not filename:
@@ -474,10 +501,36 @@ def normalize_m61_note_category_label(v: object) -> str:
     return "other"
 
 
-def m61_note_category_series_for_ui(df: pd.DataFrame) -> pd.Series:
-    """Row-level M61 note categories used by both sidebar options and filtering."""
+def m61_note_category_series_for_ui(
+    df: pd.DataFrame, *, primary_file_type: str | None = None
+) -> pd.Series:
+    """Row-level normalized M61 note categories for sidebar + table filtering.
+
+    Uses ``categorize_m61_note_category`` (same as ``reconcile``) when ``primary_file_type`` and
+    ``Liability Type (M61 Raw)`` are available, so the filter matches displayed M61 context even if
+    ``M61 Note Category`` were stale (e.g. before related-M61 surfacing refreshed liability type).
+    Falls back to the stored ``M61 Note Category`` column only when inputs are insufficient.
+    """
     if df is None or df.empty:
         return pd.Series(dtype="object")
+    pft = str(primary_file_type or "").strip()
+    if pft and "Liability Type (M61 Raw)" in df.columns:
+        note_s = (
+            df["Liability Note (M61)"]
+            if "Liability Note (M61)" in df.columns
+            else pd.Series(pd.NA, index=df.index)
+        )
+        lt_s = df["Liability Type (M61 Raw)"]
+        src_s = df["Source"] if "Source" in df.columns else pd.Series(pd.NA, index=df.index)
+        raw_labels = [
+            categorize_m61_note_category(n, t, s, primary_file_type=pft)
+            for n, t, s in zip(note_s.tolist(), lt_s.tolist(), src_s.tolist())
+        ]
+        return (
+            pd.Series(raw_labels, index=df.index, dtype="object")
+            .astype(str)
+            .map(normalize_m61_note_category_label)
+        )
     if "M61 Note Category" in df.columns:
         return df["M61 Note Category"].fillna("Other").astype(str).map(
             normalize_m61_note_category_label
@@ -592,6 +645,91 @@ def _target_22203_stage_rows(stage: str, df: pd.DataFrame) -> list[dict[str, obj
             }
         )
     return rows
+
+
+def _trace_1551_ui_enabled() -> bool:
+    return os.environ.get("RECON_UI_TRACE_1551", "").strip() in ("1", "true", "TRUE", "yes", "YES")
+
+
+def _trace_1551_eff_feb9_series(s: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(s, errors="coerce")
+    norm_ok = dt.dt.normalize().eq(pd.Timestamp("2026-02-09").normalize())
+    st = s.astype(str)
+    str_ok = (
+        st.str.contains("2/9/26", regex=False, na=False)
+        | st.str.contains("02/09/26", regex=False, na=False)
+        | st.str.contains("2/9/2026", regex=False, na=False)
+        | st.str.contains("2026-02-09", regex=False, na=False)
+    )
+    return norm_ok | str_ok
+
+
+def _trace_1551_broadway_ui_mask(df: pd.DataFrame) -> pd.Series:
+    """UI pipeline debug: 1551 Broadway + Deal ID 25-2852 + Effective Date (ACP) 2026-02-09."""
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    if "Deal Name" not in df.columns:
+        return pd.Series(False, index=df.index)
+    m = df["Deal Name"].astype(str).str.contains("1551 Broadway", case=False, na=False)
+    id_cols = [c for c in ("Deal ID (ACP)", "Deal ID Match Key (ACP)", "Deal ID") if c in df.columns]
+    if id_cols:
+        idm = pd.Series(False, index=df.index)
+        for c in id_cols:
+            idm |= df[c].astype(str).str.contains("25-2852", na=False)
+        m &= idm
+    eff_col = next(
+        (
+            c
+            for c in (
+                "Effective Date (ACP)",
+                "Effective Date (ACORE)",
+                "Eff Date (ACP)",
+                "Eff Date (AOC I)",
+                "Effective Date",
+            )
+            if c in df.columns
+        ),
+        None,
+    )
+    if eff_col is not None:
+        m &= _trace_1551_eff_feb9_series(df[eff_col])
+    return m
+
+
+def _trace_1551_broadway_ui_stderr(stage: str, df: pd.DataFrame | None) -> None:
+    if not _trace_1551_ui_enabled():
+        return
+    n = 0 if df is None else len(df)
+    if df is None or df.empty:
+        print(f"[RECON_UI_TRACE_1551] {stage} | total_rows={n} | target_present=False", file=sys.stderr)
+        return
+    mask = _trace_1551_broadway_ui_mask(df)
+    nh = int(mask.sum())
+    print(
+        f"[RECON_UI_TRACE_1551] {stage} | total_rows={n} | target_row_count={nh} | target_present={nh > 0}",
+        file=sys.stderr,
+    )
+    if nh <= 0:
+        return
+    if nh > 1:
+        print(f"    (note: {nh} target_matches; showing first row only)", file=sys.stderr)
+    rr = df.loc[mask].iloc[0]
+    rs = rr.get("recon_status", "")
+    fs = rr.get("File Source", "")
+    nc = rr.get("M61 Note Category", "")
+    ed_acp = ""
+    for k in ("Effective Date (ACP)", "Effective Date (ACORE)", "Eff Date (ACP)", "Effective Date"):
+        if k in rr.index:
+            v = rr.get(k)
+            if v is not None and not (isinstance(v, float) and pd.isna(v)) and str(v).strip():
+                ed_acp = v
+                break
+    ed_m61 = rr.get("Effective Date (M61)", rr.get("Eff Date (M61)", ""))
+    print(
+        f"    recon_status={rs!r} | File Source={fs!r} | M61 Note Category={nc!r} | "
+        f"Effective Date (ACP)={ed_acp!r} | Effective Date (M61)={ed_m61!r}",
+        file=sys.stderr,
+    )
 
 
 # Columns consulted for display-only effective date range filtering (any match → row matches).
@@ -1048,7 +1186,12 @@ with st.sidebar:
     inferred_primary_type = infer_primary_type_from_filename(
         file_b_upload.name if file_b_upload else None
     )
-    if inferred_primary_type and inferred_primary_type != primary_file_type:
+    _fn_bad, _fn_msg = primary_filename_incompatible_acp_ii_vs_iii(
+        file_b_upload.name if file_b_upload else None, primary_file_type
+    )
+    if _fn_bad:
+        st.error(_fn_msg)
+    elif inferred_primary_type and inferred_primary_type != primary_file_type:
         st.warning(
             f"Selected type is **{selected_ui_label}**, but uploaded business file name "
             f"looks like **{ui_primary_label(inferred_primary_type)}**. "
@@ -1174,7 +1317,8 @@ with st.sidebar:
     # Session key still honored if set elsewhere; without the widget it defaults to False.
     _debug_full_sidebar = bool(st.session_state.get("recon_debug_full_m61", False))
 
-    # Scope: both finance modes use the uploaded primary fund only; "Selected" additionally drops M61-only rows.
+    # Scope: both finance modes use the uploaded primary fund only; "Selected" also shows M61-only
+    # rows that passed the same fund filter (hides other funds, not all M61-only).
     scope_mode = "Selected Fund Only"
     scope_toggle_needed = True
     if _debug_full_sidebar:
@@ -1208,15 +1352,16 @@ with st.sidebar:
             help=(
                 f"**{_scope_label_all}:** All records for **{scope_label_for_primary_type(primary_file_type)}** "
                 "in this run, including lines that appear only on the comparison export. "
-                f"**{_scope_label_fund}:** Shows ACORE records for this fund and their matches in M61. "
-                "M61-only rows are hidden."
+                f"**{_scope_label_fund}:** ACORE rows for this fund, their M61 matches, and M61-only lines "
+                "that match this fund’s scope (other funds remain excluded)."
             ),
         )
         st.caption(
             "All Results shows the full reconciliation output for the uploaded primary fund, "
             "including related M61-only records. "
-            f"Selected Primary Fund Only focuses on records tied to the uploaded "
-            f"**{scope_label_for_primary_type(primary_file_type)}** fund and hides unrelated M61-only rows."
+            f"Selected Primary Fund Only shows the same fund filter as All Results, but focuses the table on "
+            f"**{scope_label_for_primary_type(primary_file_type)}**-tied ACORE rows, their M61 matches, and "
+            "M61-only export lines that match this fund (not other funds)."
         )
         scope_mode = (
             "Selected Fund Only"
@@ -1735,6 +1880,12 @@ def run_reconciliation_for_selection(
                     default_ext=".xlsx",
                 )
                 _write_upload_to_disk(path_map, mapping_upload)
+            _bad_pri_fn, _msg_pri_fn = primary_filename_incompatible_acp_ii_vs_iii(
+                getattr(file_b_upload, "name", None), primary_file_type
+            )
+            if _bad_pri_fn:
+                st.error(_msg_pri_fn)
+                st.stop()
             df_recon, _, df_excluded_type, recon_diag = reconcile(
                 path_a,
                 path_b,
@@ -1747,6 +1898,34 @@ def run_reconciliation_for_selection(
                 ),
             )
             df_recon = normalize_recon_fund_for_output(df_recon)
+            df_pri_loaded = load_primary_file(path_b, primary_file_type)
+            _probe_m = pd.Series(False, index=df_pri_loaded.index)
+            if "Deal Name" in df_pri_loaded.columns:
+                _probe_m |= df_pri_loaded["Deal Name"].astype(str).str.contains(
+                    "1551 Broadway", case=False, na=False
+                )
+            if "Deal ID" in df_pri_loaded.columns:
+                _probe_m |= df_pri_loaded["Deal ID"].astype(str).str.contains("25-2852", na=False)
+            _probe_cols = [
+                c
+                for c in (
+                    "Deal Name",
+                    "Deal ID",
+                    "Effective Date",
+                    "Source",
+                    "Facility",
+                    "Spread",
+                    "Advance Rate",
+                )
+                if c in df_pri_loaded.columns
+            ]
+            _probe_df = (
+                df_pri_loaded.loc[_probe_m, _probe_cols].copy()
+                if _probe_m.any() and _probe_cols
+                else (df_pri_loaded.loc[_probe_m].copy() if _probe_m.any() else df_pri_loaded.iloc[0:0].copy())
+            )
+            st.session_state["emergency_pri_rowcount"] = int(len(df_pri_loaded))
+            st.session_state["emergency_pri_probe_df"] = _probe_df
             st.session_state["df_recon"] = df_recon
             st.session_state["df_excluded_by_liability_type"] = (
                 df_excluded_type.copy() if df_excluded_type is not None else pd.DataFrame()
@@ -1863,6 +2042,91 @@ if "df_recon" in st.session_state:
                 except Exception as e:
                     st.error(f"Reconciliation failed: {e}")
                     st.stop()
+    # ---- EMERGENCY DEBUG (disabled) — Primary Fin Inpt load vs df_recon (1551 Broadway / Deal ID 25-2852) ----
+    #     with st.expander(
+    #         "EMERGENCY DEBUG — Primary Fin Inpt load vs `df_recon` (1551 Broadway / Deal ID 25-2852)",
+    #         expanded=True,
+    #     ):
+    #         st.caption(
+    #             "Compare **load_primary_file** (same temp path as reconcile) to reconciliation output. "
+    #             "If loaded rows > ACORE-side `df_recon` rows, the loss is in **reconcile**. If counts match here "
+    #             "but **Total ACORE Records** is lower, the loss is in **this page’s filters** (`df_all` / scope / "
+    #             "Show Records / note category)."
+    #         )
+    #         c_a, c_b, c_c = st.columns(3)
+    #         with c_a:
+    #             st.markdown(f"**Sidebar primary type (widget):** `{primary_file_type}`")
+    #             st.markdown(f"**Last run primary:** `{_run_primary_raw}` → canonical **`{run_primary}`**")
+    #         with c_b:
+    #             st.markdown(f"**Uploaded primary file:** `{run_primary_upload_name or '—'}`")
+    #         with c_c:
+    #             _n_pri_em = st.session_state.get("emergency_pri_rowcount")
+    #             _rc = st.session_state.get("recon_row_counts") or {}
+    #             _n_raw_diag = _rc.get("raw_primary_rows_loaded")
+    #             st.markdown(f"**`load_primary_file` row count:** `{_n_pri_em if _n_pri_em is not None else '—'}`")
+    #             st.markdown(
+    #                 f"**`reconcile` diag `raw_primary_rows_loaded`:** `{_n_raw_diag if _n_raw_diag is not None else '—'}`"
+    #             )
+    #         st.markdown(
+    #             "**Rows from `load_primary_file` where Deal Name contains `1551 Broadway` OR Deal ID contains `25-2852`:**"
+    #         )
+    #         _em_df = st.session_state.get("emergency_pri_probe_df")
+    #         if _em_df is not None and not getattr(_em_df, "empty", True):
+    #             st.dataframe(_em_df, use_container_width=True, height=min(320, 40 + 28 * len(_em_df)))
+    #         else:
+    #             st.info("No probe rows in session (re-run reconciliation after upload), or no rows matched the probe.")
+    #         st.markdown("**`df_recon` rows where Deal Name contains `1551 Broadway`:**")
+    #         if "Deal Name" in df_recon.columns:
+    #             _m1551 = df_recon["Deal Name"].astype(str).str.contains("1551 Broadway", case=False, na=False)
+    #             _rec_cols = [
+    #                 c
+    #                 for c in (
+    #                     "Deal Name",
+    #                     "Deal ID (ACP)",
+    #                     "Effective Date (ACP)",
+    #                     "Facility",
+    #                     "Source",
+    #                     "File Source",
+    #                     "recon_status",
+    #                     "Match Stage",
+    #                     "_row_id_b",
+    #                 )
+    #                 if c in df_recon.columns
+    #             ]
+    #             _rec_sub = df_recon.loc[_m1551, _rec_cols] if _rec_cols else df_recon.loc[_m1551]
+    #             st.dataframe(
+    #                 _rec_sub, use_container_width=True, height=min(360, 40 + 28 * max(len(_rec_sub), 1))
+    #             )
+    #             st.caption(f"**{int(_m1551.sum())}** row(s) on full `df_recon` for this deal name filter.")
+    #         else:
+    #             st.warning("`df_recon` has no `Deal Name` column.")
+    #         if "File Source" in df_recon.columns:
+    #             _n_acore_recon = int(
+    #                 df_recon["File Source"]
+    #                 .fillna("")
+    #                 .astype(str)
+    #                 .str.strip()
+    #                 .isin([FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY])
+    #                 .sum()
+    #             )
+    #         else:
+    #             _n_acore_recon = int(len(df_recon))
+    #         st.markdown(
+    #             f"**ACORE-side rows on full `df_recon` (Both + ACORE Only):** **`{_n_acore_recon}`** — compare to "
+    #             f"**`load_primary_file`** count **`{_n_pri_em if _n_pri_em is not None else '—'}`**."
+    #         )
+    #         if _n_pri_em is not None and _n_pri_em != _n_acore_recon:
+    #             st.error(
+    #                 f"**Row count mismatch:** `load_primary_file` returned **`{_n_pri_em}`** rows but **`df_recon`** "
+    #                 f"only has **`{_n_acore_recon}`** ACORE-side rows (Both + ACORE Only). The gap is in **reconcile** "
+    #                 "(or diagnostics skew if `raw_primary_rows_loaded` disagrees). If counts match here but the "
+    #                 "dashboard **Total ACORE Records** is still lower, the loss is in **filters on this page**."
+    #             )
+    #         if _n_raw_diag is not None and _n_pri_em is not None and int(_n_raw_diag) != int(_n_pri_em):
+    #             st.warning(
+    #                 f"`reconcile` reported `raw_primary_rows_loaded={_n_raw_diag}` but this page’s "
+    #                 f"`load_primary_file` probe counted **`{_n_pri_em}`** — check for version/path skew."
+    #             )
 
     st.markdown('<div class="section-label">Deal filter</div>', unsafe_allow_html=True)
 
@@ -1894,7 +2158,8 @@ if "df_recon" in st.session_state:
         help="Type in the box to jump to a deal (Streamlit search). Choose **All deals** to clear.",
     )
 
-    # Scope (finance): primary fund only via df_all; Selected drops M61-only rows within that fund.
+    # Scope (finance): df_all is fund-scoped. Selected view = primary-tied rows + M61-only rows
+    # that already passed fund scope (same df_all), not "all M61-only" from other funds.
     if "File Source" in df_all.columns:
         _fs_scope = df_all["File Source"].fillna("").astype(str).str.strip()
         in_scope_ix_primary_tied = set(
@@ -1902,8 +2167,13 @@ if "df_recon" in st.session_state:
                 _fs_scope.isin([FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY])
             ].tolist()
         )
+        in_scope_ix_m61_only_fund_scoped = set(
+            df_all.index[_fs_scope.eq(FILE_SOURCE_M61_ONLY)].tolist()
+        )
     else:
         in_scope_ix_primary_tied = set(df_all.index)
+        in_scope_ix_m61_only_fund_scoped = set()
+    in_scope_ix_selected_fund_view = in_scope_ix_primary_tied | in_scope_ix_m61_only_fund_scoped
 
     if _debug_full:
         df_view = df_recon.copy()
@@ -1911,10 +2181,12 @@ if "df_recon" in st.session_state:
             "**Developer view:** Showing every fund in this run. Use standard Scope when you return to the main workflow."
         )
     elif scope_mode == "Selected Fund Only":
+        # ACORE is the row driver: show only rows where ACORE data is present (Both or ACORE Only).
+        # M61-only rows are intentionally excluded — the ACORE file defines the row universe.
         df_view = df_all.loc[df_all.index.isin(in_scope_ix_primary_tied)].copy()
         st.info(
-            "**Selected Primary Fund Only:** Shows ACORE records for this fund and their matches in M61. "
-            "M61-only rows are hidden."
+            "**Selected Primary Fund Only:** Shows every ACORE row for this fund with M61 comparison "
+            "columns filled in where a match exists. M61-only rows are hidden — ACORE drives the row count."
         )
     else:
         df_view = df_all.copy()
@@ -1941,7 +2213,37 @@ if "df_recon" in st.session_state:
         st.session_state.get("recon_eff_date_custom_start"),
         st.session_state.get("recon_eff_date_custom_end"),
     )
+    _td_after_eff = None
+    # Always keep rows where ACORE/primary data is present (File Source = Both or ACORE Only).
+    # The effective-date range filter is for display convenience; it must never hide primary model rows.
+    _primary_row_ix = (
+        set(
+            df_view.index[
+                df_view["File Source"].fillna("").astype(str).str.strip()
+                .isin([FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY])
+            ].tolist()
+        )
+        if "File Source" in df_view.columns
+        else set()
+    )
     df_view = filter_display_dataframe_by_effective_dates(df_view, *_eff_bounds)
+    # Restore any primary rows the date filter dropped (preserves all ACORE Fin Inpt rows).
+    if _primary_row_ix:
+        _dropped_primary = _primary_row_ix - set(df_view.index.tolist())
+        if _dropped_primary:
+            _pre_filter_view = (
+                df_all.loc[df_all.index.isin(in_scope_ix_primary_tied)]
+                if "File Source" in df_all.columns
+                else df_all
+            )
+            if deal_pick and deal_pick != "All deals":
+                _pre_filter_view = _pre_filter_view[_pre_filter_view["Deal Name"] == deal_pick]
+            _restore = _pre_filter_view.loc[
+                _pre_filter_view.index.isin(_dropped_primary)
+            ]
+            if not _restore.empty:
+                df_view = pd.concat([df_view, _restore]).sort_index()
+    _td_after_eff = df_view.copy()
 
     # Read note-category selection before source-type narrowing.
     _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
@@ -1957,7 +2259,7 @@ if "df_recon" in st.session_state:
         {unicodedata.normalize("NFKC", str(x)).strip() for x in _raw_m61_note_cat.tolist() if str(x).strip()}
     )
     _selected_note_norm = normalize_m61_note_category_label(_note_pick)
-    _note_series_pre = m61_note_category_series_for_ui(df_view)
+    _note_series_pre = m61_note_category_series_for_ui(df_view, primary_file_type=run_primary)
     _note_unique_norm = sorted({_ for _ in _note_series_pre.unique().tolist() if str(_).strip()})
     if _selected_note_norm != "all":
         _keep = _note_series_pre.eq(_selected_note_norm)
@@ -2077,6 +2379,18 @@ if "df_recon" in st.session_state:
 
     # Avoid showing non-contiguous / upstream row positions in the index column (confused with deal IDs).
     df_view = df_view.reset_index(drop=True)
+    if _trace_1551_ui_enabled():
+        _trace_1551_broadway_ui_stderr("1. df_recon", df_recon)
+        _trace_1551_broadway_ui_stderr("2. df_scoped", df_scoped)
+        _trace_1551_broadway_ui_stderr("3. df_all", df_all)
+        _trace_1551_broadway_ui_stderr("4. df_view after scope", _td_after_scope)
+        _trace_1551_broadway_ui_stderr("5. df_view after deal filter", _td_after_deal)
+        _trace_1551_broadway_ui_stderr("6. df_view after effective date filter", _td_after_eff)
+        _trace_1551_broadway_ui_stderr("7. df_view after M61 Note Category filter", _td_after_note_cat)
+        _trace_1551_broadway_ui_stderr("8. df_view after Show Records / status filter", _td_after_status)
+        _td_m61_hide_or_noop = _td_after_m61_hide if _td_after_m61_hide is not None else _td_after_status
+        _trace_1551_broadway_ui_stderr("9. df_view after M61-only hide (or no-op if not ACP III/AOC)", _td_m61_hide_or_noop)
+        _trace_1551_broadway_ui_stderr("10. final df_view after reset_index", df_view)
     _target_tracking_rows: list[dict[str, object]] = []
     _diag_target = st.session_state.get("recon_row_counts", {}) or {}
     _s1 = pd.DataFrame(_diag_target.get("target_22203_stage1_rows", []) or [])
@@ -2235,17 +2549,21 @@ if "df_recon" in st.session_state:
     if False:  # validation block hidden
         pass
  
-    # ---- Metric cards (ACORE-primary interpretation; excludes M61-only rows) ----
-    if "File Source" in df_all.columns:
-        _fs_dash = df_all["File Source"].fillna("").astype(str).str.strip()
-        df_dash_acore = df_all.loc[_fs_dash.isin([FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY])].copy()
+    # ---- Metric cards (ACORE-backed rows in the *current table view*, not df_all) ----
+    # Must match visible Fin Inpt rows: same scope/deal/date/note/status filters as df_view, including
+    # primary rows restored after the effective-date display filter. Do not dedupe by deal or facility.
+    if "File Source" in df_view.columns:
+        _fs_dash = df_view["File Source"].fillna("").astype(str).str.strip()
+        df_view_acore_backed = df_view.loc[
+            _fs_dash.isin([FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY])
+        ].copy()
     else:
-        df_dash_acore = df_all.copy()
+        df_view_acore_backed = df_view.copy()
 
-    n_total_acore = int(len(df_dash_acore))
-    if n_total_acore and "recon_status" in df_dash_acore.columns:
-        _fs_ac = df_dash_acore["File Source"].fillna("").astype(str).str.strip()
-        _rs_ac = df_dash_acore["recon_status"].fillna("").astype(str).str.strip().str.upper()
+    n_total_acore = int(len(df_view_acore_backed))
+    if n_total_acore and "recon_status" in df_view_acore_backed.columns:
+        _fs_ac = df_view_acore_backed["File Source"].fillna("").astype(str).str.strip()
+        _rs_ac = df_view_acore_backed["recon_status"].fillna("").astype(str).str.strip().str.upper()
         _m_missing_m61 = _fs_ac.eq(FILE_SOURCE_ACORE_ONLY) | _rs_ac.str.contains(
             "MISSING IN M61", regex=False, na=False
         )
@@ -2254,7 +2572,7 @@ if "df_recon" in st.session_state:
         n_match_dash = int((~_m_missing_m61 & _m_clean_match).sum())
         n_needs_review_dash = int((~_m_missing_m61 & ~_m_clean_match).sum())
         match_rate_acore = (n_match_dash / n_total_acore * 100) if n_total_acore else 0.0
-        _df_needs_review_rows = df_dash_acore.loc[~_m_missing_m61 & ~_m_clean_match].copy()
+        _df_needs_review_rows = df_view_acore_backed.loc[~_m_missing_m61 & ~_m_clean_match].copy()
     else:
         n_missing_m61_dash = 0
         n_match_dash = 0
@@ -2278,7 +2596,7 @@ if "df_recon" in st.session_state:
         <div class="metric-card mc-total">
           <div class="label">Total ACORE Records</div>
           <div class="value">{n_total_acore}</div>
-          <div class="sub">Rows tied to ACORE (excl. M61-only)</div>
+          <div class="sub">ACORE-backed rows in current view (Both + ACORE Only)</div>
         </div>""",
             unsafe_allow_html=True,
         )
@@ -2313,7 +2631,9 @@ if "df_recon" in st.session_state:
             unsafe_allow_html=True,
         )
 
-    st.caption("Metrics based on ACORE (primary file)")
+    st.caption(
+        "Metrics count **ACORE-backed rows** in the **same filtered view** as the table."
+    )
 
     st.session_state.pop("selected_metric", None)
 
@@ -2671,8 +2991,8 @@ if "df_recon" in st.session_state:
             df_display = pd.DataFrame(display_rows).reset_index(drop=True)
 
             # Option pools for **Source Type (ACORE)** / **Liability Type (M61)** table filters:
-            # - Selected Fund Only → primary-tied rows only (``File Source`` Both / ACORE Only).
-            # - All Results for uploaded primary fund → all rows for that fund (including M61-only).
+            # - Selected Fund Only → same row universe as the main table (primary-tied + fund-scoped M61-only).
+            # - All Results for uploaded primary fund → all rows for that fund (same df_all as Selected for fund).
             # - Developer full-M61 → full ``df_recon`` when debug is enabled.
             # Intentionally excludes sidebar recon-status checkboxes and the Deal picker so
             # type dropdowns are scope-aware but not over-reduced vs. the displayed row set.
@@ -3092,9 +3412,8 @@ if "df_recon" in st.session_state:
                 _target_22203_stage_rows("6. final displayed dataframe", df_table_view)
             )
             st.caption(
-                "ℹ️ M61 may include repeated historical rows for the same liability. "
-                "This view keeps the most relevant current record and collapses older rows "
-                "that do not change the reconciliation result."
+                "ℹ️ M61 can include multiple liability lines per deal. The table lists every row "
+                "returned by reconciliation for your current filters—nothing is collapsed or deduplicated here."
             )
             _table_sel = st.dataframe(
                 styled,

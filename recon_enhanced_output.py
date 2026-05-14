@@ -276,8 +276,14 @@ def _debug_trace_uncommons_m61_load(
         note = safe_str_strip(r.get("Liability Note", ""))
         lt_raw = r.get("Liability Type")
         lt_bucket = _liability_type_bucket(lt_raw)
-        in_type_bucket = lt_bucket in M61_IN_SCOPE_LIABILITY_BUCKETS
-        fin_tok = bool(_fin_note_scope_mask(pd.Series([note]), primary_file_type).iloc[0])
+        in_type_bucket = lt_bucket in M61_LOAD_IN_SCOPE_LIABILITY_BUCKETS
+        fin_tok = bool(
+            _fin_note_scope_mask(
+                pd.Series([note]),
+                primary_file_type,
+                liability_type_bucket=pd.Series([lt_bucket]),
+            ).iloc[0]
+        )
         legacy_type_or_note = in_type_bucket or fin_tok
         scope_note = ""
         if in_scope_mask is not None and idx in in_scope_mask.index:
@@ -632,7 +638,7 @@ def filter_recon_to_selected_fund(df_recon: pd.DataFrame, primary_file_type: str
         mask_regex_main = mask_regex_main & (~has_m61_fund | m61_col_ok)
 
     scope_lbl = scope_label_for_primary_type(primary_file_type)
-    if primary_file_type in ("ACP II", "AOC II", "AOC I") and "Liability Note (M61)" in df_recon.columns:
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES and "Liability Note (M61)" in df_recon.columns:
         fc = df_recon["Liability Note (M61)"].map(
             lambda n: (parse_liability_note(n).get("fund_code") or "").strip()
         )
@@ -681,12 +687,15 @@ def default_recon_output_path(
 # --------------------------------------------------
 # Human-readable financing types (not wired into load_file_a; see bucket frozensets below).
 M61_FINANCING_TYPES = ["Repo", "Non", "Sale", "CLO", "TBD", "Sub Debt"]
-# Normalized Liability Type buckets that are **financing** for M61 load semantics (not Subline).
+# Normalized Liability Type buckets that are **financing** for M61 (Repo/Non/Sale/CLO).
 # Subline uses a separate set so tooling/filters do not treat Subline as “financing category.”
 M61_FINANCING_TYPE_BUCKETS = frozenset({"repo", "non", "sale", "clo"})
 M61_SUBLINE_LIABILITY_BUCKETS = frozenset({"subline"})
-# Rows survive load_file_a expanded filter if bucket is in this union OR note-token match OR fund+deal fallback.
-M61_IN_SCOPE_LIABILITY_BUCKETS = M61_FINANCING_TYPE_BUCKETS | M61_SUBLINE_LIABILITY_BUCKETS
+# Financing buckets only (excludes Subline). Used for financing-note token scope, Fin Inpt candidates,
+# and any logic that must not treat Subline liability rows as financing lines.
+M61_IN_SCOPE_LIABILITY_BUCKETS = M61_FINANCING_TYPE_BUCKETS
+# load_file_a expanded filter: financing ∪ Subline — Subline rows load but never enter Fin Inpt matching.
+M61_LOAD_IN_SCOPE_LIABILITY_BUCKETS = M61_FINANCING_TYPE_BUCKETS | M61_SUBLINE_LIABILITY_BUCKETS
 
 TARGET_FUNDS = {
     "acore credit partners iii",
@@ -857,6 +866,139 @@ def _related_m61_liability_type_rank_for_source(*, acore_source, m61_liability_t
     if not lt:
         return 3, "m61_liability_type_blank"
     return 3, "m61_liability_type_other"
+
+
+def _acp_ii_acore_family_token_for_related_m61(row: pd.Series) -> str:
+    """Coarse Repo / CLO / Non / Sale / Sub Debt token from ACORE ``Source`` + ``Facility`` (display-only)."""
+    src = normalise_text(row.get("Source"))
+    fac = normalise_text(row.get("Facility"))
+    blob = f"{src} {fac}"
+    if re.search(r"\bclo\b", blob):
+        return "clo"
+    if "sale" in src or "sold" in src:
+        return "sale"
+    if re.search(r"\bsub[\s-]*debt\b", blob):
+        return "subdebt"
+    if re.search(r"\bnon[-\s]?repo\b", blob) or src in ("non", "non-repo", "non repo"):
+        return "non"
+    if re.search(r"\brepo\b", blob):
+        return "repo"
+    return ""
+
+
+def _acp_ii_m61_family_token_for_related_m61(rr: pd.Series) -> str:
+    """Match ``_acp_ii_acore_family_token_for_related_m61`` using M61 ``Liability Type`` + ``Liability Name``."""
+    lt = normalise_text(rr.get("Liability Type"))
+    ln = normalise_text(rr.get("Liability Name"))
+    blob = f"{lt} {ln}"
+    if re.search(r"\bclo\b", blob):
+        return "clo"
+    if "sale" in lt or "sold" in lt:
+        return "sale"
+    if re.search(r"\bsub[\s-]*debt\b", blob):
+        return "subdebt"
+    if re.search(r"\bnon[-\s]?repo\b", blob) or lt in ("non", "non-repo", "non repo") or (
+        "non" in lt and "repo" in lt
+    ):
+        return "non"
+    if "repo" in blob:
+        return "repo"
+    return ""
+
+
+def _acp_ii_fin_allocation_suffix_primary(row: pd.Series) -> str:
+    """Stable extra segment(s) for ACP II Fin Inpt keys: Repo/CLO/… family plus known bank token when present."""
+    fam = _acp_ii_acore_family_token_for_related_m61(row)
+    bank = ""
+    if "_pri_fac_tok" in row.index:
+        t = str(row.get("_pri_fac_tok") or "").strip()
+        if t in FACILITY_NORM_MAP.values():
+            bank = t
+    parts = [p for p in (fam, bank) if p]
+    return "|".join(parts)
+
+
+def _acp_ii_fin_allocation_suffix_m61(row: pd.Series) -> str:
+    """Counterpart to ``_acp_ii_fin_allocation_suffix_primary`` on the M61 export row."""
+    fam = _acp_ii_m61_family_token_for_related_m61(row)
+    bank = ""
+    p = parse_liability_note(row.get("Liability Note"))
+    if (p.get("note_category") or "") == "Fin":
+        bank = _normalize_ln_suffix_token(p.get("source_suffix") or "")
+    if not bank:
+        bank = _primary_facility_match_token(
+            row.get("Financial Institution"), row.get("Liability Name")
+        )
+    if bank and bank not in FACILITY_NORM_MAP.values():
+        bank = ""
+    parts = [p for p in (fam, bank) if p]
+    return "|".join(parts)
+
+
+def _acp_ii_acore_line_bucket_for_fin(row: pd.Series) -> str:
+    """ACP II Fin Inpt: normalized line key from ACORE ``Source`` + ``Facility`` (e.g. ``CLO|2026-FL1``, ``REPO|WF``)."""
+    fam = _acp_ii_acore_family_token_for_related_m61(row)
+    if not fam:
+        return ""
+    src = normalise_text(row.get("Source"))
+    fac = normalise_text(row.get("Facility"))
+    blob = f"{src} {fac}".lower()
+    if fam == "clo":
+        m = re.search(r"(20\d{2})\s*[-]?\s*(fl\d+)", fac, re.I)
+        if m:
+            return f"CLO|{m.group(1)}-{m.group(2).upper()}"
+        m2 = re.search(r"(fl\d+)", fac, re.I)
+        if m2:
+            return f"CLO|{m2.group(1).upper()}"
+        return "CLO|BASE"
+    if fam == "repo":
+        if re.search(r"\bwf\b", blob) or "wf repo" in blob:
+            return "REPO|WF"
+        pt = _primary_facility_match_token(row.get("Source"), row.get("Facility"))
+        if pt and pt in FACILITY_NORM_MAP.values():
+            return f"REPO|{pt.upper()}"
+        return "REPO|BASE"
+    if fam == "sale":
+        return "SALE"
+    if fam == "subdebt":
+        return "SUBDEBT"
+    if fam == "non":
+        return "NON"
+    return fam.upper()
+
+
+def _acp_ii_m61_line_bucket_for_fin(row: pd.Series) -> str:
+    """ACP II Fin Inpt: line key from M61 type + name/note (mirrors ``_acp_ii_acore_line_bucket_for_fin``)."""
+    fam = _acp_ii_m61_family_token_for_related_m61(row)
+    if not fam:
+        return ""
+    ln = normalise_text(row.get("Liability Name"))
+    note_u = str(row.get("Liability Note") or "")
+    blob = f"{ln} {note_u}".upper().replace(" ", "")
+    if fam == "clo":
+        m = re.search(r"(20\d{2})\s*[-]?\s*(FL\d+)", blob, re.I)
+        if m:
+            return f"CLO|{m.group(1)}-{m.group(2).upper()}"
+        m2 = re.search(r"(FL\d+)", blob, re.I)
+        if m2:
+            return f"CLO|{m2.group(1).upper()}"
+        return "CLO|BASE"
+    if fam == "repo":
+        if "WF" in blob and "REPO" in blob:
+            return "REPO|WF"
+        pt = _primary_facility_match_token(
+            row.get("Financial Institution"), row.get("Liability Name")
+        )
+        if pt and pt in FACILITY_NORM_MAP.values():
+            return f"REPO|{pt.upper()}"
+        return "REPO|BASE"
+    if fam == "sale":
+        return "SALE"
+    if fam == "subdebt":
+        return "SUBDEBT"
+    if fam == "non":
+        return "NON"
+    return fam.upper()
 
 
 def _compute_m61_advance_rate_and_source_for_display(
@@ -1066,10 +1208,14 @@ def _surface_related_m61_for_acore_only_rows(
 ) -> pd.DataFrame:
     """Populate M61-facing columns on **ACORE-only** rows from a related ``df_a`` line.
 
-    Candidate pool: all M61 rows sharing the same deal / line keys (matched or unmatched).
-    **Ranking:** (1) liability-type compatibility with ACORE Source, (2) same Pledge Date as the ACORE row
-    (closest pledge-date distance first), (3) earliest M61 Effective Date, (4) unmatched rows preferred
-    over already-paired rows as a final tiebreaker.
+    **ACP II:** returns ``df_out`` unchanged. Fin Inpt keeps ACORE as the primary grid: main M61
+    comparison fields are filled **only** from true merge pairs. Extra note-level ACORE lines and
+    collapsed M61 context are not backfilled here — use Deal Drilldown / export views for context.
+
+    Candidate pool (non–ACP II): all M61 rows sharing the same deal / line keys (matched or unmatched).
+    **Ranking (non–ACP II):** (1) liability-type compatibility with ACORE Source (Sale rows only),
+    (2) pledge-date proximity, (3) earliest M61 ``effective_date_key``, (4) unmatched preferred.
+
     Values copied from the chosen M61 row only (``Effective Date``, ``Pledge Date``, etc. are not taken from ACORE).
 
     Does **not** modify pairing, ``recon_status``, ``File Source``, or any ``* Status`` column.
@@ -1086,6 +1232,14 @@ def _surface_related_m61_for_acore_only_rows(
             "(skipped: empty df_out or df_a)"
         )
         return df_out
+
+    if primary_file_type == "ACP II":
+        _debug_rows(
+            "Related M61 enhancement: skipped for ACP II — main M61 comparison columns populate only "
+            "from true merge pairs; ancillary M61 lines belong in drilldown / export, not backfilled here."
+        )
+        return df_out
+
     need = {"m61_match_key", "facility_norm", "effective_date_key", "Effective Date", "_row_id_a"}
     if not need.issubset(df_a.columns):
         _debug_rows(
@@ -1114,8 +1268,10 @@ def _surface_related_m61_for_acore_only_rows(
 
     out = df_out.copy()
 
+    acore_only_ixs = out.index[ac_mask].tolist()
+
     n_done = 0
-    for idx in out.index[ac_mask]:
+    for idx in acore_only_ixs:
         row = out.loc[idx]
         if _acore_row_matches_related_debug_trace(row):
             _debug_rows(
@@ -1247,11 +1403,9 @@ def _surface_related_m61_for_acore_only_rows(
         # __is_paired = 0 for unmatched M61 rows, 1 for already-paired rows.
         # Sorting ascending puts unmatched rows last in priority (preferred as tiebreaker).
         work["__is_paired"] = work["_row_id_a"].astype(int).isin(paired_row_ids_m61).astype(int)
-        # Sort: (1) liability-type rank, (2) pledge-date proximity, (3) earliest M61 effective date,
-        # (4) unmatched-before-paired tiebreaker.
-        # __ed_dist (distance from ACORE effective date) is intentionally NOT used: for ACORE-only rows
-        # that date proximity is circular — the correct M61 row often has a DIFFERENT effective date,
-        # and favouring the row closest to ACORE's date selects the wrong candidate.
+
+        # Legacy ranking (Sale rows may still narrow __lt_rank above).
+        # __ed_dist is intentionally not used here (see prior note on ACORE-only date proximity).
         work = work.sort_values(
             ["__lt_rank", "__pl_dist", "effective_date_key", "__is_paired"],
             ascending=[True, True, True, True],
@@ -1332,6 +1486,14 @@ def _surface_related_m61_for_acore_only_rows(
             _upd["M61 Extracted Deal ID"] = _v
         if "Pledge Date (M61)" in out.columns and "Pledge Date" in pick.index:
             _upd["Pledge Date (M61)"] = pick.get("Pledge Date")
+        # Keep ``M61 Note Category`` aligned with the surfaced M61 pick (liability note + type + ACORE Source).
+        if "M61 Note Category" in out.columns:
+            _upd["M61 Note Category"] = categorize_m61_note_category(
+                pick.get("Liability Note"),
+                pick.get("Liability Type"),
+                row.get("Source"),
+                primary_file_type=primary_file_type,
+            )
 
         for k, v in _upd.items():
             if k in out.columns:
@@ -1520,9 +1682,53 @@ def _ensure_file_source_populated(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _filter_subline_from_final_recon_output(
+    df: pd.DataFrame, *, skip_when_match_diagnostics: bool
+) -> pd.DataFrame:
+    """Drop M61 Subline liability-bucket rows unless they matched via ``financing_note``.
+
+    Subline rows remain in the pipeline for load/internal use; the returned recon grid omits them
+    when they would only duplicate financing context on **matched** / **ACORE-backed** rows.
+
+    **Exception:** ``File Source`` = **M61 Only** Subline export lines are kept so fund-scoped UI
+    (All Results / Selected Primary Fund / Deal Drilldown / Subline note filter) can show comparison
+    rows that never enter the financing-note match stage.
+
+    When ``reconcile(..., match_diagnostics=True)`` is used, this filter is skipped.
+    """
+    if skip_when_match_diagnostics or df is None or df.empty:
+        return df
+    if "Liability Type (M61 Raw)" not in df.columns:
+        return df
+    buckets = df["Liability Type (M61 Raw)"].map(_liability_type_bucket)
+    sub_m = buckets.eq("subline")
+    if not sub_m.any():
+        return df
+    if "Match Stage" in df.columns:
+        stage = df["Match Stage"].fillna("").astype(str).str.strip()
+    else:
+        stage = pd.Series("", index=df.index, dtype=str)
+    if "File Source" in df.columns:
+        fs = df["File Source"].fillna("").astype(str).str.strip()
+        m61_only_subline_keep = fs.eq(FILE_SOURCE_M61_ONLY) & sub_m
+    else:
+        m61_only_subline_keep = pd.Series(False, index=df.index)
+    drop_m = sub_m & stage.ne("financing_note") & ~m61_only_subline_keep
+    n_drop = int(drop_m.sum())
+    if n_drop:
+        _debug_rows(
+            "Final recon filter: "
+            f"dropping {n_drop} M61 Subline-bucket row(s) where Match Stage != 'financing_note' "
+            f"(M61-only Subline rows retained={int(m61_only_subline_keep.sum())}; "
+            f"output rows {len(df)} -> {len(df) - n_drop})"
+        )
+    return df.loc[~drop_m].copy().reset_index(drop=True)
+
+
 ACP_SHEET_COLS = [
     "Deal Name",
     "Note Name",
+    "Note ID",
     "Source",
     "Facility",
     "Advance Rate",
@@ -2258,6 +2464,20 @@ def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
     if deal_id_col is not None:
         df["Deal ID"] = df_raw[deal_id_col]
 
+    df["Note ID"] = pd.NA
+    if primary_file_type == "ACP II":
+        note_id_col = None
+        for c in df_raw.columns:
+            nk = _norm_colname_key(str(c)).replace(" ", "").replace("_", "")
+            if nk in ("noteid", "note_id", "acorenoteid", "crenoteid", "finnotenumber", "financingnoteid"):
+                note_id_col = c
+                break
+        if note_id_col is not None:
+            df["Note ID"] = df_raw.loc[df.index, note_id_col]
+            df["Note ID"] = df["Note ID"].apply(
+                lambda v: pd.NA if v is None or (isinstance(v, float) and pd.isna(v)) or not str(v).strip() else str(v).strip()
+            )
+
     df = ensure_columns(df, ACP_SHEET_COLS)
     keep_cols = list(ACP_SHEET_COLS) + (["Deal ID"] if "Deal ID" in df.columns else [])
     if primary_file_type == "ACP I" and "Index Name" in df.columns:
@@ -2283,9 +2503,13 @@ def load_primary_file(path: str, primary_file_type: str) -> pd.DataFrame:
             df[col] = df[col].apply(_safe_str)
         if "Index Name" in df.columns:
             df["Index Name"] = df["Index Name"].apply(_safe_str)
+        if "Note ID" in df.columns:
+            df["Note ID"] = df["Note ID"].apply(_safe_str)
     else:
         for col in _str_cols:
             df[col] = df[col].astype(str).str.strip()
+        if "Note ID" in df.columns:
+            df["Note ID"] = df["Note ID"].astype(str).str.strip().replace({"nan": "", "NaN": "", "<NA>": ""})
     if "Deal ID" in df.columns:
         df["Deal ID"] = df["Deal ID"].apply(
             lambda v: pd.NA if pd.isna(v) or not str(v).strip() else str(v).strip()
@@ -2345,12 +2569,27 @@ def _fin_note_tokens_for_primary(primary_file_type: str) -> tuple[str, ...]:
     return ()
 
 
-def _fin_note_scope_mask(liab_note_up: pd.Series, primary_file_type: str) -> pd.Series:
+def _fin_note_scope_mask(
+    liab_note_up: pd.Series,
+    primary_file_type: str,
+    *,
+    liability_type_bucket: pd.Series | None = None,
+) -> pd.Series:
+    """True when Liability Note matches primary financing tokens **and** row is not a Subline bucket.
+
+    Subline liability rows may load via ``M61_LOAD_IN_SCOPE_LIABILITY_BUCKETS`` but must not be
+    admitted on the financing-note token OR-path (or Fin Inpt financing keys).
+    """
     toks = _fin_note_tokens_for_primary(primary_file_type)
     if not toks:
-        return pd.Series(False, index=liab_note_up.index)
-    pat = "|".join(re.escape(t) for t in toks)
-    return liab_note_up.astype(str).str.contains(pat, case=False, regex=True, na=False)
+        out = pd.Series(False, index=liab_note_up.index)
+    else:
+        pat = "|".join(re.escape(t) for t in toks)
+        out = liab_note_up.astype(str).str.contains(pat, case=False, regex=True, na=False)
+    if liability_type_bucket is not None:
+        sub_m = liability_type_bucket.astype(str).str.strip().str.lower().isin(M61_SUBLINE_LIABILITY_BUCKETS)
+        out = out & ~sub_m.reindex(liab_note_up.index, fill_value=False)
+    return out
 
 
 def load_file_a(
@@ -2414,11 +2653,13 @@ def load_file_a(
     ].str.contains(AOC_M61_FUND_NAME_I_RE, regex=True, na=False)
     fund_mask = in_target_set | aoc_style
     df["Liability Type Bucket"] = df["Liability Type"].apply(_liability_type_bucket)
-    liab_type_mask = df["Liability Type Bucket"].isin(M61_IN_SCOPE_LIABILITY_BUCKETS)
+    liab_type_mask = df["Liability Type Bucket"].isin(M61_LOAD_IN_SCOPE_LIABILITY_BUCKETS)
     liab_note_up = df["Liability Note"].fillna("").astype(str).str.upper()
-    fin_note_scope_mask = _fin_note_scope_mask(liab_note_up, primary_file_type)
+    fin_note_scope_mask = _fin_note_scope_mask(
+        liab_note_up, primary_file_type, liability_type_bucket=df["Liability Type Bucket"]
+    )
     # Rows are dropped only when ALL of the following are false:
-    # (1) Liability Type bucket in M61_IN_SCOPE_LIABILITY_BUCKETS (financing ∪ Subline), OR
+    # (1) Liability Type bucket in M61_LOAD_IN_SCOPE_LIABILITY_BUCKETS (financing ∪ Subline), OR
     # (2) Liability Note contains primary-specific financing tokens (e.g. LN_FIN_AOCII), OR
     # (3) Fallback: Fund Name matches this run's primary fund scope (same regex as reconcile
     #     _m61_in_scope) AND Deal Name is non-blank — avoids silently dropping real fund rows
@@ -2506,6 +2747,7 @@ def load_file_a(
     # Keep DealLevelAdvanceRate when the export provides it (otherwise ensure_columns would add NA).
     if "DealLevelAdvanceRate" in df.columns and "DealLevelAdvanceRate" not in keep:
         keep = list(dict.fromkeys(list(keep) + ["DealLevelAdvanceRate"]))
+    keep = list(dict.fromkeys(list(keep) + ["Liability Type Bucket"]))
     df = df[keep].copy()
 
     # Preserve missing-vs-zero semantics for M61 numeric fields (e.g., '-' must stay missing, not 0).
@@ -3485,11 +3727,19 @@ def _facility_norm_for_debug_cell(v) -> str:
 def _fin_m61_key_from_row(row: pd.Series, scope_label: str) -> str:
     """Composite financing key on M61 rows: deal id + eff date + optional suffix; ``Fin`` + fund scope only.
 
-    ACP II extension: ``Sub`` (subline) rows also produce a bare deal-id + effective-date key so
-    they can match ACORE "Sub Debt" rows via the financing_note stage.  LN_Sub notes carry no
-    source suffix, and ACORE "Sub Debt" rows with unrecognised facilities (e.g. Bank OZK) also
-    fall back to the bare key — so the two sides naturally align.
+    Liability Type bucket ``subline`` (M61 Subline rows) never produces a key: those lines load for
+    reporting but must not pair with ACORE financing rows.
+
+    ACP II extension: ``Sub`` (LN_Sub) rows on **financing** liability buckets produce ``|sub`` keys
+    so they match ACORE "Sub Debt" only, without colliding with Repo/Non/CLO bare keys.
     """
+    _ltb = row.get("Liability Type Bucket")
+    if _ltb is not None and not (isinstance(_ltb, float) and pd.isna(_ltb)) and str(_ltb).strip():
+        _bucket = str(_ltb).strip().lower()
+    else:
+        _bucket = _liability_type_bucket(row.get("Liability Type"))
+    if _bucket in M61_SUBLINE_LIABILITY_BUCKETS:
+        return ""
     p = parse_liability_note(row.get("Liability Note"))
     nc = p.get("note_category")
     # ACP II-only: LN_Sub rows produce a keyed ``|sub`` token so they exclusively match
@@ -3532,8 +3782,20 @@ def _fin_m61_key_from_row(row: pd.Series, scope_label: str) -> str:
             sx = ""
     # When the note has no suffix and name/FI yield no token, match on deal id + effective date only.
     if sx:
-        return f"{did}|{eff}|{sx}"
-    return f"{did}|{eff}"
+        key = f"{did}|{eff}|{sx}"
+    elif scope_label == "ACP II":
+        fam = _acp_ii_m61_family_token_for_related_m61(row)
+        if fam:
+            key = f"{did}|{eff}|{fam}"
+        else:
+            key = f"{did}|{eff}"
+    else:
+        key = f"{did}|{eff}"
+    if scope_label == "ACP II" and key:
+        lk = _acp_ii_m61_line_bucket_for_fin(row)
+        if lk:
+            key = f"{key}|lk:{lk}"
+    return key
 
 
 def build_match_key(df, deal_col, facility_col, note_col, effective_date_col):
@@ -4066,14 +4328,23 @@ def reconcile(
         a["_m61_note_category"] = a["Liability Note"].apply(
             lambda v: parse_liability_note(v).get("note_category", "Other")
         )
-        # ACP II: include LN_Sub (Subline) rows alongside LN_Fin so ACORE "Sub Debt" rows
-        # can match their M61 counterparts.  All other Fin Inpt types remain Fin-only.
+        # Financing-note / Fin Inpt candidates: liability bucket must be financing (not M61 Subline).
+        # ACP II: LN_Sub (``Sub``) on financing buckets still pairs Sub Debt via ``|sub`` keys.
+        if "Liability Type Bucket" not in a.columns and "Liability Type" in a.columns:
+            a = a.copy()
+            a["Liability Type Bucket"] = a["Liability Type"].apply(_liability_type_bucket)
+        _m61_fin_bucket_m = a["Liability Type Bucket"].isin(M61_FINANCING_TYPE_BUCKETS)
         if primary_file_type == "ACP II":
             fin_note_rows = set(
-                a.loc[a["_m61_note_category"].isin({"Fin", "Sub"}), "_row_id_a"].tolist()
+                a.loc[
+                    _m61_fin_bucket_m & a["_m61_note_category"].isin({"Fin", "Sub"}),
+                    "_row_id_a",
+                ].tolist()
             )
         else:
-            fin_note_rows = set(a.loc[a["_m61_note_category"].eq("Fin"), "_row_id_a"].tolist())
+            fin_note_rows = set(
+                a.loc[_m61_fin_bucket_m & a["_m61_note_category"].eq("Fin"), "_row_id_a"].tolist()
+            )
         matchable_a = matchable_a.intersection(fin_note_rows)
         _scope_ok = pd.Series(True, index=a.index)
         # Tight fund guard for ACP II / AOC II / AOC I where shared Deal IDs across funds are common.
@@ -4132,6 +4403,32 @@ def reconcile(
                 b.loc[sub_debt_mask, "fin_acp_key"] = (
                     sub_b2["deal_id_key"].astype(str) + "|" +
                     sub_b2["effective_date_key"].astype(str) + "|sub"
+                )
+            # Bare ``deal|eff`` keys: append Repo/CLO/… family so CLO lines never share a merge key with Repo.
+            sub_acp = b.loc[msk_b]
+            _base_only = (
+                sub_acp["deal_id_key"].astype(str) + "|" + sub_acp["effective_date_key"].astype(str)
+            )
+            _cur_fin = sub_acp["fin_acp_key"].astype(str)
+            _bare_fin = _cur_fin.eq(_base_only.astype(str))
+            if _bare_fin.any():
+                bare_ix = sub_acp.index[_bare_fin]
+                fam_suf = b.loc[bare_ix].apply(_acp_ii_fin_allocation_suffix_primary, axis=1)
+                hit = fam_suf.astype(str).str.strip().ne("")
+                if hit.any():
+                    upd_ix = fam_suf.index[hit]
+                    b.loc[upd_ix, "fin_acp_key"] = (
+                        _cur_fin.loc[upd_ix].astype(str) + "|" + fam_suf.loc[upd_ix].astype(str)
+                    )
+            # CLO tranche (e.g. 2026-FL1) vs WF Repo buckets: align with M61 ``|lk:`` so rows do not
+            # positional-merge across line families on the same deal + effective date.
+            fin_series = b.loc[msk_b, "fin_acp_key"].astype(str)
+            line_ix = fin_series.index[~fin_series.str.endswith("|sub")]
+            if len(line_ix):
+                lb = b.loc[line_ix].apply(_acp_ii_acore_line_bucket_for_fin, axis=1)
+                b.loc[line_ix, "fin_acp_key"] = (
+                    b.loc[line_ix, "fin_acp_key"].astype(str)
+                    + lb.map(lambda x: f"|lk:{x}" if str(x).strip() else "")
                 )
         a["fin_m61_key"] = a.apply(lambda r: _fin_m61_key_from_row(r, scope_lbl), axis=1)
 
@@ -4208,9 +4505,12 @@ def reconcile(
         def _pick_primary_row(ar: pd.Series, cand: pd.DataFrame) -> int | None:
             if cand.empty:
                 return None
-            if len(cand) == 1:
-                return int(cand.iloc[0]["_row_id_b"])
             eff_m = safe_str_strip(ar.get("effective_date_key"))
+            if len(cand) == 1:
+                if primary_file_type == "ACP II" and eff_m:
+                    if str(cand.iloc[0].get("effective_date_key")) != eff_m:
+                        return None
+                return int(cand.iloc[0]["_row_id_b"])
             sub_eff = cand[cand["effective_date_key"].astype(str) == eff_m]
             tok = _m61_fac_tok_for_relaxed(ar)
 
@@ -4227,6 +4527,10 @@ def reconcile(
                     "(multiple primary rows same deal id + eff date): "
                     f"m61_id={int(ar['_row_id_a'])} deal_id={ar.get('m61_match_key')!r} n={len(sub_eff)}"
                 )
+                return None
+
+            # ACP II: never pair across effective dates (even when facility token is unique).
+            if primary_file_type == "ACP II":
                 return None
 
             # No primary row shares this effective date — try facility token across all candidates.
@@ -4295,6 +4599,8 @@ def reconcile(
         are sorted by ``(effective_date_key, row_id)`` then paired in order (first with first, …) up to
         ``min(count_primary, count_m61)``. Any surplus rows on either side stay unmatched (existing
         Missing / M61-only behavior).
+
+        **ACP II:** the caller skips this fallback entirely so deal-id matches never ignore effective date.
         """
         added = 0
         b_pool = b[
@@ -4308,10 +4614,18 @@ def reconcile(
         b_ids_by: dict[str, list[int]] = {}
         for _, r in b_pool.iterrows():
             k = str(r["acp_match_key"]).strip()
+            if primary_file_type == "ACP II":
+                fam = _acp_ii_acore_family_token_for_related_m61(r)
+                if fam:
+                    k = f"{k}|{fam}"
             b_ids_by.setdefault(k, []).append(int(r["_row_id_b"]))
         a_ids_by: dict[str, list[int]] = {}
         for _, r in a_pool.iterrows():
             k = str(r["m61_match_key"]).strip()
+            if primary_file_type == "ACP II":
+                fam = _acp_ii_m61_family_token_for_related_m61(r)
+                if fam:
+                    k = f"{k}|{fam}"
             a_ids_by.setdefault(k, []).append(int(r["_row_id_a"]))
         for deal_key in sorted(set(b_ids_by.keys()) & set(a_ids_by.keys())):
             b_ids = sorted(
@@ -4371,6 +4685,23 @@ def reconcile(
             _scope_ok=_scope_ok,
         )
         _debug_trace_uncommons_pairing_keys(a, b)
+    elif primary_file_type == "ACP II":
+        # Fin Inpt: never pair multiple same-deal rows by Deal ID alone — include eff date + family/bank
+        # so Repo vs CLO (and distinct bank Repo lines) do not positional-merge across families.
+        b["id_match_key"] = (
+            b["acp_match_key"].astype(str).str.strip()
+            + "|"
+            + b["effective_date_key"].astype(str).str.strip()
+            + "|"
+            + b.apply(_acp_ii_fin_allocation_suffix_primary, axis=1).astype(str)
+        )
+        a["id_match_key"] = (
+            a["m61_match_key"].astype(str).str.strip()
+            + "|"
+            + a["effective_date_key"].astype(str).str.strip()
+            + "|"
+            + a.apply(_acp_ii_fin_allocation_suffix_m61, axis=1).astype(str)
+        )
 
     if primary_file_type in FIN_INPT_PRIMARY_TYPES:
         # Financing-first: parsed M61 liability note (Fin + fund + deal id + eff date + suffix)
@@ -4495,10 +4826,42 @@ def reconcile(
         fallback_n = _pair_by_key("deal_date_key", "deal_date_key", "fallback")
         _debug_rows(f"TEMP DEBUG: staged matcher fallback matches={fallback_n}")
 
-    deal_id_eff_fb_n = _pair_deal_id_ignore_effective_date_fallback()
+    # ACP II: do not pair ACORE rows to M61 lines on deal id (+ family) alone when effective dates
+    # differ — those rows stay ACORE-only; related/drilldown context is handled separately in the UI.
+    if primary_file_type == "ACP II":
+        deal_id_eff_fb_n = 0
+    else:
+        deal_id_eff_fb_n = _pair_deal_id_ignore_effective_date_fallback()
     _debug_rows(
         f"TEMP DEBUG: deal_id_ignore_eff_date fallback (same deal id, date may differ) pairs={deal_id_eff_fb_n}"
     )
+
+    # ACP II: defensive one-to-one — a single M61 financing row must not appear in multiple ``both`` pairs.
+    if primary_file_type == "ACP II":
+        _seen_m61_pair: set[int] = set()
+        _pair_rows2: list[dict] = []
+        for _pr in pair_rows:
+            if _pr.get("_merge") != "both":
+                _pair_rows2.append(_pr)
+                continue
+            _ra = _pr.get("_row_id_a")
+            _rb = _pr.get("_row_id_b")
+            if _ra is None or pd.isna(_ra):
+                _pair_rows2.append(_pr)
+                continue
+            _rai = int(_ra)
+            if _rai in _seen_m61_pair:
+                if _rb is not None and not pd.isna(_rb):
+                    unmatched_b.add(int(_rb))
+                _rb_dbg = int(_rb) if _rb is not None and not pd.isna(_rb) else None
+                _debug_rows(
+                    "TEMP DEBUG: ACP II pair_rows dedupe — dropped duplicate M61 id in both-merge "
+                    f"m61_id={_rai} released_acp_id={_rb_dbg!r}"
+                )
+                continue
+            _seen_m61_pair.add(_rai)
+            _pair_rows2.append(_pr)
+        pair_rows = _pair_rows2
 
     # Build merged-like frame while preserving unmatched rows (outer behavior).
     for rid_b in sorted(unmatched_b):
@@ -4512,6 +4875,27 @@ def reconcile(
                 "_merge": "right_only",
             }
         )
+
+    # ACP II: ACORE-primary row order — every ACORE row in original sheet order, then true M61-only rows.
+    if primary_file_type == "ACP II":
+
+        def _acp_ii_pair_row_b_key(pr: dict) -> int:
+            v = pr.get("_row_id_b")
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return 1_000_000_000
+            return int(v)
+
+        def _acp_ii_pair_row_a_key(pr: dict) -> int:
+            v = pr.get("_row_id_a")
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return 1_000_000_000
+            return int(v)
+
+        _acp_main = [p for p in pair_rows if p.get("_merge") != "right_only"]
+        _acp_tail = [p for p in pair_rows if p.get("_merge") == "right_only"]
+        _acp_main.sort(key=_acp_ii_pair_row_b_key)
+        _acp_tail.sort(key=_acp_ii_pair_row_a_key)
+        pair_rows = _acp_main + _acp_tail
 
     paired_row_ids_m61: set[int] = set()
     for _pr in pair_rows:
@@ -4621,15 +5005,25 @@ def reconcile(
         record = {col: row.get(col) for col in ACP_SHEET_COLS}
 
         if not in_b and in_a:
+            # M61-only row: ACORE is the row driver — do NOT copy M61 fields into
+            # ACORE columns (Facility, Note Name, Pledge*, Maturity Date).  M61 data
+            # belongs only in the dedicated M61 comparison columns further below.
+            # Deal Name and Effective Date are populated from M61 solely so the row
+            # can be identified in the UI; they carry no "ACORE said so" meaning.
             record["Deal Name"] = row.get(f"{label_a}_Deal Name")
-            record["Facility"] = row.get(f"{label_a}_Liability Name")
-            record["Note Name"] = row.get(f"{label_a}_Liability Note")
-            record["Pledge"] = row.get(f"{label_a}_Pledge")
-            record["Pledge Date"] = row.get(f"{label_a}_Pledge Date")
             record["Effective Date"] = row.get(f"{label_a}_Effective Date")
-            record["Maturity Date"] = row.get(f"{label_a}_Maturity Date")
+            # Facility, Note Name, Pledge, Pledge Date, Maturity Date intentionally
+            # left as NA — these are ACORE-only fields and must not be auto-filled
+            # from M61 data (avoids "fake ACORE facility" rows in the output).
 
-        facility_raw = record.get("Facility") or row.get(f"{label_a}_Liability Name")
+        if in_b:
+            facility_raw = row.get("Facility")
+            if _is_blank_for_compare(facility_raw):
+                facility_raw = record.get("Facility")
+        else:
+            # M61-only: Financial Line is built from M61 Liability Name for display
+            # purposes, but the Facility column itself stays blank (ACORE-only field).
+            facility_raw = row.get(f"{label_a}_Liability Name")
         facility_norm = normalise_facility(facility_raw)
         record["Financial Line"] = f"{record.get('Deal Name', '')} & {str(facility_norm).upper()}"
         record["match_key"] = (
@@ -4972,6 +5366,9 @@ def reconcile(
     _target_stage2 = _target_22203_snapshot(df_out)
 
     df_out = _ensure_file_source_populated(df_out)
+    df_out = _filter_subline_from_final_recon_output(
+        df_out, skip_when_match_diagnostics=match_diagnostics
+    )
 
     _debug_cols = [
         "Deal Name",
