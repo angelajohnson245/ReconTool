@@ -34,7 +34,6 @@ from recon_enhanced_output import (
     normalise_facility,
     normalise_text,
     normalize_recon_fund_for_output,
-    load_primary_file,
     reconcile,
     safe_str_strip,
     scope_label_for_primary_type,
@@ -1219,13 +1218,6 @@ with st.sidebar:
     m61_file_valid = looks_like_m61_liability_relationship(
         file_a_upload.name if file_a_upload else None
     )
-    if file_a_upload and not m61_file_valid:
-        st.warning(
-            "Uploaded comparison file does not look like a Liability Relationship export. "
-            "Expected filename to include both `liability` and `relationship` "
-            "(and not mapping names like `LiabilityNote` / `AssetNote`)."
-        )
-
     # Optional mapping workbook is still supported by reconcile(); not exposed in UI.
     mapping_upload = None
 
@@ -1998,6 +1990,38 @@ def _scope_mode_display(scope_mode: str, debug_full: bool) -> str:
 _UPLOAD_EXTS_ALLOWED = frozenset({".xlsx", ".xlsm", ".xls", ".xlsb"})
 
 
+def _upload_has_payload(uploaded_file) -> bool:
+    """True when the Streamlit upload object contains non-empty file bytes."""
+    if uploaded_file is None:
+        return False
+    try:
+        return len(_bytes_from_streamlit_upload(uploaded_file)) > 0
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _both_uploads_ready(file_a_upload, file_b_upload) -> bool:
+    """Both workbooks must be present in memory before reconcile runs (cloud-safe)."""
+    return bool(file_a_upload and file_b_upload and _upload_has_payload(file_a_upload) and _upload_has_payload(file_b_upload))
+
+
+def _clear_recon_session_results() -> None:
+    """Drop cached reconciliation output when uploads are not ready (fresh Render deploy / cleared files)."""
+    for key in (
+        "df_recon",
+        "df_excluded_by_liability_type",
+        "recon_row_counts",
+        "recon_context",
+        "emergency_pri_rowcount",
+        "emergency_pri_probe_df",
+        "last_run_excel_name",
+        "last_run_csv_name",
+        "last_successful_upload_signature",
+        "primary_upload_name",
+    ):
+        st.session_state.pop(key, None)
+
+
 def _bytes_from_streamlit_upload(uploaded_file) -> bytes:
     """Read all bytes from a Streamlit ``UploadedFile`` / file-like object.
 
@@ -2124,6 +2148,12 @@ def run_reconciliation_for_selection(
             path_map = None
             _write_upload_to_disk(path_a, file_a_upload)
             _write_upload_to_disk(path_b, file_b_upload)
+            for _label, _path in (("M61", path_a), ("ACORE", path_b)):
+                if not os.path.isfile(_path) or os.path.getsize(_path) <= 0:
+                    raise OSError(
+                        f"{_label} upload could not be written to a temporary workbook "
+                        f"(path={_path!r}). Try uploading again."
+                    )
             if primary_file_type in ("AOC II", "AOC I") and mapping_upload:
                 path_map = _temp_workbook_path_inside_dir(
                     tmpdir,
@@ -2150,34 +2180,6 @@ def run_reconciliation_for_selection(
                 ),
             )
             df_recon = normalize_recon_fund_for_output(df_recon)
-            df_pri_loaded = load_primary_file(path_b, primary_file_type)
-            _probe_m = pd.Series(False, index=df_pri_loaded.index)
-            if "Deal Name" in df_pri_loaded.columns:
-                _probe_m |= df_pri_loaded["Deal Name"].astype(str).str.contains(
-                    "1551 Broadway", case=False, na=False
-                )
-            if "Deal ID" in df_pri_loaded.columns:
-                _probe_m |= df_pri_loaded["Deal ID"].astype(str).str.contains("25-2852", na=False)
-            _probe_cols = [
-                c
-                for c in (
-                    "Deal Name",
-                    "Deal ID",
-                    "Effective Date",
-                    "Source",
-                    "Facility",
-                    "Spread",
-                    "Advance Rate",
-                )
-                if c in df_pri_loaded.columns
-            ]
-            _probe_df = (
-                df_pri_loaded.loc[_probe_m, _probe_cols].copy()
-                if _probe_m.any() and _probe_cols
-                else (df_pri_loaded.loc[_probe_m].copy() if _probe_m.any() else df_pri_loaded.iloc[0:0].copy())
-            )
-            st.session_state["emergency_pri_rowcount"] = int(len(df_pri_loaded))
-            st.session_state["emergency_pri_probe_df"] = _probe_df
             st.session_state["df_recon"] = df_recon
             st.session_state["df_excluded_by_liability_type"] = (
                 df_excluded_type.copy() if df_excluded_type is not None else pd.DataFrame()
@@ -2206,7 +2208,22 @@ def run_reconciliation_for_selection(
 # --------------------------------------------------
 # MAIN CONTENT
 # --------------------------------------------------
-has_required_uploads = file_a_upload and file_b_upload and m61_file_valid
+both_uploads_ready = _both_uploads_ready(file_a_upload, file_b_upload)
+
+if not both_uploads_ready:
+    _clear_recon_session_results()
+    st.info("Upload both files to start the reconciliation.")
+    st.stop()
+
+if file_a_upload and not m61_file_valid:
+    st.warning(
+        "Uploaded comparison file does not look like a Liability Relationship export. "
+        "Expected filename to include both `liability` and `relationship` "
+        "(and not mapping names like `LiabilityNote` / `AssetNote`). "
+        "You can still run reconciliation."
+    )
+
+has_required_uploads = both_uploads_ready
 
 manual_run_requested = st.button("▶  Run Reconciliation", type="primary")
 upload_signature = _current_upload_signature(
@@ -4230,27 +4247,6 @@ if "df_recon" in st.session_state:
         st.caption("Downloads are disabled until you rerun with the current selection.")
 
 else:
-    # Empty state
-    st.markdown(
-        f"""
-    <div style='text-align:center; padding:60px 40px; background:#fff; border-radius:14px;
-                border: 1.5px dashed #ccd9ea; color:#5a7a99;'>
-      <div style='font-size:3rem; margin-bottom:16px;'>📂</div>
-      <h3 style='color:#1a3a6c; font-weight:700; margin-bottom:8px'>Upload both files to begin</h3>
-      <p style='font-size:0.88rem; max-width:420px; margin:0 auto; line-height:1.6;'>
-        Choose the <strong>{selected_ui_label}</strong> primary fund template in the sidebar,
-        then upload the matching <strong>Liquidity &amp; Earnings Model</strong> and the
-        <strong>(In) M61 Relationship</strong> export.
-      </p>
-      <div style='display:flex; justify-content:center; gap:16px; margin-top:24px; flex-wrap:wrap;'>
-        <div style='background:#e8f0fe; border-radius:8px; padding:10px 18px; font-size:0.78rem; color:#1a3a6c; font-weight:600;'>
-          📊 Primary .xlsm / .xlsx
-        </div>
-        <div style='background:#e8f0fe; border-radius:8px; padding:10px 18px; font-size:0.78rem; color:#1a3a6c; font-weight:600;'>
-          📄 (In) M61 .xlsx
-        </div>
-      </div>
-    </div>
-    """,
-        unsafe_allow_html=True,
+    st.info(
+        "Files are loaded. Click **Run Reconciliation** or turn on **Auto-run on upload** in the sidebar."
     )
