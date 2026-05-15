@@ -959,8 +959,12 @@ def _mismatch_detail_html(row: pd.Series) -> str:
     )
 
 
-def explain_reconciliation_row(row: pd.Series) -> str:
-    """Short business-friendly explanation for the selected grid row (rules-based text only)."""
+def explain_reconciliation_row(row: pd.Series, *, display_row: pd.Series | None = None) -> str:
+    """Short business-friendly explanation for the selected grid row (rules-based text only).
+
+    ``display_row`` is the post–Same-as-Above grid row when available; used so explanations match
+    what the user sees (consolidated M61 vs. truly missing).
+    """
     status_cols: tuple[tuple[str, str], ...] = (
         ("Effective Date Status", "Effective Date"),
         ("Pledge Date Status", "Pledge Date"),
@@ -992,6 +996,9 @@ def explain_reconciliation_row(row: pd.Series) -> str:
     file_src = safe_str_strip(row.get("File Source", ""))
     bucket = _recon_status_bucket(row.get("recon_status", ""))
     o = overall.upper()
+
+    if display_row is not None and _display_row_shows_same_as_above(display_row):
+        return _explain_same_as_above_consolidated_copy(deal, facility)
 
     mismatch_labels: list[str] = []
     missing_labels: list[str] = []
@@ -1730,6 +1737,244 @@ def _display_file_source_cell(row: pd.Series) -> str:
         "left_only": FILE_SOURCE_ACORE_ONLY,
         "right_only": FILE_SOURCE_M61_ONLY,
     }.get(k, "")
+
+
+# ---------------------------------------------------------------------------
+# "Same as Above" display helpers
+#
+# Business context: ACORE holds individual rows for each tranche / sub-line.
+# M61 may consolidate those rows into a single liability record.  When that
+# happens the extra ACORE-Only siblings should NOT look like they are missing
+# from M61 — they are simply covered by the matched row above.
+#
+# Rules:
+#   • Applied at the FULL ROW level — every M61-side value column AND every
+#     status column on that sibling row is replaced with "Same as Above".
+#   • **File Source** is set to **Both** for those sibling rows (M61 data exists for the
+#     group; display-only — not a new M61 match row).
+#   • Sibling rows are sorted to appear directly after the first Both row of their group.
+#   • Rows genuinely absent from M61 (no Both sibling in the same group) are
+#     never touched.
+#   • Styling (light-blue highlight) is applied separately in the render block.
+# ---------------------------------------------------------------------------
+
+# Display-side M61 value columns (formatted strings in df_display)
+_SAA_DISPLAY_M61_VALUE_COLS = [
+    "Eff Date (M61)",
+    "Pledge Date (M61)",
+    "Adv Rate (M61)",
+    "Spread (M61)",
+    "Undrawn (M61)",
+    "Index Floor (M61)",
+    "Index Name (M61)",
+    "Recourse % (M61)",
+    "Liability Type (M61)",
+    "M61 Note Category",
+]
+
+# Display-side status columns that also get replaced
+_SAA_DISPLAY_STATUS_COLS = [
+    "Effective Date Status",
+    "Pledge Date Status",
+    "Advance Rate Status",
+    "Spread Status",
+    "Undrawn Capacity Status",
+    "Index Floor Status",
+    "Index Name Status",
+    "Recourse % Status",
+    "Overall Recon Status",
+]
+
+# Raw M61 value columns in the export / df_view dataframe
+_SAA_EXPORT_M61_VALUE_COLS = [
+    "Effective Date (M61)",
+    "Pledge Date (M61)",
+    "Advance Rate (M61)",
+    "Spread (M61)",
+    "Undrawn Capacity (M61)",
+    "Index Floor (M61)",
+    "Index Name (M61)",
+    "Recourse % (M61)",
+    "Liability Type (M61)",
+    "Liability Type (M61 Raw)",
+    "M61 Note Category",
+]
+
+# Raw status columns in the export dataframe
+_SAA_EXPORT_STATUS_COLS = [
+    "Effective Date Status",
+    "Pledge Date Status",
+    "Advance Rate Status",
+    "Spread Status",
+    "Undrawn Capacity Status",
+    "Index Floor Status",
+    "Index Name Status",
+    "Recourse % Status",
+    "recon_status",
+    "Overall Recon Status",
+]
+
+
+_SAA_CELL_LABEL = "Same as Above"
+
+
+def _display_row_shows_same_as_above(disp: pd.Series | None) -> bool:
+    """True when the results grid row uses Same-as-Above (consolidated M61) display."""
+    if disp is None or len(disp) == 0:
+        return False
+    for c in _SAA_DISPLAY_M61_VALUE_COLS:
+        if c in disp.index and str(disp.get(c, "")).strip() == _SAA_CELL_LABEL:
+            return True
+    for c in _SAA_DISPLAY_STATUS_COLS:
+        if c in disp.index and str(disp.get(c, "")).strip() == _SAA_CELL_LABEL:
+            return True
+    return False
+
+
+def _explain_same_as_above_consolidated_copy(deal: str, facility: str) -> str:
+    """Explain text for rows where M61 values are intentionally not repeated (Same as Above)."""
+    return (
+        f"This ACORE line is represented by the **same consolidated M61 liability** as the matched "
+        f"**Both** row directly above (**{deal}** — **{facility}**). M61 often carries one obligation "
+        "row for several related ACORE lines, so detailed M61 fields are not duplicated here."
+        "\n\n"
+        "**This is not missing from M61** — the obligation is booked; use the row above whenever you "
+        "need the underlying M61 figures."
+        "\n\n"
+        "Next step: No separate M61 booking is expected for this line unless your controls require "
+        "a one-to-one row for each ACORE tranche."
+    )
+
+
+def _apply_same_as_above_display(df: pd.DataFrame, col_tag: str) -> pd.DataFrame:
+    """Replace M61 value + status columns with 'Same as Above' for ACORE Only rows
+    that are tied to the same consolidated M61 record as a matched 'Both' row in the
+    same (Deal Name, Source Type (ACORE), Eff Date) group. Sets **File Source** to **Both**
+    for those sibling rows (display-only).
+
+    The sibling rows are also re-sorted to sit directly underneath their matched row
+    so the visual relationship is immediately clear.
+
+    Rows that are genuinely missing from M61 (no Both sibling in their group) are
+    never touched.
+    """
+    if df.empty:
+        return df
+
+    eff_col = f"Eff Date ({col_tag})"
+    m61_cols = [c for c in _SAA_DISPLAY_M61_VALUE_COLS if c in df.columns]
+    status_cols = [c for c in _SAA_DISPLAY_STATUS_COLS if c in df.columns]
+    all_saa_cols = m61_cols + status_cols
+
+    required = ["Deal Name", "Source Type (ACORE)", eff_col, "File Source"]
+    if not all_saa_cols or any(c not in df.columns for c in required):
+        return df
+
+    df = df.copy()
+    df["_orig_pos"] = range(len(df))
+
+    gkey = (
+        df["Deal Name"].fillna("").astype(str)
+        + "||"
+        + df["Source Type (ACORE)"].fillna("").astype(str)
+        + "||"
+        + df[eff_col].fillna("").astype(str)
+    )
+    df["_gkey"] = gkey
+
+    both_mask = df["File Source"] == FILE_SOURCE_BOTH
+    acore_only_mask = df["File Source"] == FILE_SOURCE_ACORE_ONLY
+
+    eligible_groups = set(gkey[both_mask]) & set(gkey[acore_only_mask])
+    if not eligible_groups:
+        df.drop(columns=["_orig_pos", "_gkey"], inplace=True)
+        return df
+
+    # Rows to mark "Same as Above": ACORE Only siblings whose group has a Both match
+    saa_mask = acore_only_mask & gkey.isin(eligible_groups)
+    if not saa_mask.any():
+        df.drop(columns=["_orig_pos", "_gkey"], inplace=True)
+        return df
+
+    # Replace M61 value columns and status columns for sibling rows
+    for col in all_saa_cols:
+        df.loc[saa_mask, col] = "Same as Above"
+    df.loc[saa_mask, "File Source"] = FILE_SOURCE_BOTH
+
+    # --- Reorder: siblings go directly after the first Both row of their group ---
+    # Sort key for each row:
+    #   Non-eligible rows         → (_orig_pos, 0, _orig_pos)
+    #   Eligible Both rows        → (first_both_pos_in_group, 0, _orig_pos)
+    #   Eligible ACORE Only rows  → (first_both_pos_in_group, 1, _orig_pos)
+    #
+    # This keeps non-eligible rows at their natural positions while pulling ACORE
+    # Only siblings to sit immediately after the Both row of their group.
+
+    first_both_pos = (
+        df.loc[both_mask & df["_gkey"].isin(eligible_groups)]
+        .groupby("_gkey")["_orig_pos"]
+        .min()
+    )
+    df["_group_anchor"] = df["_gkey"].map(first_both_pos)
+
+    in_eligible = df["_gkey"].isin(eligible_groups) & (both_mask | saa_mask)
+    df["_sort_anchor"] = df["_orig_pos"]
+    df.loc[in_eligible, "_sort_anchor"] = df.loc[in_eligible, "_group_anchor"]
+
+    df["_sort_type"] = 0
+    df.loc[saa_mask, "_sort_type"] = 1   # siblings sort after Both rows
+
+    df = (
+        df.sort_values(["_sort_anchor", "_sort_type", "_orig_pos"], kind="stable")
+        .reset_index(drop=True)
+    )
+    df.drop(
+        columns=["_orig_pos", "_gkey", "_group_anchor", "_sort_anchor", "_sort_type"],
+        inplace=True,
+    )
+    return df
+
+
+def _apply_same_as_above_export(df: pd.DataFrame) -> pd.DataFrame:
+    """Export-side equivalent of ``_apply_same_as_above_display``.
+
+    Replaces both M61 value columns and status columns with 'Same as Above' for
+    sibling ACORE Only rows, using raw reconciliation-engine column names.
+    Sets **File Source** to **Both** for those rows (display/export parity with the grid).
+    Grouping key: (Deal Name, Source, Effective Date (ACP)).
+    """
+    if df.empty:
+        return df
+
+    m61_cols = [c for c in _SAA_EXPORT_M61_VALUE_COLS if c in df.columns]
+    status_cols = [c for c in _SAA_EXPORT_STATUS_COLS if c in df.columns]
+    all_saa_cols = m61_cols + status_cols
+
+    eff_col = "Effective Date (ACP)" if "Effective Date (ACP)" in df.columns else "Effective Date"
+    required = ["Deal Name", "Source", eff_col, "File Source"]
+    if not all_saa_cols or any(c not in df.columns for c in required):
+        return df
+
+    df = df.copy()
+    gkey = (
+        df["Deal Name"].fillna("").astype(str)
+        + "||"
+        + df["Source"].fillna("").astype(str)
+        + "||"
+        + df[eff_col].fillna("").astype(str)
+    )
+    both_groups = set(gkey[df["File Source"] == FILE_SOURCE_BOTH])
+    if not both_groups:
+        return df
+
+    mask = (df["File Source"] == FILE_SOURCE_ACORE_ONLY) & gkey.isin(both_groups)
+    if not mask.any():
+        return df
+
+    for col in all_saa_cols:
+        df.loc[mask, col] = "Same as Above"
+    df.loc[mask, "File Source"] = FILE_SOURCE_BOTH
+    return df
 
 
 def _scope_mode_display(scope_mode: str, debug_full: bool) -> str:
@@ -2989,6 +3234,9 @@ if "df_recon" in st.session_state:
                 display_rows.append(rec)
 
             df_display = pd.DataFrame(display_rows).reset_index(drop=True)
+            # "Same as Above": replace M61 value columns for ACORE Only rows that share
+            # the same Deal / Source Type / Eff Date group as a matched Both row.
+            df_display = _apply_same_as_above_display(df_display, col_tag)
 
             # Option pools for **Source Type (ACORE)** / **Liability Type (M61)** table filters:
             # - Selected Fund Only → same row universe as the main table (primary-tied + fund-scoped M61-only).
@@ -3304,7 +3552,11 @@ if "df_recon" in st.session_state:
 
             # Status columns: color only (layout / padding / alignment shared via set_properties).
             def color_status(val):
-                v = str(val).strip().upper()
+                v = str(val).strip()
+                # "Same as Above" rows — light blue, communicates M61 consolidation
+                if v == "Same as Above":
+                    return "background-color: #daeeff; color: #1a4f7a; font-style: italic;"
+                v = v.upper()
                 if v in ("N/A", "", "—", "-", "NAN", "NONE"):
                     return ""
                 # MISSING FROM BOTH = absent on both sides, not a real issue — render muted/gray.
@@ -3402,6 +3654,17 @@ if "df_recon" in st.session_state:
                             "background-clip": "padding-box",
                         },
                     )
+                # "Same as Above" highlight on M61 value columns (light blue).
+                # Status columns are already handled by color_status above.
+                _saa_m61_visible = [
+                    c for c in _SAA_DISPLAY_M61_VALUE_COLS if c in df_table_view_display.columns
+                ]
+                if _saa_m61_visible:
+                    def _saa_cell_style(val):
+                        if str(val).strip() == "Same as Above":
+                            return "background-color: #daeeff; color: #1a4f7a; font-style: italic;"
+                        return ""
+                    styled = styled.map(_saa_cell_style, subset=_saa_m61_visible)
             _df_kwargs: dict = {
                 "use_container_width": True,
                 "height": 580,
@@ -3438,9 +3701,13 @@ if "df_recon" in st.session_state:
                     _sel_deal = str(df_table_view.iloc[_sel_pos].get("Deal Name", "")).strip()
                     if _sel_deal:
                         st.session_state["drilldown_deal_pick"] = _sel_deal
-                    _explain_row = df_view.loc[df_table_view.index[_sel_pos]]
+                    _ix = df_table_view.index[_sel_pos]
+                    _explain_row = df_view.loc[_ix]
+                    _disp_row = df_display.loc[_ix] if _ix in df_display.index else None
                     with st.expander("Explain this row", expanded=True):
-                        st.markdown(explain_reconciliation_row(_explain_row))
+                        st.markdown(
+                            explain_reconciliation_row(_explain_row, display_row=_disp_row)
+                        )
 
             if len(df_table_view) == 0:
                 df_export_ui = df_view.iloc[0:0].copy()
@@ -3880,6 +4147,8 @@ if "df_recon" in st.session_state:
         if _sp_acp_blank.any():
             df_export_ready.loc[_sp_acp_blank, "Spread (ACP)"] = df_export_ready.loc[_sp_acp_blank, "Spread"]
     df_export_ready = _normalize_display_missing_df(df_export_ready)
+    # "Same as Above": mirror the display transformation in the export output.
+    df_export_ready = _apply_same_as_above_export(df_export_ready)
 
     col_dl1, col_dl2 = st.columns(2)
 
