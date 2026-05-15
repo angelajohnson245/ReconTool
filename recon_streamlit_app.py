@@ -1119,6 +1119,49 @@ def explain_reconciliation_row(row: pd.Series, *, display_row: pd.Series | None 
     return "\n\n".join(parts)
 
 
+def render_full_app_shell(selected_ui_label: str, m61_export_line_html: str) -> None:
+    """Main-area header (sidebar is built separately in its own ``with st.sidebar`` block)."""
+    st.markdown(
+        f"""
+<div class="recon-header">
+  <div>
+    <h1>📊 Financing Line Reconciliation</h1>
+    <p>Primary: <strong>{html.escape(str(selected_ui_label), quote=True)}</strong> · {m61_export_line_html}</p>
+  </div>
+  <div class="badge">Run: {datetime.now().strftime("%b %d, %Y  %H:%M")}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_original_landing_page_if_no_results(selected_ui_label: str) -> None:
+    """Original polished holding page when no reconciliation results are in session."""
+    st.markdown(
+        f"""
+    <div style='text-align:center; padding:60px 40px; background:#fff; border-radius:14px;
+                border: 1.5px dashed #ccd9ea; color:#5a7a99;'>
+      <div style='font-size:3rem; margin-bottom:16px;'>📂</div>
+      <h3 style='color:#1a3a6c; font-weight:700; margin-bottom:8px'>Upload both files to begin</h3>
+      <p style='font-size:0.88rem; max-width:420px; margin:0 auto; line-height:1.6;'>
+        Choose the <strong>{html.escape(str(selected_ui_label), quote=True)}</strong> primary fund template in the sidebar,
+        then upload the matching <strong>Liquidity &amp; Earnings Model</strong> and the
+        <strong>(In) M61 Relationship</strong> export.
+      </p>
+      <div style='display:flex; justify-content:center; gap:16px; margin-top:24px; flex-wrap:wrap;'>
+        <div style='background:#e8f0fe; border-radius:8px; padding:10px 18px; font-size:0.78rem; color:#1a3a6c; font-weight:600;'>
+          📊 Primary .xlsm / .xlsx
+        </div>
+        <div style='background:#e8f0fe; border-radius:8px; padding:10px 18px; font-size:0.78rem; color:#1a3a6c; font-weight:600;'>
+          📄 (In) M61 .xlsx
+        </div>
+      </div>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+
 # --------------------------------------------------
 # SIDEBAR
 # --------------------------------------------------
@@ -1469,23 +1512,9 @@ with st.sidebar:
 # <strong style='color:#8fb8d8'>Target Advance Rate</strong><br>From M61 file only
 
 
-# --------------------------------------------------
-# HEADER
-# --------------------------------------------------
-st.markdown(
-    f"""
-<div class="recon-header">
-  <div>
-    <h1>📊 Financing Line Reconciliation</h1>
-    <p>Primary: <strong>{html.escape(str(selected_ui_label), quote=True)}</strong> · {_m61_export_line}</p>
-  </div>
-  <div class="badge">Run: {datetime.now().strftime("%b %d, %Y  %H:%M")}</div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
- 
- 
+render_full_app_shell(selected_ui_label, _m61_export_line)
+
+
 # --------------------------------------------------
 # HELPERS
 # --------------------------------------------------
@@ -2212,10 +2241,7 @@ both_uploads_ready = _both_uploads_ready(file_a_upload, file_b_upload)
 
 if not both_uploads_ready:
     _clear_recon_session_results()
-    st.info("Upload both files to start the reconciliation.")
-    st.stop()
-
-if file_a_upload and not m61_file_valid:
+elif file_a_upload and not m61_file_valid:
     st.warning(
         "Uploaded comparison file does not look like a Liability Relationship export. "
         "Expected filename to include both `liability` and `relationship` "
@@ -4247,6 +4273,6 @@ if "df_recon" in st.session_state:
         st.caption("Downloads are disabled until you rerun with the current selection.")
 
 else:
-    st.info(
-        "Files are loaded. Click **Run Reconciliation** or turn on **Auto-run on upload** in the sidebar."
-    )
+    if not both_uploads_ready:
+        st.info("Upload both files to start the reconciliation.")
+    render_original_landing_page_if_no_results(selected_ui_label)
