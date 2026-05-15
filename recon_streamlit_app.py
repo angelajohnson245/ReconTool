@@ -3,6 +3,7 @@ Financing Line Reconciliation Tool — Streamlit UI
 Run with: streamlit run recon_streamlit_app.py
 """
 import calendar
+import gc
 import html
 import io
 import os
@@ -2049,6 +2050,8 @@ def _clear_recon_session_results() -> None:
         "primary_upload_name",
     ):
         st.session_state.pop(key, None)
+    # Release memory held by now-deleted DataFrames so Render doesn't OOM.
+    gc.collect()
 
 
 def _bytes_from_streamlit_upload(uploaded_file) -> bytes:
@@ -2111,6 +2114,9 @@ def _write_upload_to_disk(path: str, uploaded_file) -> None:
             os.fsync(out.fileno())
         except OSError:
             pass
+    # Free the in-memory bytes buffer immediately — the file on disk is the only
+    # copy needed for reconcile().  On Render, this matters for large workbooks.
+    del data
 
 
 def _current_upload_signature(
@@ -2209,9 +2215,14 @@ def run_reconciliation_for_selection(
                 ),
             )
             df_recon = normalize_recon_fund_for_output(df_recon)
+            # Drop the previous run's large DataFrames before storing new ones so
+            # Python's allocator can reclaim the memory on Render.
+            for _stale_key in ("df_recon", "df_excluded_by_liability_type"):
+                st.session_state.pop(_stale_key, None)
+            gc.collect()
             st.session_state["df_recon"] = df_recon
             st.session_state["df_excluded_by_liability_type"] = (
-                df_excluded_type.copy() if df_excluded_type is not None else pd.DataFrame()
+                df_excluded_type if df_excluded_type is not None else pd.DataFrame()
             )
             st.session_state["recon_row_counts"] = dict(recon_diag or {})
             st.session_state["recon_context"] = get_last_recon_context()
@@ -2426,19 +2437,21 @@ if "df_recon" in st.session_state:
     st.markdown('<div class="section-label">Deal filter</div>', unsafe_allow_html=True)
 
     _debug_full = bool(st.session_state.get("recon_debug_full_m61", False))
+    # filter_recon_to_selected_fund receives a copy so the session-state df_recon
+    # is never mutated by the engine's internal filtering.
     df_scoped = filter_recon_to_selected_fund(df_recon.copy(), run_primary)
     if _debug_full:
-        df_all = df_recon.copy()
+        df_all = df_recon   # read-only reference in debug mode; no copy needed
     else:
-        df_all = df_scoped.copy()
+        df_all = df_scoped  # df_scoped is already a fresh filtered DataFrame
 
     if "File Source" in df_all.columns:
         _deal_source_mask = df_all["File Source"].fillna("").astype(str).str.strip().isin(
             [FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY]
         )
-        _deal_pool = df_all.loc[_deal_source_mask].copy()
+        _deal_pool = df_all.loc[_deal_source_mask]   # view; only used for .unique()
     else:
-        _deal_pool = df_all.copy()
+        _deal_pool = df_all
     deal_names = (
         sorted(_deal_pool["Deal Name"].dropna().astype(str).unique().tolist())
         if "Deal Name" in _deal_pool.columns
@@ -2484,22 +2497,22 @@ if "df_recon" in st.session_state:
             "columns filled in where a match exists. M61-only rows are hidden — ACORE drives the row count."
         )
     else:
-        df_view = df_all.copy()
+        # No copy — df_view is immediately reassigned by every filter step below
+        # (deal filter, date filter, note category, status filter all use .loc[] or pd.concat
+        # which produce new DataFrames, leaving df_all untouched).
+        df_view = df_all
         st.caption(
             f"**All results for {run_primary_label}:** Every record for this fund—matches, gaps, and export-only lines. "
             "Other funds are not shown."
         )
-    # TEMP DEBUG snapshot — after scope mode applied
-    # Disabled: Backend vs UI row-count expander (was ACORE / AOC II only).
-    # _td_active = run_primary in ("ACORE", "AOC II")
+    # _td_active snapshots disabled — set to None so no DataFrame copies are made.
     _td_active = False
-    _td_after_scope = df_view.copy()
+    _td_after_scope = None
 
     # Deal filter is applied after scope (on the scoped/unscoped base view).
     if deal_pick and deal_pick != "All deals":
         df_view = df_view[df_view["Deal Name"] == deal_pick]
-    # TEMP DEBUG snapshot — after deal filter
-    _td_after_deal = df_view.copy()
+    _td_after_deal = None
 
     # Effective date range (display-only; sidebar Advanced filters). Applied before note category / metrics.
     _eff_preset = str(st.session_state.get("recon_eff_date_preset") or "All dates").strip()
@@ -2538,7 +2551,7 @@ if "df_recon" in st.session_state:
             ]
             if not _restore.empty:
                 df_view = pd.concat([df_view, _restore]).sort_index()
-    _td_after_eff = df_view.copy()
+    _td_after_eff = None
 
     # Read note-category selection before source-type narrowing.
     _note_pick = str(st.session_state.get("recon_m61_note_category", "Financing") or "Financing").strip()
@@ -2585,8 +2598,7 @@ if "df_recon" in st.session_state:
                     hide_index=True,
                     height=min(240, 40 + 28 * max(len(_vc_note), 1)),
                 )
-    # TEMP DEBUG snapshot — after note category filter
-    _td_after_note_cat = df_view.copy()
+    _td_after_note_cat = None
 
     # Apply status filters on the current view (same categories as before; gated by Show Records UI).
     review_filter = []
@@ -2645,8 +2657,7 @@ if "df_recon" in st.session_state:
     else:
         df_view = df_view.iloc[0:0]
     _after_status_filter = len(df_view)
-    # TEMP DEBUG snapshot — after status filter
-    _td_after_status = df_view.copy()
+    _td_after_status = None
 
     # For selected primary types: when Note Category is not All, drop M61-only rows (same as prior default
     # with the removed "Show M61-only exceptions" checkbox always off).
@@ -2660,8 +2671,7 @@ if "df_recon" in st.session_state:
             _hidden = _before - len(df_view)
             if _hidden > 0:
                 st.caption(f"Hidden M61-only exceptions: {_hidden}")
-        # TEMP DEBUG snapshot — after M61-only hide
-        _td_after_m61_hide = df_view.copy()
+        _td_after_m61_hide = None
 
     _displayed_rows_final = len(df_view)
     _note_cat_m61_only_hidden_hint = (
@@ -3294,12 +3304,14 @@ if "df_recon" in st.session_state:
             # - Developer full-M61 → full ``df_recon`` when debug is enabled.
             # Intentionally excludes sidebar recon-status checkboxes and the Deal picker so
             # type dropdowns are scope-aware but not over-reduced vs. the displayed row set.
+            # df_type_opts_base is read-only (only .map() / .apply() / .unique() called on it).
+            # No copy needed — views/references are safe here.
             if _debug_full:
-                df_type_opts_base = df_recon.copy()
+                df_type_opts_base = df_recon
             elif scope_mode == "Selected Fund Only":
-                df_type_opts_base = df_all.loc[df_all.index.isin(in_scope_ix_primary_tied)].copy()
+                df_type_opts_base = df_all.loc[df_all.index.isin(in_scope_ix_primary_tied)]
             else:
-                df_type_opts_base = df_all.copy()
+                df_type_opts_base = df_all
             src_type_opt_series = (
                 df_type_opts_base["Source"].map(_acore_source_type_family)
                 if not df_type_opts_base.empty and "Source" in df_type_opts_base.columns
@@ -4273,6 +4285,4 @@ if "df_recon" in st.session_state:
         st.caption("Downloads are disabled until you rerun with the current selection.")
 
 else:
-    if not both_uploads_ready:
-        st.info("Upload both files to start the reconciliation.")
     render_original_landing_page_if_no_results(selected_ui_label)
