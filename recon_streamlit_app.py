@@ -498,6 +498,8 @@ def normalize_m61_note_category_label(v: object) -> str:
         return "financing"
     if s in ("equity/fund", "eq/fund", "equity", "fund"):
         return "other"
+    if "whole loan" in s or "wholeloan" in s or "wl-cpace" in s or "wlcpace" in s:
+        return "other"
     return "other"
 
 
@@ -1834,15 +1836,20 @@ def _display_row_shows_same_as_above(disp: pd.Series | None) -> bool:
 def _explain_same_as_above_consolidated_copy(deal: str, facility: str) -> str:
     """Explain text for rows where M61 values are intentionally not repeated (Same as Above)."""
     return (
-        f"This ACORE line is represented by the **same consolidated M61 liability** as the matched "
-        f"**Both** row directly above (**{deal}** — **{facility}**). M61 often carries one obligation "
-        "row for several related ACORE lines, so detailed M61 fields are not duplicated here."
+        f"This ACORE line is included in the same M61 liability record as the "
+        f"matched **Both** row above (**{deal}** – **{facility}**). "
+        "M61 combines some related ACORE lines into a single liability entry, "
+        "so the M61 values are not repeated on this row."
+
         "\n\n"
-        "**This is not missing from M61** — the obligation is booked; use the row above whenever you "
-        "need the underlying M61 figures."
+
+        "This row is **not missing** from **M61** — refer to the matched row above "
+        "for the related M61 details."
+
         "\n\n"
-        "Next step: No separate M61 booking is expected for this line unless your controls require "
-        "a one-to-one row for each ACORE tranche."
+
+        "Next step: Review the shared M61 row above if you need the underlying "
+        "M61 values for this ACORE line."
     )
 
 

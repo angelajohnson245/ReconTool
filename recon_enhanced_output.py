@@ -16,6 +16,45 @@ FILE_SOURCE_ACORE_ONLY = "ACORE Only"
 FILE_SOURCE_M61_ONLY = "M61 Only"
 FILE_SOURCE_BOTH = "Both"
 
+# Fin Inpt reconciliation: ACORE workbook rows are the table driver; M61 is comparison-only.
+PRIMARY_BACKED_FILE_SOURCES = frozenset({FILE_SOURCE_BOTH, FILE_SOURCE_ACORE_ONLY})
+
+
+def _primary_backed_file_source_mask(df: pd.DataFrame) -> pd.Series:
+    """True for rows anchored on the uploaded primary model (Both or ACORE Only)."""
+    if df is None or df.empty or "File Source" not in df.columns:
+        return pd.Series(dtype=bool)
+    return (
+        df["File Source"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .isin(PRIMARY_BACKED_FILE_SOURCES)
+    )
+
+
+def _sort_pair_rows_acore_primary_order(pair_rows: list[dict]) -> list[dict]:
+    """Preserve Fin Inpt sheet order: all primary-tied pairs first, then M61-only export lines."""
+
+    def _pair_row_b_key(pr: dict) -> int:
+        v = pr.get("_row_id_b")
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return 1_000_000_000
+        return int(v)
+
+    def _pair_row_a_key(pr: dict) -> int:
+        v = pr.get("_row_id_a")
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return 1_000_000_000
+        return int(v)
+
+    main = [p for p in pair_rows if p.get("_merge") != "right_only"]
+    tail = [p for p in pair_rows if p.get("_merge") == "right_only"]
+    main.sort(key=_pair_row_b_key)
+    tail.sort(key=_pair_row_a_key)
+    return main + tail
+
+
 # --------------------------------------------------
 # 1. FILE PATHS
 # --------------------------------------------------
@@ -615,9 +654,9 @@ def _fund_series_contains_label_token(s: pd.Series, lab: str | None) -> pd.Serie
 def filter_recon_to_selected_fund(df_recon: pd.DataFrame, primary_file_type: str) -> pd.DataFrame:
     """Filter reconciliation rows by selected fund scope (display/export helper).
 
-    Uses the same fund regex as ``_m61_in_scope`` / ``PRIMARY_TYPE_FUND_CONFIG``, token-safe
-    primary labels, optional ``Fund (M61)`` alignment, and (for ACP II / AOC II / AOC I) the same
-    liability-note ``fund_code`` guard as staged matching—without changing merge or pairing.
+    **ACORE-primary rule (all Fin Inpt funds):** rows with ``File Source`` **Both** or **ACORE Only**
+    always remain visible for the selected template. M61 fund-name / liability-note ``fund_code``
+    guards apply only to **M61 Only** export lines.
 
     Returns a row subset only; does not change any column values (including ``Fund``).
     """
@@ -652,10 +691,21 @@ def filter_recon_to_selected_fund(df_recon: pd.DataFrame, primary_file_type: str
             continue
         mask_primary |= _fund_series_contains_label_token(fund_series, lab)
 
-    combined = (mask_regex_main | mask_primary) & note_scope_ok
+    m61_scoped = (mask_regex_main | mask_primary) & note_scope_ok
+    n_m61_only = 0
+    if "File Source" in df_recon.columns:
+        fs = df_recon["File Source"].fillna("").astype(str).str.strip()
+        m61_only = fs.eq(FILE_SOURCE_M61_ONLY)
+        n_m61_only = int(m61_only.sum())
+        # ACORE-primary: every non–M61-only row stays; fund/note guards apply to M61 export lines only.
+        combined = (~m61_only) | (m61_only & m61_scoped)
+    else:
+        primary_backed = _primary_backed_file_source_mask(df_recon)
+        combined = primary_backed | m61_scoped
     out = df_recon[combined].copy()
     _debug_rows(
         f"Scoped filter ({primary_file_type}) rows: in={len(df_recon)} out={len(out)} "
+        f"m61_only={n_m61_only} m61_scoped={int(m61_scoped.sum())} "
         f"mask_regex={int(mask_regex_main.sum())} mask_primary={int(mask_primary.sum())} "
         f"note_scope_ok={int(note_scope_ok.sum())}"
     )
@@ -1208,20 +1258,16 @@ def _surface_related_m61_for_acore_only_rows(
 ) -> pd.DataFrame:
     """Populate M61-facing columns on **ACORE-only** rows from a related ``df_a`` line.
 
-    **ACP II:** returns ``df_out`` unchanged. Fin Inpt keeps ACORE as the primary grid: main M61
-    comparison fields are filled **only** from true merge pairs. Extra note-level ACORE lines and
-    collapsed M61 context are not backfilled here — use Deal Drilldown / export views for context.
+    **Fin Inpt funds (ACP I–III, AOC I–II, legacy ACORE):** returns ``df_out`` unchanged.
+    ACORE drives the reconciliation table; M61 comparison fields are filled **only** from true
+    merge pairs. Without a match, rows stay **ACORE Only** / **Missing in M61** — no synthetic
+    M61 attach from collateral liability lines.
 
-    Candidate pool (non–ACP II): all M61 rows sharing the same deal / line keys (matched or unmatched).
-    **Ranking (non–ACP II):** (1) liability-type compatibility with ACORE Source (Sale rows only),
+    Candidate pool (legacy non–Fin-Inpt flows only): M61 rows sharing deal / line keys.
+    **Ranking:** (1) liability-type compatibility with ACORE Source (Sale rows only),
     (2) pledge-date proximity, (3) earliest M61 ``effective_date_key``, (4) unmatched preferred.
 
-    Values copied from the chosen M61 row only (``Effective Date``, ``Pledge Date``, etc. are not taken from ACORE).
-
     Does **not** modify pairing, ``recon_status``, ``File Source``, or any ``* Status`` column.
-
-    **Important:** Do not write related M61 text into ``Liability Note (M61)`` — that column feeds
-    ``filter_recon_to_selected_fund`` (note fund_code guard).
     """
     n_before = len(df_out) if df_out is not None else 0
     _debug_rows(f"Related M61 enhancement: row count BEFORE={n_before}")
@@ -1233,10 +1279,10 @@ def _surface_related_m61_for_acore_only_rows(
         )
         return df_out
 
-    if primary_file_type == "ACP II":
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES:
         _debug_rows(
-            "Related M61 enhancement: skipped for ACP II — main M61 comparison columns populate only "
-            "from true merge pairs; ancillary M61 lines belong in drilldown / export, not backfilled here."
+            f"Related M61 enhancement: skipped for {primary_file_type} — "
+            "ACORE-primary output; M61 fields populate only from true merge pairs."
         )
         return df_out
 
@@ -1997,6 +2043,7 @@ PRIMARY_FILE_CONFIG: dict[str, dict] = {
     "ACP III": {
         "sheet_name": "10) Fin Inpt",
         "header_row": 6,
+        "sanitize_fin_inpt_headers": True,
         "column_map": {
             "deal_name": "Deal Name",
             "note_name": "Note Name",
@@ -2342,9 +2389,34 @@ def safe_parse_date(series):
     return out
 
 
+def _fin_inpt_row_has_deal_identity(row: pd.Series) -> bool:
+    """True when a Fin Inpt row has non-blank Deal Name and Deal ID (valid ACORE deal line)."""
+    deal_name = ""
+    deal_id = ""
+    for col in row.index:
+        nk = _norm_colname_key(col)
+        nk_compact = nk.replace(" ", "")
+        try:
+            val = row[col]
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                s = ""
+            else:
+                s = str(val).strip()
+        except (TypeError, ValueError):
+            s = ""
+        if nk_compact == "dealname":
+            deal_name = s
+        elif nk_compact == "dealid":
+            deal_id = s
+    return bool(deal_name) and bool(deal_id)
+
+
 def _drop_hidden_fin_inpt_rows(df_raw: pd.DataFrame, path: str, cfg: dict, primary_file_type: str) -> pd.DataFrame:
-    """AOC Fin Inpt guard: exclude Excel rows that are hidden/filtered in the source sheet."""
-    if primary_file_type not in ("AOC II", "AOC I"):
+    """Fin Inpt guard: exclude Excel rows hidden in the source sheet.
+
+    Rows with both **Deal Name** and **Deal ID** are always kept (valid ACORE deal lines).
+    """
+    if not cfg.get("sanitize_fin_inpt_headers"):
         return df_raw
     try:
         wb = load_workbook(path, read_only=False, data_only=True)
@@ -2352,15 +2424,21 @@ def _drop_hidden_fin_inpt_rows(df_raw: pd.DataFrame, path: str, cfg: dict, prima
         header_row = int(cfg["header_row"])  # 0-based pandas header row
         first_data_excel_row = header_row + 2  # 1-based Excel row number
         keep_mask = []
+        kept_hidden_identity = 0
         for i in range(len(df_raw)):
             excel_row = first_data_excel_row + i
             hidden = bool(ws.row_dimensions[excel_row].hidden)
-            keep_mask.append(not hidden)
+            if hidden and _fin_inpt_row_has_deal_identity(df_raw.iloc[i]):
+                keep_mask.append(True)
+                kept_hidden_identity += 1
+            else:
+                keep_mask.append(not hidden)
         kept = int(sum(1 for x in keep_mask if x))
         if kept != len(df_raw):
             _debug_rows(
                 "Primary hidden-row filter applied "
-                f"primary_type={primary_file_type} kept_rows={kept}/{len(df_raw)} sheet={cfg['sheet_name']!r}"
+                f"primary_type={primary_file_type} kept_rows={kept}/{len(df_raw)} "
+                f"kept_hidden_with_deal_identity={kept_hidden_identity} sheet={cfg['sheet_name']!r}"
             )
         return df_raw.loc[keep_mask].reset_index(drop=True)
     except Exception as e:
@@ -4876,26 +4954,9 @@ def reconcile(
             }
         )
 
-    # ACP II: ACORE-primary row order — every ACORE row in original sheet order, then true M61-only rows.
-    if primary_file_type == "ACP II":
-
-        def _acp_ii_pair_row_b_key(pr: dict) -> int:
-            v = pr.get("_row_id_b")
-            if v is None or (isinstance(v, float) and pd.isna(v)):
-                return 1_000_000_000
-            return int(v)
-
-        def _acp_ii_pair_row_a_key(pr: dict) -> int:
-            v = pr.get("_row_id_a")
-            if v is None or (isinstance(v, float) and pd.isna(v)):
-                return 1_000_000_000
-            return int(v)
-
-        _acp_main = [p for p in pair_rows if p.get("_merge") != "right_only"]
-        _acp_tail = [p for p in pair_rows if p.get("_merge") == "right_only"]
-        _acp_main.sort(key=_acp_ii_pair_row_b_key)
-        _acp_tail.sort(key=_acp_ii_pair_row_a_key)
-        pair_rows = _acp_main + _acp_tail
+    # Fin Inpt: ACORE-primary row order — every ACORE row in sheet order, then M61-only export lines.
+    if primary_file_type in FIN_INPT_PRIMARY_TYPES:
+        pair_rows = _sort_pair_rows_acore_primary_order(pair_rows)
 
     paired_row_ids_m61: set[int] = set()
     for _pr in pair_rows:
