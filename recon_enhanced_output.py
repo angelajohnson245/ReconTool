@@ -5721,7 +5721,16 @@ def _autofit_recon_columns_for_readability(ws, *, data_start_row: int, data_end_
         ws.column_dimensions[get_column_letter(col_idx)].width = computed
 
 
+_SAME_AS_ABOVE_EXPORT_LABEL = "Same as Above"
+
+
+def _is_same_as_above_export_label(v) -> bool:
+    return isinstance(v, str) and str(v).strip() == _SAME_AS_ABOVE_EXPORT_LABEL
+
+
 def _fmt_date(v):
+    if _is_same_as_above_export_label(v):
+        return _SAME_AS_ABOVE_EXPORT_LABEL
     if pd.isna(v) or str(v) in ("NaT", "nan", ""):
         return "-"
     try:
@@ -5731,6 +5740,8 @@ def _fmt_date(v):
 
 
 def _fmt_num(v):
+    if _is_same_as_above_export_label(v):
+        return _SAME_AS_ABOVE_EXPORT_LABEL
     n = _coerce_numeric_value(v)
     return "-" if n is None else n
 

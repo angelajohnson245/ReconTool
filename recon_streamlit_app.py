@@ -38,6 +38,8 @@ from recon_enhanced_output import (
     reconcile,
     safe_str_strip,
     scope_label_for_primary_type,
+    _coerce_numeric_value,
+    _is_blank_for_compare,
 )
  
 # --------------------------------------------------
@@ -1540,7 +1542,16 @@ def pill(status):
     return f'<span class="pill pill-na">{status}</span>'
  
  
+SAME_AS_ABOVE_LABEL = "Same as Above"
+
+
+def _is_same_as_above_label(v) -> bool:
+    return isinstance(v, str) and str(v).strip() == SAME_AS_ABOVE_LABEL
+
+
 def pct(v, *, ndigits: int = 2, missing: str = "—"):
+    if _is_same_as_above_label(v):
+        return SAME_AS_ABOVE_LABEL
     if v is None:
         return missing
     try:
@@ -1565,6 +1576,8 @@ def pct(v, *, ndigits: int = 2, missing: str = "—"):
 
 def pct_spread(v):
     """Spread-only: percent with 3 decimal places; missing → ``-`` (aligned with display/export dashes)."""
+    if _is_same_as_above_label(v):
+        return SAME_AS_ABOVE_LABEL
     return pct(v, ndigits=3, missing="-")
 
 
@@ -1575,6 +1588,8 @@ def _is_spread_value_column(name: object) -> bool:
 
 def fmt_fraction_as_pct(v, *, ndigits: int = 3):
     """Format a stored fraction (e.g. 0.02275) for display as a percent; — when missing."""
+    if _is_same_as_above_label(v):
+        return SAME_AS_ABOVE_LABEL
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return "—"
     try:
@@ -1587,6 +1602,8 @@ def fmt_fraction_as_pct(v, *, ndigits: int = 3):
  
  
 def fmt_date(v):
+    if _is_same_as_above_label(v):
+        return SAME_AS_ABOVE_LABEL
     try:
         return pd.to_datetime(v).strftime("%m/%d/%y")
     except Exception:
@@ -1605,6 +1622,8 @@ def fmt_num_plain(v):
     # Treat None, NA, and numeric zero as blank for display purposes.
     # Undrawn Capacity = 0 in M61 exports is an Excel artifact for blank cells,
     # not a meaningful "fully-drawn" value distinct from missing.
+    if _is_same_as_above_label(v):
+        return SAME_AS_ABOVE_LABEL
     if v is None:
         return "—"
     try:
@@ -1839,7 +1858,32 @@ _SAA_EXPORT_STATUS_COLS = [
 ]
 
 
-_SAA_CELL_LABEL = "Same as Above"
+_SAA_CELL_LABEL = SAME_AS_ABOVE_LABEL
+_SAA_UNDRAWN_DISPLAY_COL = "Undrawn (M61)"
+_SAA_UNDRAWN_EXPORT_COL = "Undrawn Capacity (M61)"
+
+
+def _raw_m61_undrawn_present(v) -> bool:
+    """True when the source M61 undrawn cell has a real value (not blank; 0 treated as blank)."""
+    if _is_blank_for_compare(v):
+        return False
+    n = _coerce_numeric_value(v)
+    return n is not None and n != 0
+
+
+def _raw_m61_undrawn_values_equal(cur_raw, anchor_raw) -> bool:
+    if not _raw_m61_undrawn_present(cur_raw) or not _raw_m61_undrawn_present(anchor_raw):
+        return False
+    return _coerce_numeric_value(cur_raw) == _coerce_numeric_value(anchor_raw)
+
+
+def _same_as_above_undrawn_cell(cur_raw, anchor_raw) -> str | None:
+    """Undrawn (M61) for consolidated siblings; ``None`` = keep existing formatted value."""
+    if _raw_m61_undrawn_present(cur_raw) and _raw_m61_undrawn_values_equal(cur_raw, anchor_raw):
+        return SAME_AS_ABOVE_LABEL
+    if not _raw_m61_undrawn_present(cur_raw):
+        return "-"
+    return None
 
 
 def _display_row_shows_same_as_above(disp: pd.Series | None) -> bool:
@@ -1875,7 +1919,12 @@ def _explain_same_as_above_consolidated_copy(deal: str, facility: str) -> str:
     )
 
 
-def _apply_same_as_above_display(df: pd.DataFrame, col_tag: str) -> pd.DataFrame:
+def _apply_same_as_above_display(
+    df: pd.DataFrame,
+    col_tag: str,
+    *,
+    raw_undrawn_m61: pd.Series | None = None,
+) -> pd.DataFrame:
     """Replace M61 value + status columns with 'Same as Above' for ACORE Only rows
     that are tied to the same consolidated M61 record as a matched 'Both' row in the
     same (Deal Name, Source Type (ACORE), Eff Date) group. Sets **File Source** to **Both**
@@ -1925,10 +1974,37 @@ def _apply_same_as_above_display(df: pd.DataFrame, col_tag: str) -> pd.DataFrame
         df.drop(columns=["_orig_pos", "_gkey"], inplace=True)
         return df
 
-    # Replace M61 value columns and status columns for sibling rows
-    for col in all_saa_cols:
-        df.loc[saa_mask, col] = "Same as Above"
+    first_both_pos = (
+        df.loc[both_mask & df["_gkey"].isin(eligible_groups)]
+        .groupby("_gkey")["_orig_pos"]
+        .min()
+    )
+
+    undrawn_display_col = _SAA_UNDRAWN_DISPLAY_COL
+    saa_value_cols = [c for c in m61_cols if c != undrawn_display_col]
+    for col in saa_value_cols + status_cols:
+        df.loc[saa_mask, col] = _SAA_CELL_LABEL
     df.loc[saa_mask, "File Source"] = FILE_SOURCE_BOTH
+
+    if undrawn_display_col in df.columns and saa_mask.any():
+        for idx in df.index[saa_mask]:
+            gk = df.at[idx, "_gkey"]
+            anchor_pos = first_both_pos.get(gk)
+            if anchor_pos is None or raw_undrawn_m61 is None:
+                df.at[idx, undrawn_display_col] = "-"
+                continue
+            anchor_ixs = df.index[df["_orig_pos"] == anchor_pos]
+            if len(anchor_ixs) == 0:
+                df.at[idx, undrawn_display_col] = "-"
+                continue
+            anchor_idx = anchor_ixs[0]
+            cur_raw = raw_undrawn_m61.loc[idx] if idx in raw_undrawn_m61.index else pd.NA
+            anchor_raw = (
+                raw_undrawn_m61.loc[anchor_idx] if anchor_idx in raw_undrawn_m61.index else pd.NA
+            )
+            undrawn_disp = _same_as_above_undrawn_cell(cur_raw, anchor_raw)
+            if undrawn_disp is not None:
+                df.at[idx, undrawn_display_col] = undrawn_disp
 
     # --- Reorder: siblings go directly after the first Both row of their group ---
     # Sort key for each row:
@@ -1939,11 +2015,6 @@ def _apply_same_as_above_display(df: pd.DataFrame, col_tag: str) -> pd.DataFrame
     # This keeps non-eligible rows at their natural positions while pulling ACORE
     # Only siblings to sit immediately after the Both row of their group.
 
-    first_both_pos = (
-        df.loc[both_mask & df["_gkey"].isin(eligible_groups)]
-        .groupby("_gkey")["_orig_pos"]
-        .min()
-    )
     df["_group_anchor"] = df["_gkey"].map(first_both_pos)
 
     in_eligible = df["_gkey"].isin(eligible_groups) & (both_mask | saa_mask)
@@ -2000,9 +2071,27 @@ def _apply_same_as_above_export(df: pd.DataFrame) -> pd.DataFrame:
     if not mask.any():
         return df
 
-    for col in all_saa_cols:
-        df.loc[mask, col] = "Same as Above"
+    both_mask_orig = df["File Source"] == FILE_SOURCE_BOTH
+    undrawn_export_col = _SAA_UNDRAWN_EXPORT_COL
+    saa_value_cols = [c for c in m61_cols if c != undrawn_export_col]
+    for col in saa_value_cols + status_cols:
+        df.loc[mask, col] = _SAA_CELL_LABEL
     df.loc[mask, "File Source"] = FILE_SOURCE_BOTH
+
+    if undrawn_export_col in df.columns and mask.any():
+        for idx in df.index[mask]:
+            gk = gkey.loc[idx]
+            anchor_ixs = df.index[both_mask_orig & gkey.eq(gk)]
+            if len(anchor_ixs) == 0:
+                df.at[idx, undrawn_export_col] = "-"
+                continue
+            anchor_idx = anchor_ixs[0]
+            cur_raw = df.at[idx, undrawn_export_col]
+            anchor_raw = df.at[anchor_idx, undrawn_export_col]
+            undrawn_val = _same_as_above_undrawn_cell(cur_raw, anchor_raw)
+            if undrawn_val is not None:
+                df.at[idx, undrawn_export_col] = undrawn_val
+
     return df
 
 
@@ -3175,6 +3264,7 @@ if "df_recon" in st.session_state:
         else:
             # Build display table (aligned with RECON_ORDERED_COLS / Excel export)
             display_rows = []
+            raw_undrawn_for_saa: list[object] = []
             for _, row in df_view.iterrows():
                 ed_acp = _col(row, "Effective Date (ACP)", "Effective Date")
                 adv_acp = _col(row, "Advance Rate (ACP)", "Advance Rate")
@@ -3291,12 +3381,17 @@ if "df_recon" in st.session_state:
                         f"raw_undrawn_m61={und_liab!r} "
                         f"formatted_undrawn_m61={rec.get('Undrawn (M61)')!r}"
                     )
+                raw_undrawn_for_saa.append(und_liab)
                 display_rows.append(rec)
 
             df_display = pd.DataFrame(display_rows).reset_index(drop=True)
             # "Same as Above": replace M61 value columns for ACORE Only rows that share
             # the same Deal / Source Type / Eff Date group as a matched Both row.
-            df_display = _apply_same_as_above_display(df_display, col_tag)
+            df_display = _apply_same_as_above_display(
+                df_display,
+                col_tag,
+                raw_undrawn_m61=pd.Series(raw_undrawn_for_saa, index=df_display.index),
+            )
 
             # Option pools for **Source Type (ACORE)** / **Liability Type (M61)** table filters:
             # - Selected Fund Only → same row universe as the main table (primary-tied + fund-scoped M61-only).
@@ -3688,6 +3783,8 @@ if "df_recon" in st.session_state:
                 if _spread_cols:
 
                     def _fmt_spread_styler(v):
+                        if _is_same_as_above_label(v):
+                            return SAME_AS_ABOVE_LABEL
                         if isinstance(v, str) and str(v).strip() in ("-", "—", ""):
                             return "-"
                         try:
