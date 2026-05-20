@@ -4,6 +4,7 @@ Run with: streamlit run recon_streamlit_app.py
 """
 import calendar
 import gc
+import hashlib
 import html
 import io
 import os
@@ -1496,9 +1497,14 @@ with st.sidebar:
                 )
  
     st.markdown("---")
-    _m61_export_line = (
-        f"M61 Export: {html.escape(file_a_upload.name, quote=True)}"
+    _m61_display_name = (
+        file_a_upload.name
         if file_a_upload
+        else st.session_state.get("persisted_m61_upload_name")
+    )
+    _m61_export_line = (
+        f"M61 Export: {html.escape(_m61_display_name, quote=True)}"
+        if _m61_display_name
         else "M61 Export: —"
     )
     st.markdown(
@@ -2124,8 +2130,84 @@ def _both_uploads_ready(file_a_upload, file_b_upload) -> bool:
     return bool(file_a_upload and file_b_upload and _upload_has_payload(file_a_upload) and _upload_has_payload(file_b_upload))
 
 
+def _file_hash_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _upload_fingerprint(uploaded_file):
+    """Stable workbook identity: ``(filename, byte length, sha256 hex)``."""
+    if not uploaded_file or not _upload_has_payload(uploaded_file):
+        return None
+    name = str(getattr(uploaded_file, "name", "") or "")
+    raw = _bytes_from_streamlit_upload(uploaded_file)
+    size = len(raw)
+    return (name, size, _file_hash_hex(raw))
+
+
+def _update_persisted_upload_fingerprints(
+    file_a_upload,
+    file_b_upload,
+    mapping_upload,
+    primary_file_type: str,
+) -> None:
+    """Remember last in-memory uploads so a transient ``None`` widget does not drop the workspace."""
+    fa = _upload_fingerprint(file_a_upload)
+    fb = _upload_fingerprint(file_b_upload)
+    fm = _upload_fingerprint(mapping_upload) if mapping_upload else None
+    if fa is not None:
+        st.session_state["persisted_m61_fingerprint"] = fa
+        st.session_state["persisted_m61_upload_name"] = fa[0]
+    if fb is not None:
+        st.session_state["persisted_primary_fingerprint"] = fb
+        st.session_state["persisted_primary_upload_name"] = fb[0]
+    if fm is not None:
+        st.session_state["persisted_mapping_fingerprint"] = fm
+    if fa is not None or fb is not None:
+        st.session_state["persisted_primary_file_type_at_upload"] = str(
+            primary_file_type
+        ).strip()
+
+
+def _upload_conflicts_with_persisted(uploaded_file, persisted_key: str) -> bool:
+    """True when the user replaced a workbook with different bytes (not a transient None)."""
+    fp = _upload_fingerprint(uploaded_file)
+    if fp is None:
+        return False
+    persisted = st.session_state.get(persisted_key)
+    if persisted is None:
+        return False
+    return fp != persisted
+
+
+def _has_restored_reconciliation_workspace() -> bool:
+    return bool(
+        "df_recon" in st.session_state
+        and st.session_state.get("last_successful_upload_signature")
+    )
+
+
+def _workspace_should_be_cleared(
+    file_a_upload,
+    file_b_upload,
+    mapping_upload,
+    primary_file_type: str,
+) -> bool:
+    """Discard cached reconciliation only when inputs materially changed or user requested reset."""
+    if st.session_state.pop("recon_user_requested_clear", False):
+        return True
+    if "df_recon" not in st.session_state:
+        return False
+    if _upload_conflicts_with_persisted(file_a_upload, "persisted_m61_fingerprint"):
+        return True
+    if _upload_conflicts_with_persisted(file_b_upload, "persisted_primary_fingerprint"):
+        return True
+    if _upload_conflicts_with_persisted(mapping_upload, "persisted_mapping_fingerprint"):
+        return True
+    return False
+
+
 def _clear_recon_session_results() -> None:
-    """Drop cached reconciliation output when uploads are not ready (fresh Render deploy / cleared files)."""
+    """Drop cached reconciliation output after file changes or an explicit user reset."""
     for key in (
         "df_recon",
         "df_excluded_by_liability_type",
@@ -2137,6 +2219,12 @@ def _clear_recon_session_results() -> None:
         "last_run_csv_name",
         "last_successful_upload_signature",
         "primary_upload_name",
+        "persisted_m61_fingerprint",
+        "persisted_primary_fingerprint",
+        "persisted_mapping_fingerprint",
+        "persisted_m61_upload_name",
+        "persisted_primary_upload_name",
+        "persisted_primary_file_type_at_upload",
     ):
         st.session_state.pop(key, None)
     # Release memory held by now-deleted DataFrames so Render doesn't OOM.
@@ -2211,22 +2299,22 @@ def _write_upload_to_disk(path: str, uploaded_file) -> None:
 def _current_upload_signature(
     file_a_upload, file_b_upload, mapping_upload, primary_file_type: str
 ):
-    """Uniquely identify a run: selected primary template + file bytes (names/sizes) + optional mapping.
+    """Uniquely identify a run: primary template + stable file fingerprints + optional mapping.
 
     Including ``primary_file_type`` ensures that after e.g. an AOC II run, switching the sidebar
     to AOC I with the same uploads still invalidates the last successful signature so
     **Auto-run on upload** can refresh results (Fund column and scope follow the new template).
     """
-    if not file_a_upload or not file_b_upload:
+    fa = _upload_fingerprint(file_a_upload)
+    fb = _upload_fingerprint(file_b_upload)
+    if not fa or not fb:
         return None
+    fm = _upload_fingerprint(mapping_upload) if mapping_upload else None
     return (
         str(primary_file_type).strip(),
-        file_a_upload.name,
-        getattr(file_a_upload, "size", None),
-        file_b_upload.name,
-        getattr(file_b_upload, "size", None),
-        mapping_upload.name if mapping_upload else None,
-        getattr(mapping_upload, "size", None) if mapping_upload else None,
+        fa,
+        fb,
+        fm,
     )
 
 
@@ -2329,6 +2417,9 @@ def run_reconciliation_for_selection(
             st.session_state["last_successful_upload_signature"] = _current_upload_signature(
                 file_a_upload, file_b_upload, mapping_upload, primary_file_type
             )
+            _update_persisted_upload_fingerprints(
+                file_a_upload, file_b_upload, mapping_upload, primary_file_type
+            )
             # Defer status reset to pre-widget stage (Streamlit-safe session_state mutation).
             st.session_state["reset_status_filters"] = True
             _reset_table_filter_state()
@@ -2339,7 +2430,12 @@ def run_reconciliation_for_selection(
 # --------------------------------------------------
 both_uploads_ready = _both_uploads_ready(file_a_upload, file_b_upload)
 
-if not both_uploads_ready:
+_update_persisted_upload_fingerprints(
+    file_a_upload, file_b_upload, mapping_upload, primary_file_type
+)
+if _workspace_should_be_cleared(
+    file_a_upload, file_b_upload, mapping_upload, primary_file_type
+):
     _clear_recon_session_results()
 elif file_a_upload and not m61_file_valid:
     st.warning(
