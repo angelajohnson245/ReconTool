@@ -2203,8 +2203,40 @@ def _upload_conflicts_with_persisted(uploaded_file, persisted_key: str) -> bool:
 _RECON_RESUME_CACHE_DIR = os.path.join(tempfile.gettempdir(), "recon_resume_cache")
 
 
+def _normalize_recon_resume_run_id(run_id: object) -> str | None:
+    """Accept only safe run_id values (UUID from our app or URL query param)."""
+    if run_id is None:
+        return None
+    if isinstance(run_id, (list, tuple)):
+        run_id = run_id[0] if run_id else None
+    safe = re.sub(r"[^\w\-]", "", str(run_id).strip())[:64]
+    return safe or None
+
+
+def _get_recon_resume_run_id() -> str | None:
+    """Session first, then ``?run_id=`` in the URL (survives Mac sleep / reconnect)."""
+    run_id = _normalize_recon_resume_run_id(st.session_state.get("recon_resume_run_id"))
+    if run_id:
+        return run_id
+    return _normalize_recon_resume_run_id(st.query_params.get("run_id"))
+
+
+def _set_recon_resume_run_id(run_id: str) -> None:
+    safe = _normalize_recon_resume_run_id(run_id)
+    if not safe:
+        return
+    st.session_state["recon_resume_run_id"] = safe
+    st.query_params["run_id"] = safe
+
+
+def _clear_recon_resume_run_id() -> None:
+    st.session_state.pop("recon_resume_run_id", None)
+    if "run_id" in st.query_params:
+        del st.query_params["run_id"]
+
+
 def _recon_resume_cache_path(run_id: str) -> str:
-    safe = re.sub(r"[^\w\-]", "", str(run_id))[:64]
+    safe = _normalize_recon_resume_run_id(run_id) or ""
     return os.path.join(_RECON_RESUME_CACHE_DIR, f"{safe}.pkl")
 
 
@@ -2272,21 +2304,21 @@ def _persist_recon_run_to_resume_cache(
     df_excluded_by_liability_type: pd.DataFrame,
 ) -> None:
     """Assign a new run_id and snapshot the successful run to server temp storage."""
-    _delete_recon_resume_cache(st.session_state.get("recon_resume_run_id"))
+    _delete_recon_resume_cache(_get_recon_resume_run_id())
     run_id = str(uuid.uuid4())
     _save_recon_resume_cache(
         run_id,
         df_recon=df_recon,
         df_excluded_by_liability_type=df_excluded_by_liability_type,
     )
-    st.session_state["recon_resume_run_id"] = run_id
+    _set_recon_resume_run_id(run_id)
 
 
 def _try_restore_recon_from_resume_cache() -> bool:
     """Reload df_recon from disk when Streamlit session memory was dropped."""
     if "df_recon" in st.session_state:
         return True
-    run_id = st.session_state.get("recon_resume_run_id")
+    run_id = _get_recon_resume_run_id()
     if not run_id:
         return False
     path = _recon_resume_cache_path(run_id)
@@ -2300,6 +2332,7 @@ def _try_restore_recon_from_resume_cache() -> bool:
     if not isinstance(bundle, dict) or "df_recon" not in bundle:
         return False
     _apply_recon_resume_bundle(bundle)
+    _set_recon_resume_run_id(run_id)
     return True
 
 
@@ -2307,7 +2340,7 @@ def _has_persisted_reconciliation_results() -> bool:
     """True after a successful run — used to keep the results workspace across filter/idle reruns."""
     if "df_recon" in st.session_state:
         return True
-    if st.session_state.get("recon_resume_run_id"):
+    if _get_recon_resume_run_id():
         return True
     return bool(st.session_state.get("last_successful_upload_signature"))
 
@@ -2357,7 +2390,8 @@ def _workspace_should_be_cleared(
 
 def _clear_recon_session_results() -> None:
     """Drop cached reconciliation output after file changes or an explicit user reset."""
-    _delete_recon_resume_cache(st.session_state.get("recon_resume_run_id"))
+    _delete_recon_resume_cache(_get_recon_resume_run_id())
+    _clear_recon_resume_run_id()
     for key in (
         "df_recon",
         "df_excluded_by_liability_type",
@@ -2368,7 +2402,6 @@ def _clear_recon_session_results() -> None:
         "last_run_excel_name",
         "last_run_csv_name",
         "last_successful_upload_signature",
-        "recon_resume_run_id",
         "primary_upload_name",
         "persisted_m61_fingerprint",
         "persisted_primary_fingerprint",
@@ -2587,6 +2620,10 @@ def run_reconciliation_for_selection(
 # --------------------------------------------------
 # MAIN CONTENT
 # --------------------------------------------------
+# Resume from server cache before workspace/landing logic (session may have lost df_recon + run_id).
+if "df_recon" not in st.session_state and _get_recon_resume_run_id():
+    _try_restore_recon_from_resume_cache()
+
 both_uploads_ready = _both_uploads_ready(file_a_upload, file_b_upload)
 
 _update_persisted_upload_fingerprints(
