@@ -8,10 +8,12 @@ import hashlib
 import html
 import io
 import os
+import pickle
 import re
 import sys
 import tempfile
 import unicodedata
+import uuid
 from datetime import date, datetime
  
 import pandas as pd
@@ -2198,11 +2200,121 @@ def _upload_conflicts_with_persisted(uploaded_file, persisted_key: str) -> bool:
     return fp != persisted
 
 
-def _has_restored_reconciliation_workspace() -> bool:
-    return bool(
-        "df_recon" in st.session_state
-        and st.session_state.get("last_successful_upload_signature")
+_RECON_RESUME_CACHE_DIR = os.path.join(tempfile.gettempdir(), "recon_resume_cache")
+
+
+def _recon_resume_cache_path(run_id: str) -> str:
+    safe = re.sub(r"[^\w\-]", "", str(run_id))[:64]
+    return os.path.join(_RECON_RESUME_CACHE_DIR, f"{safe}.pkl")
+
+
+def _delete_recon_resume_cache(run_id: str | None) -> None:
+    if not run_id:
+        return
+    path = _recon_resume_cache_path(run_id)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _save_recon_resume_cache(
+    run_id: str,
+    *,
+    df_recon: pd.DataFrame,
+    df_excluded_by_liability_type: pd.DataFrame,
+) -> None:
+    """Write reconciliation output to a temp file so idle reconnects can resume."""
+    os.makedirs(_RECON_RESUME_CACHE_DIR, exist_ok=True)
+    bundle = {
+        "df_recon": df_recon,
+        "df_excluded_by_liability_type": df_excluded_by_liability_type,
+        "primary_file_type": st.session_state.get("primary_file_type"),
+        "primary_upload_name": st.session_state.get("primary_upload_name"),
+        "last_run_excel_name": st.session_state.get("last_run_excel_name"),
+        "last_run_csv_name": st.session_state.get("last_run_csv_name"),
+        "recon_row_counts": st.session_state.get("recon_row_counts"),
+        "last_successful_upload_signature": st.session_state.get(
+            "last_successful_upload_signature"
+        ),
+    }
+    path = _recon_resume_cache_path(run_id)
+    with open(path, "wb") as out:
+        pickle.dump(bundle, out, protocol=pickle.HIGHEST_PROTOCOL)
+        out.flush()
+        try:
+            os.fsync(out.fileno())
+        except OSError:
+            pass
+
+
+def _apply_recon_resume_bundle(bundle: dict) -> None:
+    st.session_state["df_recon"] = bundle["df_recon"]
+    st.session_state["df_excluded_by_liability_type"] = bundle.get(
+        "df_excluded_by_liability_type", pd.DataFrame()
     )
+    for key in (
+        "primary_file_type",
+        "primary_upload_name",
+        "last_run_excel_name",
+        "last_run_csv_name",
+        "recon_row_counts",
+        "last_successful_upload_signature",
+    ):
+        if key in bundle and bundle[key] is not None:
+            st.session_state[key] = bundle[key]
+
+
+def _persist_recon_run_to_resume_cache(
+    df_recon: pd.DataFrame,
+    df_excluded_by_liability_type: pd.DataFrame,
+) -> None:
+    """Assign a new run_id and snapshot the successful run to server temp storage."""
+    _delete_recon_resume_cache(st.session_state.get("recon_resume_run_id"))
+    run_id = str(uuid.uuid4())
+    _save_recon_resume_cache(
+        run_id,
+        df_recon=df_recon,
+        df_excluded_by_liability_type=df_excluded_by_liability_type,
+    )
+    st.session_state["recon_resume_run_id"] = run_id
+
+
+def _try_restore_recon_from_resume_cache() -> bool:
+    """Reload df_recon from disk when Streamlit session memory was dropped."""
+    if "df_recon" in st.session_state:
+        return True
+    run_id = st.session_state.get("recon_resume_run_id")
+    if not run_id:
+        return False
+    path = _recon_resume_cache_path(run_id)
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as inp:
+            bundle = pickle.load(inp)
+    except (OSError, pickle.UnpicklingError, TypeError, ValueError):
+        return False
+    if not isinstance(bundle, dict) or "df_recon" not in bundle:
+        return False
+    _apply_recon_resume_bundle(bundle)
+    return True
+
+
+def _has_persisted_reconciliation_results() -> bool:
+    """True after a successful run — used to keep the results workspace across filter/idle reruns."""
+    if "df_recon" in st.session_state:
+        return True
+    if st.session_state.get("recon_resume_run_id"):
+        return True
+    return bool(st.session_state.get("last_successful_upload_signature"))
+
+
+def _should_show_upload_landing_page() -> bool:
+    """Upload landing only before any successful reconciliation has been stored."""
+    return not _has_persisted_reconciliation_results()
 
 
 def _workspace_should_be_cleared(
@@ -2231,6 +2343,9 @@ def _workspace_should_be_cleared(
         )
         if _cur_sig is not None and _cur_sig == _last_sig:
             return False  # Same files as last successful run — never clear on a filter rerun
+        if _cur_sig is None:
+            # Upload widgets may be present but unreadable on a filter/idle rerun; do not clear.
+            return False
     if _upload_conflicts_with_persisted(file_a_upload, "persisted_m61_fingerprint"):
         return True
     if _upload_conflicts_with_persisted(file_b_upload, "persisted_primary_fingerprint"):
@@ -2242,6 +2357,7 @@ def _workspace_should_be_cleared(
 
 def _clear_recon_session_results() -> None:
     """Drop cached reconciliation output after file changes or an explicit user reset."""
+    _delete_recon_resume_cache(st.session_state.get("recon_resume_run_id"))
     for key in (
         "df_recon",
         "df_excluded_by_liability_type",
@@ -2252,6 +2368,7 @@ def _clear_recon_session_results() -> None:
         "last_run_excel_name",
         "last_run_csv_name",
         "last_successful_upload_signature",
+        "recon_resume_run_id",
         "primary_upload_name",
         "persisted_m61_fingerprint",
         "persisted_primary_fingerprint",
@@ -2461,6 +2578,10 @@ def run_reconciliation_for_selection(
             # Defer status reset to pre-widget stage (Streamlit-safe session_state mutation).
             st.session_state["reset_status_filters"] = True
             _reset_table_filter_state()
+            _persist_recon_run_to_resume_cache(
+                df_recon,
+                st.session_state["df_excluded_by_liability_type"],
+            )
  
  
 # --------------------------------------------------
@@ -2493,6 +2614,10 @@ last_success_sig = st.session_state.get("last_successful_upload_signature")
 auto_run_requested = bool(
     has_required_uploads and run_on_upload and upload_signature and upload_signature != last_success_sig
 )
+# Filter/deal/idle reruns: keep showing cached df_recon; only auto-run when uploads actually changed.
+if "df_recon" in st.session_state and not manual_run_requested:
+    if last_success_sig is None or upload_signature == last_success_sig:
+        auto_run_requested = False
 
 if has_required_uploads and (manual_run_requested or auto_run_requested):
     try:
@@ -2529,7 +2654,18 @@ if has_required_uploads and (manual_run_requested or auto_run_requested):
                 st.session_state["last_successful_upload_signature"] = upload_signature
  
 # ---- Display results if available ----
-if "df_recon" in st.session_state:
+if _has_persisted_reconciliation_results():
+    _resumed_from_disk = False
+    if "df_recon" not in st.session_state:
+        _resumed_from_disk = _try_restore_recon_from_resume_cache()
+    if "df_recon" not in st.session_state:
+        st.warning(
+            "Reconciliation results are no longer in memory and could not be restored from the "
+            "server cache. Re-upload the same primary and M61 files, or run reconciliation again."
+        )
+        st.stop()
+    if _resumed_from_disk:
+        st.info("Restored your last reconciliation results from the server cache after reconnect.")
     df_recon = st.session_state["df_recon"]
     df_excluded_by_type = st.session_state.get("df_excluded_by_liability_type", pd.DataFrame())
     _run_primary_raw = st.session_state.get("primary_file_type", primary_file_type)
@@ -4532,5 +4668,5 @@ if "df_recon" in st.session_state:
     if is_stale_selection:
         st.caption("Downloads are disabled until you rerun with the current selection.")
 
-else:
+elif _should_show_upload_landing_page():
     render_original_landing_page_if_no_results(selected_ui_label)
