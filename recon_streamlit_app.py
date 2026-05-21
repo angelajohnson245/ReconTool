@@ -2136,12 +2136,29 @@ def _file_hash_hex(data: bytes) -> str:
 
 def _upload_fingerprint(uploaded_file):
     """Stable workbook identity: ``(filename, byte length, sha256 hex)``."""
-    if not uploaded_file or not _upload_has_payload(uploaded_file):
+    if not uploaded_file:
+        return None
+    try:
+        raw = _bytes_from_streamlit_upload(uploaded_file)
+    except (TypeError, ValueError, OSError):
+        return None
+    if not raw:
         return None
     name = str(getattr(uploaded_file, "name", "") or "")
-    raw = _bytes_from_streamlit_upload(uploaded_file)
-    size = len(raw)
-    return (name, size, _file_hash_hex(raw))
+    return (name, len(raw), _file_hash_hex(raw))
+
+
+def _sanitize_multiselect_state(ms_key: str, opts: list) -> None:
+    """Drop stale multiselect values so filter reruns do not crash when options shrink."""
+    if ms_key not in st.session_state:
+        return
+    prior = st.session_state.get(ms_key)
+    if not isinstance(prior, list):
+        return
+    allowed = set(opts)
+    cleaned = [v for v in prior if v in allowed]
+    if cleaned != prior:
+        st.session_state[ms_key] = cleaned
 
 
 def _update_persisted_upload_fingerprints(
@@ -2170,8 +2187,10 @@ def _update_persisted_upload_fingerprints(
 
 def _upload_conflicts_with_persisted(uploaded_file, persisted_key: str) -> bool:
     """True when the user replaced a workbook with different bytes (not a transient None)."""
+    if uploaded_file is None:
+        return False
     fp = _upload_fingerprint(uploaded_file)
-    if fp is None:
+    if fp is None or fp[1] <= 0:
         return False
     persisted = st.session_state.get(persisted_key)
     if persisted is None:
@@ -2196,6 +2215,9 @@ def _workspace_should_be_cleared(
     if st.session_state.pop("recon_user_requested_clear", False):
         return True
     if "df_recon" not in st.session_state:
+        return False
+    # Table/filter reruns often leave upload widgets empty; that is not a file change.
+    if not _both_uploads_ready(file_a_upload, file_b_upload):
         return False
     if _upload_conflicts_with_persisted(file_a_upload, "persisted_m61_fingerprint"):
         return True
@@ -2643,6 +2665,8 @@ if "df_recon" in st.session_state:
         else []
     )
     deal_options = ["All deals"] + deal_names
+    if st.session_state.get("recon_deal_pick") not in deal_options:
+        st.session_state["recon_deal_pick"] = "All deals"
     deal_pick = st.selectbox(
         "Deal name",
         options=deal_options,
@@ -3356,7 +3380,7 @@ if "df_recon" in st.session_state:
                 "or use **All Results for Uploaded Primary Fund** in Scope."
             )
         elif df_view.empty:
-            st.info("No records match the current filters.")
+            st.info("No records match the selected filters.")
         else:
             # Build display table (aligned with RECON_ORDERED_COLS / Excel export)
             display_rows = []
@@ -3727,10 +3751,10 @@ if "df_recon" in st.session_state:
                                 else:
                                     ms_key = base_key
 
+                                _sanitize_multiselect_state(ms_key, opts)
                                 selected_vals = st.multiselect(
                                     fc,
                                     options=opts,
-                                    default=[],
                                     key=ms_key,
                                     help="Empty = show all values.",
                                 )
@@ -3799,8 +3823,9 @@ if "df_recon" in st.session_state:
                     "(try turning off **Hide fully blank columns** or select different columns)."
                 )
             elif not df_table.empty and df_table_view.empty:
-                st.caption(
-                    "No rows match the **Table filters** above. Clear one or more multiselect filters to see data."
+                st.info(
+                    "No records match the selected filters. "
+                    "Clear one or more table filters to see data."
                 )
 
             # Status columns: color only (layout / padding / alignment shared via set_properties).
