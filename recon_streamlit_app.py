@@ -2219,6 +2219,18 @@ def _workspace_should_be_cleared(
     # Table/filter reruns often leave upload widgets empty; that is not a file change.
     if not _both_uploads_ready(file_a_upload, file_b_upload):
         return False
+    # If the upload signature matches the last successful run, the files have not changed.
+    # This is the primary guard against filter-rerun false positives (e.g. from unstable
+    # fingerprint reads). Checking this BEFORE the per-file fingerprint comparison prevents
+    # a spurious clear even if _upload_fingerprint produces a slightly different value on a
+    # second read within the same Streamlit rerun.
+    _last_sig = st.session_state.get("last_successful_upload_signature")
+    if _last_sig is not None:
+        _cur_sig = _current_upload_signature(
+            file_a_upload, file_b_upload, mapping_upload, primary_file_type
+        )
+        if _cur_sig is not None and _cur_sig == _last_sig:
+            return False  # Same files as last successful run — never clear on a filter rerun
     if _upload_conflicts_with_persisted(file_a_upload, "persisted_m61_fingerprint"):
         return True
     if _upload_conflicts_with_persisted(file_b_upload, "persisted_primary_fingerprint"):
@@ -2352,7 +2364,11 @@ def _reset_table_filter_state() -> None:
         if isinstance(k, str) and k.startswith(prefixes):
             del st.session_state[k]
     st.session_state["recon_hide_blank_cols"] = False
-    st.session_state["recon_deal_pick"] = "All deals"
+    # NOTE: recon_deal_pick is intentionally NOT reset here.  The selectbox guard at render
+    # time (``if st.session_state.get("recon_deal_pick") not in deal_options``) already resets
+    # it to "All deals" when the previously selected deal no longer exists in the new results.
+    # Resetting it here unconditionally was the root cause of the deal-filter being cleared on
+    # every reconciliation run, including unintended auto-runs triggered by filter reruns.
     # Cannot set ``recon_m61_note_category`` here: sidebar selectbox may already exist this run.
     # Apply default on the *next* run before the widget is created (see sidebar Filters block).
     st.session_state["recon_pending_m61_note_category_reset"] = True
@@ -2493,10 +2509,24 @@ if has_required_uploads and (manual_run_requested or auto_run_requested):
         st.markdown("**Missing or unmapped:**")
         for line in e.missing:
             st.markdown(f"- `{line}`")
-        st.stop()
+        if manual_run_requested:
+            # Explicit user action: stop so the error is the only thing shown.
+            st.stop()
+        else:
+            # Auto-run failure: record the failing signature so auto-run does NOT retry on every
+            # subsequent rerun (prevents the infinite-failure stuck loop).  Old df_recon (if any)
+            # is preserved because the pop inside run_reconciliation_for_selection only runs after
+            # reconcile() succeeds — so execution falls through to the results display below.
+            if upload_signature:
+                st.session_state["last_successful_upload_signature"] = upload_signature
     except Exception as e:
         st.error(f"Reconciliation failed: {e}")
-        st.stop()
+        if manual_run_requested:
+            st.stop()
+        else:
+            # Same as above: suppress the auto-retry loop; let old results show.
+            if upload_signature:
+                st.session_state["last_successful_upload_signature"] = upload_signature
  
 # ---- Display results if available ----
 if "df_recon" in st.session_state:
