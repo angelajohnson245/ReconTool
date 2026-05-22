@@ -18,6 +18,7 @@ from datetime import date, datetime
  
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as st_components
  
 from recon_enhanced_output import (
     FILE_SOURCE_ACORE_ONLY,
@@ -2283,6 +2284,7 @@ def _save_recon_resume_cache(
 
 
 def _apply_recon_resume_bundle(bundle: dict) -> None:
+    _mark_reconciliation_results_workspace_active()
     st.session_state["df_recon"] = bundle["df_recon"]
     st.session_state["df_excluded_by_liability_type"] = bundle.get(
         "df_excluded_by_liability_type", pd.DataFrame()
@@ -2336,9 +2338,20 @@ def _try_restore_recon_from_resume_cache() -> bool:
     return True
 
 
+def _has_reconciliation_results_in_session() -> bool:
+    """True when the in-memory results table is available for this run."""
+    return "df_recon" in st.session_state
+
+
+def _mark_reconciliation_results_workspace_active() -> None:
+    st.session_state["recon_results_workspace_active"] = True
+
+
 def _has_persisted_reconciliation_results() -> bool:
     """True after a successful run — used to keep the results workspace across filter/idle reruns."""
-    if "df_recon" in st.session_state:
+    if _has_reconciliation_results_in_session():
+        return True
+    if st.session_state.get("recon_results_workspace_active"):
         return True
     if _get_recon_resume_run_id():
         return True
@@ -2347,7 +2360,45 @@ def _has_persisted_reconciliation_results() -> bool:
 
 def _should_show_upload_landing_page() -> bool:
     """Upload landing only before any successful reconciliation has been stored."""
-    return not _has_persisted_reconciliation_results()
+    if _has_reconciliation_results_in_session():
+        return False
+    if st.session_state.get("recon_results_workspace_active"):
+        return False
+    if _get_recon_resume_run_id():
+        return False
+    return not bool(st.session_state.get("last_successful_upload_signature"))
+
+
+# Streamlit script rerun interval while reviewing results (not a browser page reload).
+_RECON_RESULTS_HEARTBEAT_INTERVAL_MS = 60_000
+
+
+def _render_results_workspace_heartbeat() -> None:
+    """Lightweight keep-alive: periodic Streamlit script reruns to hold session during long review."""
+    if not _has_reconciliation_results_in_session():
+        return
+    st_components.html(
+        f"""
+        <script>
+        (function () {{
+            const iv = {_RECON_RESULTS_HEARTBEAT_INTERVAL_MS};
+            const guardKey = "reconResultsReviewHeartbeat";
+            const root = window.parent;
+            if (!root || root[guardKey]) {{
+                return;
+            }}
+            root[guardKey] = setInterval(function () {{
+                root.postMessage(
+                    {{isStreamlitMessage: true, type: "streamlit:rerun"}},
+                    "*"
+                );
+            }}, iv);
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def _workspace_should_be_cleared(
@@ -2392,6 +2443,7 @@ def _clear_recon_session_results() -> None:
     """Drop cached reconciliation output after file changes or an explicit user reset."""
     _delete_recon_resume_cache(_get_recon_resume_run_id())
     _clear_recon_resume_run_id()
+    st.session_state.pop("recon_results_workspace_active", None)
     for key in (
         "df_recon",
         "df_excluded_by_liability_type",
@@ -2586,6 +2638,7 @@ def run_reconciliation_for_selection(
                 st.session_state.pop(_stale_key, None)
             gc.collect()
             st.session_state["df_recon"] = df_recon
+            _mark_reconciliation_results_workspace_active()
             st.session_state["df_excluded_by_liability_type"] = (
                 df_excluded_type if df_excluded_type is not None else pd.DataFrame()
             )
@@ -2703,6 +2756,7 @@ if _has_persisted_reconciliation_results():
         st.stop()
     if _resumed_from_disk:
         st.info("Restored your last reconciliation results from the server cache after reconnect.")
+    _mark_reconciliation_results_workspace_active()
     df_recon = st.session_state["df_recon"]
     df_excluded_by_type = st.session_state.get("df_excluded_by_liability_type", pd.DataFrame())
     _run_primary_raw = st.session_state.get("primary_file_type", primary_file_type)
@@ -4704,6 +4758,8 @@ if _has_persisted_reconciliation_results():
     )
     if is_stale_selection:
         st.caption("Downloads are disabled until you rerun with the current selection.")
+
+    _render_results_workspace_heartbeat()
 
 elif _should_show_upload_landing_page():
     render_original_landing_page_if_no_results(selected_ui_label)
